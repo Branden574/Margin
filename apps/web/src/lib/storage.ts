@@ -102,6 +102,32 @@ export async function saveDocument(record: DocumentRecord): Promise<void> {
     { entity: 'document', id: record.id },
   );
 }
+export type DocumentPatch = Partial<
+  Pick<DocumentRecord, 'name' | 'folderId' | 'starred' | 'trashed' | 'pageCount'>
+>;
+/** Merge inside the retried vault transaction, never from an open dialog's snapshot. */
+export async function patchDocument(
+  id: string,
+  patch: DocumentPatch,
+  blob?: Blob,
+): Promise<DocumentRecord> {
+  return commit(
+    async (tx) => {
+      const current = await tx.get<DocumentRecord>('documents', id);
+      if (!current) throw new Error('This document no longer exists. Your changes were not saved.');
+      const next: DocumentRecord = {
+        ...current,
+        ...patch,
+        ...(blob ? { size: blob.size } : {}),
+        updatedAt: Math.max(current.updatedAt, Date.now()),
+      };
+      tx.put('documents', id, next);
+      if (blob) tx.put('blobs', id, blob);
+      return next;
+    },
+    { entity: 'document', id },
+  );
+}
 export async function getDocumentBlob(id: string): Promise<Blob | undefined> {
   return readVaultRecord('blobs', id);
 }
@@ -189,10 +215,13 @@ export async function getPreferences(): Promise<Preferences> {
   const stored = await readVaultRecord<Preferences>('settings', 'preferences');
   return { ...DEFAULT_PREFERENCES, ...stored };
 }
-export async function savePreferences(preferences: Preferences): Promise<void> {
-  await commit(
+export async function savePreferences(patch: Partial<Preferences>): Promise<Preferences> {
+  return commit(
     async (tx) => {
-      tx.put('settings', 'preferences', preferences);
+      const current = await tx.get<Preferences>('settings', 'preferences');
+      const next = { ...DEFAULT_PREFERENCES, ...current, ...patch };
+      tx.put('settings', 'preferences', next);
+      return next;
     },
     { entity: 'preferences' },
   );

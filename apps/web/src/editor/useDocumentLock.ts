@@ -1,40 +1,15 @@
 import { useEffect, useState } from 'react';
+import { acquireDocumentLock, type DocumentLockStatus } from '../lib/document-lock';
 /** Structural PDF changes require a single local writer; this is not cloud collaboration. */
 export function useDocumentLock(documentId: string) {
-  const [status, setStatus] = useState<'pending' | 'owned' | 'blocked' | 'unsupported'>('pending');
+  const [status, setStatus] = useState<DocumentLockStatus>('pending');
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!navigator.locks) {
       setStatus('unsupported');
       return;
     }
-    let active = true;
-    let release: () => void = () => {};
-    setStatus('pending');
-    void navigator.locks
-      .request(
-        `margin-document:${documentId}`,
-        { mode: 'exclusive', ifAvailable: true },
-        async (lock) => {
-          if (!active) return;
-          if (!lock) {
-            setStatus('blocked');
-            return;
-          }
-          setStatus('owned');
-          await new Promise<void>((resolve) => {
-            release = resolve;
-            if (!active) resolve();
-          });
-        },
-      )
-      .catch(() => {
-        if (active) setStatus('unsupported');
-      });
-    return () => {
-      active = false;
-      release();
-    };
+    return acquireDocumentLock(navigator.locks, documentId, setStatus);
   }, [documentId, attempt]);
   return { lockStatus: status, retryLock: () => setAttempt((value) => value + 1) };
 }

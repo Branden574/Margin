@@ -83,7 +83,9 @@ export default function App() {
   const uploadInput = useRef<HTMLInputElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sourceShown = useRef(false);
+  const refreshGeneration = useRef(0);
   const refresh = useCallback(async () => {
+    const request = ++refreshGeneration.current;
     const [d, f, a, p, u] = await Promise.all([
       db.listDocuments(),
       db.listFolders(),
@@ -91,6 +93,7 @@ export default function App() {
       db.getPreferences(),
       db.listUploadRecords(),
     ]);
+    if (request !== refreshGeneration.current) return;
     setDocuments(d);
     setFolders(f);
     setAssignments(a);
@@ -270,7 +273,7 @@ export default function App() {
       try {
         const record = await importDocument(file, updateUpload, exportPassphrase || undefined);
         if (page.startsWith('folder:'))
-          await db.saveDocument({ ...record, folderId: page.slice(7) });
+          await db.patchDocument(record.id, { folderId: page.slice(7) });
         count++;
       } catch (e) {
         const message = e instanceof Error ? e.message : 'The file could not be imported.';
@@ -289,13 +292,12 @@ export default function App() {
     }
     if (uploadInput.current) uploadInput.current.value = '';
   }
-  async function savePreferences(p: Preferences) {
-    await db.savePreferences(p);
-    setPreferences(p);
+  async function savePreferences(p: Partial<Preferences>) {
+    setPreferences(await db.savePreferences(p));
   }
   async function star(doc: DocumentRecord) {
     try {
-      await db.saveDocument({ ...doc, starred: !doc.starred });
+      await db.patchDocument(doc.id, { starred: !doc.starred });
       await refresh();
     } catch (e) {
       notify(String(e), true);
@@ -308,7 +310,7 @@ export default function App() {
         return;
       }
       if (action === 'trash' || action === 'restore') {
-        await db.saveDocument({ ...doc, trashed: action === 'trash', updatedAt: Date.now() });
+        await db.patchDocument(doc.id, { trashed: action === 'trash' });
         await refresh();
         notify(action === 'trash' ? 'Document moved to Trash.' : 'Document restored.');
       } else if (action === 'duplicate') {
@@ -393,17 +395,13 @@ export default function App() {
         });
         await refresh();
       } else if (dialog.type === 'rename') {
-        await db.saveDocument({
-          ...dialog.doc,
+        await db.patchDocument(dialog.doc.id, {
           name: String(f.get('name')).trim(),
-          updatedAt: Date.now(),
         });
         await refresh();
       } else if (dialog.type === 'move') {
-        await db.saveDocument({
-          ...dialog.doc,
+        await db.patchDocument(dialog.doc.id, {
           folderId: String(f.get('folder')) || null,
-          updatedAt: Date.now(),
         });
         await refresh();
       } else if (dialog.type === 'delete') {
@@ -457,16 +455,14 @@ export default function App() {
   }
   const documentChanged = async (changes: { blob?: Blob; pageCount?: number; name?: string }) => {
     if (!opened) return;
-    const current = (await db.getDocument(opened.document.id)) ?? opened.document;
-    const next = {
-      ...current,
-      ...(changes.name ? { name: changes.name } : {}),
-      ...(changes.pageCount ? { pageCount: changes.pageCount } : {}),
-      ...(changes.blob ? { size: changes.blob.size } : {}),
-      updatedAt: Math.max(current.updatedAt, Date.now()),
-    };
-    if (changes.blob) await db.saveDocumentWithBlob(next, changes.blob);
-    else await db.saveDocument(next);
+    const next = await db.patchDocument(
+      opened.document.id,
+      {
+        ...(changes.name ? { name: changes.name } : {}),
+        ...(changes.pageCount ? { pageCount: changes.pageCount } : {}),
+      },
+      changes.blob,
+    );
     setOpened({ document: next, blob: changes.blob ?? opened.blob });
     await refresh();
   };

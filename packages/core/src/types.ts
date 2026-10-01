@@ -27,7 +27,8 @@ export type AnnotationTool =
   | 'comment'
   | 'rectangle'
   | 'ellipse'
-  | 'line';
+  | 'line'
+  | 'arrow';
 export interface Point {
   x: number;
   y: number;
@@ -36,12 +37,25 @@ export interface Point {
 export interface Annotation {
   id: string;
   pageIndex: number;
-  type: 'text' | 'pen' | 'highlight' | 'comment' | 'rectangle' | 'ellipse' | 'line';
+  type:
+    | 'text'
+    | 'pen'
+    | 'highlight'
+    | 'comment'
+    | 'rectangle'
+    | 'ellipse'
+    | 'line'
+    | 'arrow'
+    | 'signature'
+    | 'stamp';
   x: number;
   y: number;
   width?: number;
   height?: number;
   points?: Point[];
+  strokes?: Point[][];
+  lineStyle?: 'solid' | 'dashed' | 'dotted';
+  fontSize?: number;
   text?: string;
   color: string;
   strokeWidth: number;

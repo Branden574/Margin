@@ -1684,6 +1684,23 @@ kbd {
 .settings-controls {
   max-width: 560px;
 }
+.account-sessions {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.account-sessions li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.account-sessions small {
+  display: block;
+  margin-top: 4px;
+}
 .inline-form {
   display: flex;
   gap: 10px;
@@ -1799,7 +1816,7 @@ kbd {
   height: 19px;
   padding: 3px;
   border-radius: 12px;
-  background: #dedfd6;
+  background: #737969;
   flex-shrink: 0;
 }
 .toggle span {
@@ -1816,6 +1833,19 @@ kbd {
 }
 .toggle.on span {
   transform: translateX(13px);
+}
+[data-theme='contrast'] .toggle {
+  background: #fff;
+  outline: 1px solid #111;
+}
+[data-theme='contrast'] .toggle span {
+  background: #111;
+}
+[data-theme='contrast'] .toggle.on {
+  background: #111;
+}
+[data-theme='contrast'] .toggle.on span {
+  background: #fff;
 }
 .storage-detail {
   display: flex;

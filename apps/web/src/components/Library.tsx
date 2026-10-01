@@ -78,7 +78,10 @@ export function Library({
         (!folder || d.folderId === folder.id) &&
         (!isTemplate || d.source === 'sample') &&
         (!search || d.name.toLowerCase().includes(search.toLowerCase())) &&
-        (filter === 'all' || (filter === 'mine' ? d.source !== 'sample' : d.source === 'sample')),
+        (isTemplate ||
+          page === 'trash' ||
+          filter === 'all' ||
+          (filter === 'mine' ? d.source !== 'sample' : d.source === 'sample')),
     )
     .sort((a, b) => (sort === 'recent' ? b.updatedAt - a.updatedAt : a.name.localeCompare(b.name)));
   const recent = visible.slice(0, 4);

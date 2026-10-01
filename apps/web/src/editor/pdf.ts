@@ -1,6 +1,6 @@
-import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
+import { PDFDocument, StandardFonts, LineCapStyle, degrees, rgb } from 'pdf-lib';
 import type { Annotation } from '@margin/core';
-import type { PageAction } from './model';
+import { annotationPaths, dashPattern, pathData, textLike, type PageAction } from './model';
 
 export async function transformPage(blob: Blob, action: PageAction, index: number): Promise<Blob> {
   const pdf = await PDFDocument.load(await blob.arrayBuffer());
@@ -36,14 +36,20 @@ export interface ExportPageView {
   pageIndex: number;
   transform: number[];
 }
-async function rasterText(text: string, size: number, ink: string) {
+async function rasterText(
+  text: string,
+  size: number,
+  ink: string,
+  face = 'sans-serif',
+  style = '',
+) {
   const canvas = new OffscreenCanvas(1, 1),
     context = canvas.getContext('2d');
   if (!context) throw new Error('This browser cannot export Unicode text.');
-  context.font = `${size * 2}px sans-serif`;
+  context.font = `${style} ${size * 2}px ${face}`.trim();
   canvas.width = Math.ceil(context.measureText(text).width) + 8;
   canvas.height = size * 2 + 16;
-  context.font = `${size * 2}px sans-serif`;
+  context.font = `${style} ${size * 2}px ${face}`.trim();
   context.fillStyle = ink;
   context.fillText(text, 0, size * 2 + 2);
   return {
@@ -59,6 +65,12 @@ export async function exportAnnotatedPdf(
 ): Promise<Blob> {
   const pdf = await PDFDocument.load(await blob.arrayBuffer());
   const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const signatureFont = annotations.some((a) => a.type === 'signature' && a.text)
+    ? await pdf.embedFont(StandardFonts.TimesRomanItalic)
+    : font;
+  const stampFont = annotations.some((a) => a.type === 'stamp')
+    ? await pdf.embedFont(StandardFonts.HelveticaBold)
+    : font;
   const comments = annotations.filter((a) => a.type === 'comment');
   for (const index of new Set(annotations.map((a) => a.pageIndex))) {
     const page = pdf.getPage(index),
@@ -75,31 +87,58 @@ export async function exportAnnotatedPdf(
       const ink = color(a.color),
         width = a.width ?? 160,
         height = a.height ?? 24;
-      if (a.type === 'text') {
+      if (textLike(a)) {
+        const isSignature = a.type === 'signature',
+          isStamp = a.type === 'stamp';
+        const textFont = isSignature ? signatureFont : isStamp ? stampFont : font;
+        const textSize = isSignature ? (a.fontSize ?? 28) : isStamp ? 12 : 16;
         const angle = a.rotation ?? 0,
           rad = (angle * Math.PI) / 180;
+        if (isStamp)
+          page.drawRectangle({
+            ...xy(a.x - Math.sin(rad) * height, a.y + Math.cos(rad) * height),
+            width,
+            height,
+            rotate: degrees(pageRotation - angle),
+            borderColor: ink,
+            borderWidth: a.strokeWidth,
+            borderOpacity: a.opacity,
+          });
         const lines = (a.text ?? '').split('\n');
         for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
           const line = lines[lineIndex],
-            offset = 16 + lineIndex * 21;
-          const origin = xy(a.x - Math.sin(rad) * offset, a.y + Math.cos(rad) * offset);
+            offset = (isStamp ? 24 : textSize) + lineIndex * (textSize + 5);
+          const textX = a.x + Math.cos(rad) * (isStamp ? 10 : 0),
+            textY = a.y + Math.sin(rad) * (isStamp ? 10 : 0);
+          const origin = xy(textX - Math.sin(rad) * offset, textY + Math.cos(rad) * offset);
           try {
-            font.encodeText(line);
+            textFont.encodeText(line);
             page.drawText(line, {
               ...origin,
-              font,
-              size: 16,
+              font: textFont,
+              size: textSize,
+              opacity: a.opacity,
               color: ink,
               rotate: degrees(pageRotation - angle),
             });
           } catch {
-            const raster = await rasterText(line, 16, a.color),
+            const raster = await rasterText(
+                line,
+                textSize,
+                a.color,
+                isSignature ? '"Times New Roman", serif' : 'sans-serif',
+                isSignature ? 'italic' : isStamp ? 'bold' : '',
+              ),
               png = await pdf.embedPng(raster.data);
-            const pos = xy(a.x - Math.sin(rad) * (offset + 5), a.y + Math.cos(rad) * (offset + 5));
+            const pos = xy(
+              textX - Math.sin(rad) * (offset + 5),
+              textY + Math.cos(rad) * (offset + 5),
+            );
             page.drawImage(png, {
               ...pos,
               width: raster.width,
               height: raster.height,
+              opacity: a.opacity,
               rotate: degrees(pageRotation - angle),
             });
           }
@@ -114,21 +153,35 @@ export async function exportAnnotatedPdf(
           color: rgb(1, 1, 1),
           rotate: degrees(pageRotation),
         });
-      } else if (a.points?.length) {
-        for (let i = 1; i < a.points.length; i++)
-          page.drawLine({
-            start: xy(a.points[i - 1].x, a.points[i - 1].y),
-            end: xy(a.points[i].x, a.points[i].y),
-            thickness: a.strokeWidth,
-            color: ink,
-            opacity: a.opacity,
-          });
-        if (a.points.length === 1)
-          page.drawCircle({
-            ...xy(a.points[0].x, a.points[0].y),
-            size: a.strokeWidth / 2,
-            color: ink,
-          });
+      } else if (annotationPaths(a).length) {
+        for (const [pathIndex, points] of annotationPaths(a).entries()) {
+          if (points.length > 1)
+            page.drawSvgPath(
+              pathData(
+                points.map((point) => {
+                  const pos = xy(point.x, point.y);
+                  return { x: pos.x, y: -pos.y };
+                }),
+              ),
+              {
+                x: 0,
+                y: 0,
+                scale: 1,
+                borderColor: ink,
+                borderWidth: a.strokeWidth,
+                borderOpacity: a.opacity,
+                borderLineCap: LineCapStyle.Round,
+                borderDashArray: a.type === 'arrow' && pathIndex > 0 ? undefined : dashPattern(a),
+              },
+            );
+          if (points.length === 1)
+            page.drawCircle({
+              ...xy(points[0].x, points[0].y),
+              size: a.strokeWidth / 2,
+              color: ink,
+              opacity: a.opacity,
+            });
+        }
       } else if (a.type === 'ellipse') {
         page.drawEllipse({
           ...xy(a.x + width / 2, a.y + height / 2),
@@ -136,6 +189,9 @@ export async function exportAnnotatedPdf(
           yScale: height / 2,
           borderColor: ink,
           borderWidth: a.strokeWidth,
+          borderLineCap: LineCapStyle.Round,
+          borderDashArray: dashPattern(a),
+          borderOpacity: a.opacity,
           rotate: degrees(pageRotation),
           opacity: a.opacity,
         });
@@ -147,7 +203,14 @@ export async function exportAnnotatedPdf(
           rotate: degrees(pageRotation),
           ...(a.type === 'highlight'
             ? { color: ink, opacity: a.opacity }
-            : { borderColor: ink, borderWidth: a.strokeWidth, opacity: a.opacity }),
+            : {
+                borderColor: ink,
+                borderWidth: a.strokeWidth,
+                borderLineCap: LineCapStyle.Round,
+                borderDashArray: dashPattern(a),
+                borderOpacity: a.opacity,
+                opacity: a.opacity,
+              }),
         });
       }
     }

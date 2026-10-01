@@ -16,9 +16,10 @@ import {
 import type { Preferences, DocumentRecord } from '@margin/core';
 import { fileSize, downloadBlob } from '../lib/format';
 import { encryptExport } from '../lib/vault';
+import { AccountConnection } from './AccountConnection';
 interface Props {
   preferences: Preferences;
-  onSave: (p: Preferences) => Promise<void>;
+  onSave: (p: Partial<Preferences>) => Promise<void>;
   documents: DocumentRecord[];
   token: string;
   onToken: (v: string) => void;
@@ -28,7 +29,7 @@ export function Settings({ preferences, onSave, documents, token, onToken, onHel
   const [name, setName] = useState(preferences.name);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  async function update(p: Preferences) {
+  async function update(p: Partial<Preferences>) {
     try {
       setError('');
       await onSave(p);
@@ -48,6 +49,7 @@ export function Settings({ preferences, onSave, documents, token, onToken, onHel
         </div>
       </div>
       <div className="settings-sections">
+        <AccountConnection />
         <section className="settings-section">
           <div className="settings-intro">
             <h2>Your profile</h2>
@@ -58,7 +60,7 @@ export function Settings({ preferences, onSave, documents, token, onToken, onHel
               className="inline-form"
               onSubmit={(e) => {
                 e.preventDefault();
-                if (name.trim()) void update({ ...preferences, name: name.trim() });
+                if (name.trim()) void update({ name: name.trim() });
               }}
             >
               <label>
@@ -78,9 +80,7 @@ export function Settings({ preferences, onSave, documents, token, onToken, onHel
               Workspace view
               <select
                 value={preferences.role}
-                onChange={(e) =>
-                  void update({ ...preferences, role: e.target.value as Preferences['role'] })
-                }
+                onChange={(e) => void update({ role: e.target.value as Preferences['role'] })}
               >
                 <option value="teacher">Teacher</option>
                 <option value="student">Student</option>
@@ -107,7 +107,8 @@ export function Settings({ preferences, onSave, documents, token, onToken, onHel
               ).map(({ id, label, icon: Icon }) => (
                 <button
                   className={`theme-option ${preferences.theme === id ? 'active' : ''}`}
-                  onClick={() => void update({ ...preferences, theme: id })}
+                  aria-pressed={preferences.theme === id}
+                  onClick={() => void update({ theme: id })}
                   key={id}
                 >
                   <span className={`theme-preview preview-${id}`}>
@@ -135,21 +136,21 @@ export function Settings({ preferences, onSave, documents, token, onToken, onHel
               label="Comfortable reading font"
               description="Use a spacious, rounded font throughout the workspace."
               checked={preferences.dyslexiaFont}
-              onChange={(v) => void update({ ...preferences, dyslexiaFont: v })}
+              onChange={(v) => void update({ dyslexiaFont: v })}
               icon={<Eye size={18} />}
             />
             <Toggle
               label="Reduce motion"
               description="Keep transitions and movement to a minimum."
               checked={preferences.reducedMotion}
-              onChange={(v) => void update({ ...preferences, reducedMotion: v })}
+              onChange={(v) => void update({ reducedMotion: v })}
               icon={<Monitor size={18} />}
             />
             <Toggle
               label="Keyboard shortcuts"
               description="Quick access to tools and the command palette."
               checked={preferences.shortcuts}
-              onChange={(v) => void update({ ...preferences, shortcuts: v })}
+              onChange={(v) => void update({ shortcuts: v })}
               icon={<Keyboard size={18} />}
             />
             <button className="text-button" onClick={onHelp}>

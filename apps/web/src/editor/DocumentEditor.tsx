@@ -7,6 +7,9 @@ import {
 } from 'react';
 import {
   ArrowLeft,
+  ArrowUpRight,
+  PenTool,
+  Stamp,
   ArrowDown,
   ArrowUp,
   Check,
@@ -47,7 +50,16 @@ import { useAnnotations } from './useAnnotations';
 import { usePdf } from './usePdf';
 import { PdfCanvas } from './PdfCanvas';
 import { AnnotationGraphic } from './AnnotationLayer';
-import { clamp, hitTest, movedAnnotation, remapAnnotations, uid, type PageAction } from './model';
+import { SignatureDialog, type SignatureInput } from './SignatureDialog';
+import {
+  bounds,
+  clamp,
+  hitTest,
+  movedAnnotation,
+  remapAnnotations,
+  uid,
+  type PageAction,
+} from './model';
 import { downloadBlob } from './pdf';
 import { transformPageInWorker, exportPdfInWorker, mergePdfInWorker } from './pageWorker';
 import { useDocumentLock } from './useDocumentLock';
@@ -98,7 +110,7 @@ export default function DocumentEditor({
   registerLeaveGuard,
 }: Props) {
   const [workingBlob, setWorkingBlob] = useState(blob);
-  const { lockStatus } = useDocumentLock(record.id);
+  const { lockStatus, retryLock } = useDocumentLock(record.id);
   const [lockInitialized, setLockInitialized] = useState(false),
     [vaultLocking, setVaultLocking] = useState(false),
     [leaving, setLeaving] = useState(false);
@@ -120,7 +132,9 @@ export default function DocumentEditor({
   const [tool, setTool] = useState<AnnotationTool>('select'),
     [color, setColor] = useState(colors[0]),
     [strokeWidth, setStrokeWidth] = useState(2.5),
-    [opacity, setOpacity] = useState(0.32);
+    [opacity, setOpacity] = useState(0.32),
+    [lineStyle, setLineStyle] = useState<NonNullable<Annotation['lineStyle']>>('solid'),
+    [signatureOpen, setSignatureOpen] = useState(false);
   const [sidebar, setSidebar] = useState(true),
     [panel, setPanel] = useState<'comments' | 'search' | 'text' | null>(null),
     [pageMenu, setPageMenu] = useState(false),
@@ -136,6 +150,12 @@ export default function DocumentEditor({
   const [busy, setBusy] = useState(''),
     [notice, setNotice] = useState(''),
     [error, setError] = useState('');
+  const [exportLink, setExportLink] = useState<{ url: string; name: string } | null>(null);
+  useEffect(() => {
+    return () => {
+      if (exportLink) URL.revokeObjectURL(exportLink.url);
+    };
+  }, [exportLink]);
   const [online, setOnline] = useState(navigator.onLine),
     [speaking, setSpeaking] = useState(false),
     [readSpeed, setReadSpeed] = useState(1),
@@ -155,8 +175,8 @@ export default function DocumentEditor({
     commandDialog = useRef<HTMLDialogElement>(null),
     mergeInput = useRef<HTMLInputElement>(null);
   const transition = useRef<Promise<void> | null>(null),
-    transitionState = useRef({ busy, editing });
-  transitionState.current = { busy, editing };
+    transitionState = useRef({ busy, editing, signatureOpen });
+  transitionState.current = { busy, editing, signatureOpen };
   const currentPageAnnotations = annotations.filter((a) => a.pageIndex === pageIndex);
   const pageCount = pdf?.numPages ?? record.pageCount;
   const ready =
@@ -175,6 +195,7 @@ export default function DocumentEditor({
     [],
   );
   useEffect(() => {
+    setLockInitialized(false);
     if (lockStatus !== 'owned') return;
     let active = true;
     void Promise.all([getDocumentBlob(record.id), getDocument(record.id), reload()])
@@ -204,7 +225,7 @@ export default function DocumentEditor({
     const state = transitionState.current;
     const refusal = state.busy
       ? 'Wait for the current PDF operation to finish before leaving or locking.'
-      : draft.current || state.editing?.text.trim()
+      : draft.current || state.editing?.text.trim() || state.signatureOpen
         ? 'Finish or cancel the pending annotation before leaving or locking.'
         : '';
     if (refusal) {
@@ -225,6 +246,17 @@ export default function DocumentEditor({
     transition.current = pending;
     return pending;
   }, [flush]);
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => {
+      const state = transitionState.current;
+      if (state.signatureOpen || state.editing?.text.trim() || draft.current) {
+        event.preventDefault();
+        event.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, []);
   useEffect(() => onBeforeVaultLock(leaveGuard), [leaveGuard]);
   useEffect(() => {
     registerLeaveGuard?.(leaveGuard);
@@ -256,7 +288,7 @@ export default function DocumentEditor({
     setSelected(null);
     setDraftAnnotation(null);
     draft.current = null;
-  }, [pageIndex, tool]);
+  }, [pageIndex]);
   useEffect(() => {
     searchGeneration.current++;
     setSearching(false);
@@ -360,6 +392,10 @@ export default function DocumentEditor({
     }
   }
   const chooseTool = (next: AnnotationTool) => {
+    if (!ready || transition.current) return;
+    setSelected(null);
+    draft.current = null;
+    setDraftAnnotation(null);
     setTool(next);
     setShapeMenu(false);
     if (next === 'highlight' && color === colors[0]) setColor(colors[1]);
@@ -401,6 +437,27 @@ export default function DocumentEditor({
         setPageMenu(false);
         setShapeMenu(false);
       }
+      if (selected && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+        e.preventDefault();
+        const item = current.current.find((a) => a.id === selected);
+        if (item) {
+          const b = bounds(item),
+            distance = e.shiftKey ? 10 : 1;
+          const dx = clamp(
+            e.key === 'ArrowRight' ? distance : e.key === 'ArrowLeft' ? -distance : 0,
+            -b.x,
+            pageSize.width - b.x - b.width,
+          );
+          const dy = clamp(
+            e.key === 'ArrowDown' ? distance : e.key === 'ArrowUp' ? -distance : 0,
+            -b.y,
+            pageSize.height - b.y - b.height,
+          );
+          if (dx || dy)
+            commit(current.current.map((a) => (a.id === item.id ? movedAnnotation(a, dx, dy) : a)));
+        }
+        return;
+      }
       if (e.key === 'ArrowRight') setPageIndex((i) => Math.min(pageCount - 1, i + 1));
       if (e.key === 'ArrowLeft') setPageIndex((i) => Math.max(0, i - 1));
     };
@@ -431,7 +488,84 @@ export default function DocumentEditor({
       opacity: type === 'highlight' ? opacity : 1,
       createdAt: Date.now(),
       author: 'You',
+      ...(['line', 'arrow', 'rectangle', 'ellipse', 'pen'].includes(type) && lineStyle !== 'solid'
+        ? { lineStyle }
+        : {}),
     };
+  }
+  function insertAtCenter(item: Annotation) {
+    if (!ready || transition.current) return;
+    commit([...current.current, item]);
+    setTool('select');
+    setSelected(item.id);
+    setShapeMenu(false);
+  }
+  function insertSignature(value: SignatureInput) {
+    if (!ready || transition.current) return;
+    const width = Math.max(10, Math.min(320, pageSize.width - 40));
+    if (value.kind === 'typed') {
+      const context = document.createElement('canvas').getContext('2d');
+      if (context) context.font = 'italic 30px "Times New Roman", serif';
+      const measured = context?.measureText(value.text).width ?? value.text.length * 30;
+      const scale = Math.min(1, width / Math.max(measured, 1)),
+        fontSize = 30 * scale,
+        actualWidth = Math.min(width, measured * scale + 4);
+      insertAtCenter({
+        ...baseAnnotation('signature', {
+          x: (pageSize.width - actualWidth) / 2,
+          y: pageSize.height / 2 - (fontSize + 8) / 2,
+        }),
+        text: value.text,
+        fontSize,
+        width: actualWidth,
+        height: fontSize + 8,
+      });
+    } else {
+      if (!value.strokes.some((stroke) => stroke.length)) return;
+      const box = bounds({
+        ...baseAnnotation('signature', { x: 0, y: 0 }),
+        strokes: value.strokes,
+      });
+      const scale = Math.min(width / Math.max(box.width, 1), 100 / Math.max(box.height, 1), 1);
+      const placedX = (pageSize.width - box.width * scale) / 2,
+        placedY = (pageSize.height - box.height * scale) / 2;
+      insertAtCenter({
+        ...baseAnnotation('signature', { x: placedX, y: placedY }),
+        strokeWidth: 2.5,
+        strokes: value.strokes.map((stroke) =>
+          stroke.map((point) => ({
+            x: placedX + (point.x - box.x) * scale,
+            y: placedY + (point.y - box.y) * scale,
+          })),
+        ),
+        width: box.width * scale,
+        height: box.height * scale,
+      });
+    }
+    setSignatureOpen(false);
+    setError('');
+  }
+  function insertStamp(text: 'REVIEWED' | 'GREAT WORK' | 'REVISE') {
+    insertAtCenter({
+      ...baseAnnotation('stamp', {
+        x: Math.max(10, (pageSize.width - 140) / 2),
+        y: Math.max(10, pageSize.height / 2 - 18),
+      }),
+      text,
+      width: 140,
+      height: 36,
+      strokeWidth: 1.5,
+    });
+  }
+  function insertKeyboardShape() {
+    if (!ready || !['line', 'arrow', 'rectangle', 'ellipse'].includes(tool)) return;
+    const start = { x: pageSize.width / 2 - 65, y: pageSize.height / 2 - 30 };
+    insertAtCenter({
+      ...baseAnnotation(tool as Annotation['type'], start),
+      ...(['line', 'arrow'].includes(tool)
+        ? { points: [start, { x: start.x + 130, y: start.y + 60 }] }
+        : { width: 130, height: 60 }),
+    });
   }
   function pointerDown(event: ReactPointerEvent<SVGSVGElement>) {
     if (!ready || transition.current || event.button !== 0) return;
@@ -457,7 +591,9 @@ export default function DocumentEditor({
     draft.current = { tool, start: point, points: [point] };
     setDraftAnnotation({
       ...baseAnnotation(tool, point),
-      ...(tool === 'pen' || tool === 'line' ? { points: [point] } : { width: 0, height: 0 }),
+      ...(tool === 'pen' || tool === 'line' || tool === 'arrow'
+        ? { points: [point] }
+        : { width: 0, height: 0 }),
     });
   }
   function pointerMove(event: ReactPointerEvent<SVGSVGElement>) {
@@ -475,7 +611,7 @@ export default function DocumentEditor({
       if (Math.hypot(point.x - last.x, point.y - last.y) < 0.8) return;
       gesture.points.push(point);
       setDraftAnnotation((a) => (a ? { ...a, points: [...gesture.points] } : null));
-    } else if (gesture.tool === 'line')
+    } else if (gesture.tool === 'line' || gesture.tool === 'arrow')
       setDraftAnnotation((a) => (a ? { ...a, points: [gesture.start, point] } : null));
     else
       setDraftAnnotation((a) =>
@@ -497,8 +633,17 @@ export default function DocumentEditor({
       if (draft.current?.tool === 'select')
         commit(current.current.map((a) => (a.id === draftAnnotation.id ? draftAnnotation : a)));
       else if (
-        draftAnnotation.points?.length ||
-        ((draftAnnotation.width ?? 0) > 2 && (draftAnnotation.height ?? 0) > 2)
+        draftAnnotation.type === 'line' || draftAnnotation.type === 'arrow'
+          ? Boolean(
+              draftAnnotation.points &&
+                draftAnnotation.points.length > 1 &&
+                Math.hypot(
+                  draftAnnotation.points.at(-1)!.x - draftAnnotation.points[0].x,
+                  draftAnnotation.points.at(-1)!.y - draftAnnotation.points[0].y,
+                ) > 1,
+            )
+          : draftAnnotation.points?.length ||
+            ((draftAnnotation.width ?? 0) > 2 && (draftAnnotation.height ?? 0) > 2)
       )
         commit([...current.current, draftAnnotation]);
     }
@@ -590,10 +735,9 @@ export default function DocumentEditor({
           '.pdf',
         mimeType: 'application/pdf',
       });
-      downloadBlob(
-        encrypted,
-        `margin-document-${new Date().toISOString().replace(/[:.]/g, '-')}.margin`,
-      );
+      const name = `margin-document-${new Date().toISOString().replace(/[:.]/g, '-')}.margin`;
+      setExportLink({ url: URL.createObjectURL(encrypted), name });
+      downloadBlob(encrypted, name);
       setNotice('Encrypted .margin file ready. Reopen in Margin with your vault passphrase.');
     } catch (e) {
       setError(`Export could not finish: ${errorMessage(e)}`);
@@ -713,6 +857,9 @@ export default function DocumentEditor({
   }
   const commands = [
     ...tools.map((t) => ({ label: `${t.label} tool`, detail: t.key, run: () => chooseTool(t.id) })),
+    { label: 'Arrow tool', detail: 'Shapes', run: () => chooseTool('arrow') },
+    { label: 'Add signature', detail: 'Typed or drawn', run: () => setSignatureOpen(true) },
+    { label: 'Add reviewed stamp', detail: 'Feedback', run: () => insertStamp('REVIEWED') },
     { label: 'Export encrypted file', detail: '.margin', run: () => void exportPdf() },
     { label: 'Add a blank page', detail: 'Pages', run: () => void editPage('insert') },
     { label: 'Rotate current page', detail: 'Pages', run: () => void editPage('rotate') },
@@ -722,7 +869,13 @@ export default function DocumentEditor({
   ];
   const activeTool =
     tools.find((t) => t.id === tool)?.label ??
-    (tool === 'rectangle' ? 'Rectangle' : tool === 'ellipse' ? 'Ellipse' : 'Line');
+    (tool === 'rectangle'
+      ? 'Rectangle'
+      : tool === 'ellipse'
+        ? 'Ellipse'
+        : tool === 'arrow'
+          ? 'Arrow'
+          : 'Line');
   return (
     <div className="document-editor">
       <input
@@ -823,10 +976,11 @@ export default function DocumentEditor({
           ))}
           <div className="editor-menu-wrap">
             <button
-              className={`editor-tool ${['rectangle', 'ellipse', 'line'].includes(tool) ? 'is-active' : ''}`}
+              className={`editor-tool ${['rectangle', 'ellipse', 'line', 'arrow'].includes(tool) ? 'is-active' : ''}`}
               onClick={() => setShapeMenu(!shapeMenu)}
               disabled={!ready}
               aria-expanded={shapeMenu}
+              aria-label="Shapes"
             >
               <Square size={17} />
               <span>Shapes</span>
@@ -838,15 +992,39 @@ export default function DocumentEditor({
                   { id: 'rectangle', label: 'Rectangle', Icon: Square },
                   { id: 'ellipse', label: 'Ellipse', Icon: Circle },
                   { id: 'line', label: 'Line', Icon: Minus },
+                  { id: 'arrow', label: 'Arrow', Icon: ArrowUpRight },
                 ].map(({ id, label, Icon }) => (
                   <button key={id} onClick={() => chooseTool(id as AnnotationTool)}>
                     <Icon size={15} />
                     {label}
                   </button>
                 ))}
+                <div className="editor-dropdown-label">Feedback stamps</div>
+                {(['REVIEWED', 'GREAT WORK', 'REVISE'] as const).map((text) => (
+                  <button key={text} onClick={() => insertStamp(text)}>
+                    <Stamp size={15} />
+                    {text === 'REVIEWED'
+                      ? 'Reviewed stamp'
+                      : text === 'GREAT WORK'
+                        ? 'Great work stamp'
+                        : 'Revise stamp'}
+                  </button>
+                ))}
               </div>
             ) : null}
           </div>
+          <button
+            className="editor-tool"
+            disabled={!ready}
+            onClick={() => {
+              setError('');
+              setSignatureOpen(true);
+            }}
+            aria-label="Add signature"
+          >
+            <PenTool size={18} />
+            <span>Sign</span>
+          </button>
         </div>
         <div className="editor-toolbar-spacer" />
         <button
@@ -899,7 +1077,7 @@ export default function DocumentEditor({
         {tool === 'select' ? (
           <span className="editor-tool-help">
             {selected
-              ? 'Drag to move · Delete to remove'
+              ? 'Drag or arrow keys to move · Shift for larger steps · Delete to remove'
               : 'Select an annotation to move or edit it'}
           </span>
         ) : tool === 'eraser' ? (
@@ -926,7 +1104,7 @@ export default function DocumentEditor({
                 aria-label="Custom annotation color"
               />
             </label>
-            {['pen', 'rectangle', 'ellipse', 'line'].includes(tool) ? (
+            {['pen', 'rectangle', 'ellipse', 'line', 'arrow'].includes(tool) ? (
               <label className="editor-width-control">
                 <span>Weight</span>
                 <input
@@ -941,6 +1119,31 @@ export default function DocumentEditor({
                 <span>{strokeWidth} px</span>
               </label>
             ) : null}
+            {['pen', 'rectangle', 'ellipse', 'line', 'arrow'].includes(tool) ? (
+              <label className="editor-line-style">
+                <span>Line style</span>
+                <select
+                  aria-label="Line style"
+                  value={lineStyle}
+                  onChange={(e) =>
+                    setLineStyle(e.target.value as NonNullable<Annotation['lineStyle']>)
+                  }
+                >
+                  <option value="solid">Solid</option>
+                  <option value="dashed">Dashed</option>
+                  <option value="dotted">Dotted</option>
+                </select>
+              </label>
+            ) : null}
+            {['line', 'arrow', 'rectangle', 'ellipse'].includes(tool) ? (
+              <button
+                className="editor-inline-action"
+                onClick={insertKeyboardShape}
+                disabled={!ready}
+              >
+                Insert {tool} at center
+              </button>
+            ) : null}
             {tool === 'highlight' ? (
               <label className="editor-width-control">
                 <span>Opacity</span>
@@ -948,7 +1151,7 @@ export default function DocumentEditor({
                   type="range"
                   min=".1"
                   max=".7"
-                  step=".05"
+                  step=".01"
                   value={opacity}
                   onChange={(e) => setOpacity(+e.target.value)}
                   aria-label="Highlight opacity"
@@ -969,7 +1172,9 @@ export default function DocumentEditor({
         )}
         {selected ? (
           <div className="editor-selection-actions">
-            {current.current.find((a) => a.id === selected)?.text ? (
+            {current.current.find(
+              (a) => a.id === selected && (a.type === 'text' || a.type === 'comment'),
+            )?.text ? (
               <button
                 onClick={() => {
                   const a = current.current.find((a) => a.id === selected)!;
@@ -1010,6 +1215,17 @@ export default function DocumentEditor({
           </button>
         </div>
       ) : null}
+      {exportLink ? (
+        <div className="export-ready" role="status">
+          <span>Encrypted export prepared. If your download did not start, use this link.</span>
+          <a href={exportLink.url} download={exportLink.name}>
+            Download encrypted file
+          </a>
+          <button aria-label="Dismiss prepared export" onClick={() => setExportLink(null)}>
+            <X size={15} />
+          </button>
+        </div>
+      ) : null}
       {lockStatus === 'blocked' || lockStatus === 'unsupported' ? (
         <div className="editor-error" role="status">
           <span>
@@ -1017,9 +1233,7 @@ export default function DocumentEditor({
               ? 'This document is open for editing in another tab. Close it there to edit safely here.'
               : 'This browser cannot acquire a document editing lock. Use a current Chrome browser to edit safely.'}
           </span>
-          {lockStatus === 'blocked' ? (
-            <button onClick={() => window.location.reload()}>Reload and retry</button>
-          ) : null}
+          {lockStatus === 'blocked' ? <button onClick={retryLock}>Retry editing</button> : null}
         </div>
       ) : null}
       <div className="editor-body">
@@ -1164,7 +1378,12 @@ export default function DocumentEditor({
                   const p = position(e),
                     a = [...currentPageAnnotations]
                       .reverse()
-                      .find((item) => item.text && hitTest(item, p));
+                      .find(
+                        (item) =>
+                          (item.type === 'text' || item.type === 'comment') &&
+                          item.text &&
+                          hitTest(item, p),
+                      );
                   if (a)
                     setEditing({
                       point: { x: a.x, y: a.y },
@@ -1470,6 +1689,17 @@ export default function DocumentEditor({
           {notice}
         </div>
       ) : null}
+      <SignatureDialog
+        ink={color}
+        open={signatureOpen}
+        disabled={!ready}
+        error={error}
+        onClose={() => {
+          setSignatureOpen(false);
+          setError('');
+        }}
+        onInsert={insertSignature}
+      />
       <dialog ref={editDialog} className="editor-dialog" onCancel={() => setEditing(null)}>
         <form
           onSubmit={(e) => {

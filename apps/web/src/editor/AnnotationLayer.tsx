@@ -1,5 +1,5 @@
 import type { Annotation } from '@margin/core';
-import { bounds, pathData } from './model';
+import { annotationPaths, bounds, dashPattern, pathData, textLike } from './model';
 
 export function AnnotationGraphic({
   annotation: a,
@@ -8,26 +8,45 @@ export function AnnotationGraphic({
   annotation: Annotation;
   selected?: boolean;
 }) {
-  const b = bounds(a);
+  const b = bounds(a),
+    paths = annotationPaths(a);
   let graphic;
-  if (a.type === 'text')
+  if (textLike(a)) {
+    const signature = a.type === 'signature',
+      stamp = a.type === 'stamp';
+    const size = signature ? (a.fontSize ?? 28) : stamp ? 12 : 16;
     graphic = (
-      <text
-        x={a.x}
-        y={a.y + 16}
-        fill={a.color}
-        fontSize="16"
-        fontFamily="Arial, sans-serif"
-        transform={`rotate(${a.rotation ?? 0} ${a.x} ${a.y})`}
-      >
-        {(a.text ?? '').split('\n').map((line, i) => (
-          <tspan key={i} x={a.x} dy={i ? 21 : 0}>
-            {line || ' '}
-          </tspan>
-        ))}
-      </text>
+      <g transform={`rotate(${a.rotation ?? 0} ${a.x} ${a.y})`} opacity={a.opacity}>
+        {stamp && (
+          <rect
+            x={a.x}
+            y={a.y}
+            width={a.width ?? 140}
+            height={a.height ?? 36}
+            fill="none"
+            stroke={a.color}
+            strokeWidth={a.strokeWidth}
+            rx="3"
+          />
+        )}
+        <text
+          x={a.x + (stamp ? 10 : 0)}
+          y={a.y + (stamp ? 24 : size)}
+          fill={a.color}
+          fontSize={size}
+          fontFamily={signature ? '"Times New Roman", serif' : 'Arial, sans-serif'}
+          fontStyle={signature ? 'italic' : undefined}
+          fontWeight={stamp ? '700' : undefined}
+        >
+          {(a.text ?? '').split('\n').map((line, i) => (
+            <tspan key={i} x={a.x + (stamp ? 10 : 0)} dy={i ? size + 5 : 0}>
+              {line || ' '}
+            </tspan>
+          ))}
+        </text>
+      </g>
     );
-  else if (a.type === 'comment')
+  } else if (a.type === 'comment')
     graphic = (
       <g>
         <rect x={a.x} y={a.y} width="24" height="24" rx="9" fill={a.color} />
@@ -43,17 +62,25 @@ export function AnnotationGraphic({
         </text>
       </g>
     );
-  else if (a.points?.length)
+  else if (paths.length)
     graphic = (
-      <path
-        d={pathData(a.points) + (a.points.length === 1 ? ` l 0.1 0` : '')}
-        fill="none"
-        stroke={a.color}
-        strokeWidth={a.strokeWidth}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        opacity={a.opacity}
-      />
+      <>
+        {paths.map((points, index) => (
+          <path
+            key={index}
+            d={pathData(points) + (points.length === 1 ? ' l 0.1 0' : '')}
+            fill="none"
+            stroke={a.color}
+            strokeWidth={a.strokeWidth}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            opacity={a.opacity}
+            strokeDasharray={
+              a.type === 'arrow' && index > 0 ? undefined : dashPattern(a)?.join(' ')
+            }
+          />
+        ))}
+      </>
     );
   else if (a.type === 'ellipse')
     graphic = (
@@ -65,6 +92,9 @@ export function AnnotationGraphic({
         fill="none"
         stroke={a.color}
         strokeWidth={a.strokeWidth}
+        strokeLinecap="round"
+        strokeDasharray={dashPattern(a)?.join(' ')}
+        opacity={a.opacity}
       />
     );
   else
@@ -78,11 +108,13 @@ export function AnnotationGraphic({
         fill={a.type === 'highlight' ? a.color : 'none'}
         stroke={a.type === 'highlight' ? 'none' : a.color}
         strokeWidth={a.strokeWidth}
+        strokeLinecap="round"
+        strokeDasharray={dashPattern(a)?.join(' ')}
         opacity={a.opacity}
       />
     );
   return (
-    <g>
+    <g data-annotation-id={a.id} data-annotation-type={a.type}>
       {graphic}
       {selected ? (
         <rect

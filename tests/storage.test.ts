@@ -18,6 +18,7 @@ import {
   listFolders,
   listUploadRecords,
   loadAnnotations,
+  patchDocument,
   replaceDocumentWithAnnotations,
   replayAnnotationOperations,
   saveAssignment,
@@ -103,6 +104,51 @@ describe('offline workspace persistence', () => {
     const ops = [operation('z', 50, 'delete'), operation('a', 50)];
     expect(replayAnnotationOperations(ops)).toEqual([]);
     expect(replayAnnotationOperations(ops.reverse())).toEqual([]);
+  });
+  it('merges stale-dialog metadata changes without undoing concurrent document edits', async () => {
+    const dialogSnapshot = document();
+    await saveDocumentWithBlob(dialogSnapshot, new Blob(['old']));
+    await Promise.all([
+      replaceDocumentWithAnnotations(dialogSnapshot.id, new Blob(['edited PDF bytes']), 5, []),
+      patchDocument(dialogSnapshot.id, { folderId: 'new-folder', trashed: true }),
+      patchDocument(dialogSnapshot.id, { starred: true }),
+    ]);
+    const renamed = await patchDocument(dialogSnapshot.id, { name: 'Renamed from stale dialog' });
+    expect(renamed).toMatchObject({
+      name: 'Renamed from stale dialog',
+      folderId: 'new-folder',
+      pageCount: 5,
+      size: 16,
+      trashed: true,
+      starred: true,
+      createdAt: dialogSnapshot.createdAt,
+    });
+    expect(await (await getDocumentBlob(dialogSnapshot.id))?.text()).toBe('edited PDF bytes');
+  });
+  it('rejects queued edits after deletion without resurrecting metadata or bytes', async () => {
+    const stale = document();
+    await saveDocumentWithBlob(stale, new Blob(['old']));
+    const deleting = deleteDocument(stale.id);
+    const saving = patchDocument(stale.id, { name: 'Stale rename' }, new Blob(['replacement']));
+    await expect(saving).rejects.toThrow('no longer exists');
+    await deleting;
+    expect(await getDocument(stale.id)).toBeUndefined();
+    expect(await getDocumentBlob(stale.id)).toBeUndefined();
+  });
+  it('preserves every field from overlapping partial preference saves', async () => {
+    await Promise.all([
+      savePreferences({ theme: 'dark' }),
+      savePreferences({ reducedMotion: true }),
+      savePreferences({ name: 'New name', role: 'student' }),
+    ]);
+    expect(await getPreferences()).toEqual({
+      name: 'New name',
+      role: 'student',
+      theme: 'dark',
+      dyslexiaFont: false,
+      reducedMotion: true,
+      shortcuts: true,
+    });
   });
   it('makes operation retries idempotent and rejects conflicting IDs', async () => {
     await saveDocumentWithBlob(document(), new Blob(['test']));
