@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error The extension intentionally ships dependency-free native JavaScript.
-import { workspaceUrl, handoffUrl } from '../apps/extension/urls.js';
+import { DEFAULT_WORKSPACE, workspaceUrl, handoffUrl } from '../apps/extension/urls.js';
 describe('extension handoff trust boundary', () => {
   it('requires HTTPS even on exact local development hosts', () => {
+    expect(DEFAULT_WORKSPACE).toBe('https://127.0.0.1:5173/');
+    expect(workspaceUrl(DEFAULT_WORKSPACE).origin).toBe('https://127.0.0.1:5173');
+    expect(handoffUrl(DEFAULT_WORKSPACE)).toBe('https://127.0.0.1:5173/');
     expect(workspaceUrl('https://localhost:5173/path').origin).toBe('https://localhost:5173');
     expect(workspaceUrl('https://margin.example').protocol).toBe('https:');
     for (const url of [

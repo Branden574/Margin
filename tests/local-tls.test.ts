@@ -47,7 +47,7 @@ afterAll(() => {
 });
 
 describe('local HTTPS leaf certificate setup', () => {
-  it('creates the required server leaf, valid hostnames, matching private key, and private permissions', () => {
+  it('creates a server leaf scoped only to 127.0.0.1, a matching private key, and private permissions', () => {
     const result = ensureLocalTls(join(root, 'new'));
     const leaf = certificate(result);
     const details = execFileSync('openssl', ['x509', '-in', result.certPath, '-noout', '-text'], {
@@ -55,16 +55,21 @@ describe('local HTTPS leaf certificate setup', () => {
     });
     expect(result.action).toBe('created');
     expect(leaf.ca).toBe(false);
-    expect(leaf.checkHost('localhost')).toBeTruthy();
+    expect(leaf.subject).toBe('CN=127.0.0.1');
+    expect(leaf.subjectAltName).toBe('IP Address:127.0.0.1');
+    expect(leaf.checkHost('localhost')).toBeUndefined();
     expect(leaf.checkIP('127.0.0.1')).toBeTruthy();
-    expect(leaf.checkIP('::1')).toBeTruthy();
+    expect(leaf.checkIP('::1')).toBeUndefined();
     expect(leaf.checkHost('example.com')).toBeUndefined();
     expect(leaf.checkPrivateKey(createPrivateKey(readFileSync(result.keyPath)))).toBe(true);
     expect(leaf.publicKey.asymmetricKeyDetails?.modulusLength).toBe(3072);
     expect(leaf.keyUsage).toEqual(['1.3.6.1.5.5.7.3.1']);
     expect(details).toMatch(/Signature Algorithm:\s*sha256WithRSAEncryption/);
     expect(details).toMatch(/X509v3 Basic Constraints:\s*critical\s+CA:FALSE/);
-    expect(details).toMatch(/X509v3 Key Usage:\s*critical\s+Digital Signature, Key Encipherment/);
+    expect(details).toMatch(
+      /X509v3 Key Usage:[ \t]*critical[ \t]*\r?\n[ \t]*Digital Signature, Key Encipherment[ \t]*\r?\n/,
+    );
+    expect(details).not.toContain('Certificate Sign');
     expect(
       (new Date(leaf.validTo).getTime() - new Date(leaf.validFrom).getTime()) / 86_400_000,
     ).toBe(30);
@@ -147,6 +152,44 @@ describe('local HTTPS leaf certificate setup', () => {
     expect(permissions(preserved)).toBe(0o700);
     expect(permissions(join(preserved, 'key.pem'))).toBe(0o600);
     expect(permissions(join(preserved, 'cert.pem'))).toBe(0o600);
+  });
+  it('rotates the broader localhost and IPv6 leaf while preserving the original pair', () => {
+    const directory = copyFixture('broader-loopback');
+    const oldKey = readFileSync(join(directory, 'key.pem'));
+    execFileSync(
+      'openssl',
+      [
+        'req',
+        '-x509',
+        '-key',
+        join(directory, 'key.pem'),
+        '-sha256',
+        '-out',
+        join(directory, 'cert.pem'),
+        '-days',
+        '30',
+        '-subj',
+        '/CN=localhost',
+        '-addext',
+        'basicConstraints=critical,CA:FALSE',
+        '-addext',
+        'keyUsage=critical,digitalSignature,keyEncipherment',
+        '-addext',
+        'extendedKeyUsage=serverAuth',
+        '-addext',
+        'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1',
+      ],
+      { stdio: 'pipe' },
+    );
+    const oldCert = readFileSync(join(directory, 'cert.pem'));
+    const result = ensureLocalTls(directory);
+    expect(result.action).toBe('regenerated');
+    expect(result.reason).toBe('certificate scope is not exactly 127.0.0.1');
+    expect(readFileSync(join(result.backupDirectory!, 'key.pem'))).toEqual(oldKey);
+    expect(readFileSync(join(result.backupDirectory!, 'cert.pem'))).toEqual(oldCert);
+    expect(certificate(result).subject).toBe('CN=127.0.0.1');
+    expect(certificate(result).subjectAltName).toBe('IP Address:127.0.0.1');
+    expect(ensureLocalTls(directory).action).toBe('reused');
   });
   it('preserves incomplete, mismatched, and expired pairs before regeneration', () => {
     const incomplete = join(root, 'incomplete');

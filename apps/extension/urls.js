@@ -1,4 +1,4 @@
-export const DEFAULT_WORKSPACE = 'https://localhost:5173/';
+export const DEFAULT_WORKSPACE = 'https://127.0.0.1:5173/';
 export function workspaceUrl(value) {
   const url = new URL(value);
   if (url.username || url.password || url.protocol !== 'https:') {

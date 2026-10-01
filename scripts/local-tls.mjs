@@ -25,11 +25,11 @@ function inspectPair(keyPath, certPath, now, openssl) {
       return 'certificate is not valid yet';
     if (new Date(certificate.validTo).getTime() <= now.getTime()) return 'expired certificate';
     if (
-      !certificate.checkHost('localhost') ||
-      !certificate.checkIP('127.0.0.1') ||
-      !certificate.checkIP('::1')
+      certificate.subject !== 'CN=127.0.0.1' ||
+      certificate.subjectAltName !== 'IP Address:127.0.0.1' ||
+      !certificate.checkIP('127.0.0.1')
     )
-      return 'missing localhost names or addresses';
+      return 'certificate scope is not exactly 127.0.0.1';
     if (!certificate.checkPrivateKey(createPrivateKey(readFileSync(keyPath))))
       return 'certificate and private key do not match';
     if (
@@ -49,7 +49,10 @@ function inspectPair(keyPath, certPath, now, openssl) {
       return 'unexpected certificate signature algorithm';
     if (!/X509v3 Basic Constraints:\s*critical\s+CA:FALSE/.test(description))
       return 'missing critical leaf constraint';
-    if (!/X509v3 Key Usage:\s*critical\s+Digital Signature, Key Encipherment/.test(description))
+    const keyUsage = description
+      .match(/X509v3 Key Usage:[ \t]*critical[ \t]*\r?\n[ \t]*([^\r\n]+)/)?.[1]
+      .trim();
+    if (keyUsage !== 'Digital Signature, Key Encipherment')
       return 'missing critical server key usages';
     return undefined;
   } catch {
@@ -119,7 +122,7 @@ export function ensureLocalTls(directory, { now = new Date(), openssl = 'openssl
         '-days',
         '30',
         '-subj',
-        '/CN=localhost',
+        '/CN=127.0.0.1',
         '-addext',
         'basicConstraints=critical,CA:FALSE',
         '-addext',
@@ -127,7 +130,7 @@ export function ensureLocalTls(directory, { now = new Date(), openssl = 'openssl
         '-addext',
         'extendedKeyUsage=serverAuth',
         '-addext',
-        'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1',
+        'subjectAltName=IP:127.0.0.1',
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
