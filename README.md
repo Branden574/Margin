@@ -15,10 +15,16 @@ Requires Node.js 22+, npm and OpenSSL.
 ```sh
 npm ci
 npm run setup:dev
+# On macOS, approve trust for this local server certificate:
+npm run trust:dev
 npm run dev
 ```
 
-Open **https://127.0.0.1:5173**. Setup creates a self-signed localhost certificate and random API secrets under the Git-ignored `.local/` directory, with private file permissions. It does not change your system trust store or print secrets. Explicitly trust the development certificate on your development machine, or accept its localhost warning for a temporary test. Offline service workers may require certificate trust. Never disable certificate checks globally.
+Open **https://127.0.0.1:5173**. Setup creates a 30-day self-signed server certificate and random API secrets under the Git-ignored `.local/` directory, with private file permissions. It never changes certificate trust or prints secrets. The certificate cannot act as a certificate authority.
+
+On macOS, `npm run trust:dev` requests trust for that exact certificate, constrained to SSL on `127.0.0.1` in your user login keychain. Approve the macOS prompt yourself. It imports only the public certificate, preserves normal certificate validation, and does not change system-wide trust. `npm run check:tls` checks the result; `npm run untrust:dev` reverses it. Reload the preview after approval. Other operating systems need their own development-certificate trust setup.
+
+If the preview reports `ERR_AUTHORITY_INVALID`, the server certificate is not trusted by the browser. The in-app browser may have no “proceed anyway” control. Complete the trust step instead of disabling HTTPS or certificate checks. If the browser still caches the error after trust is verified, close and reopen the preview tab.
 
 Create a strong workspace passphrase. Documents and metadata are encrypted in this browser's IndexedDB. The passphrase is never stored or sent to the API. **There is no passphrase reset.** Keep it safely: it is also needed to open exported `.margin` packages in another workspace. Lock the workspace from the sidebar when finished, especially on shared devices. Locking first saves edits across open tabs and refuses to discard an unfinished draft.
 

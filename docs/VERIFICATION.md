@@ -5,7 +5,7 @@ Verified locally on October 1, 2026, on macOS/Apple Silicon with Node.js 22.22.2
 | Check                  | Observed result                                                                                                                                                                                               |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | TypeScript             | All workspace type checks passed                                                                                                                                                                              |
-| Unit/integration suite | 67 tests across 9 files passed                                                                                                                                                                                |
+| Unit/integration suite | 71 tests across 10 files passed                                                                                                                                                                               |
 | Browser workflows      | All 15 Chromium tests passed over local HTTPS                                                                                                                                                                 |
 | Build                  | Web production bundle, Node API compilation and Manifest V3 permission/package validation passed                                                                                                              |
 | Production offline     | All 26 emitted assets cached at their exact URLs; encrypted vault re-unlocked after offline reload; previously unopened PDF rendered; blank creation and PDF import workers worked offline; no browser errors |
@@ -16,13 +16,15 @@ Verified locally on October 1, 2026, on macOS/Apple Silicon with Node.js 22.22.2
 
 ## What the tests establish
 
+Local certificate tests cover server-only leaf constraints, hostnames, key matching, private permissions, valid-pair reuse, and backed-up replacement of legacy, expired, incomplete or mismatched pairs. The migration test verifies that existing API secrets remain byte-for-byte unchanged. macOS certificate trust requires an explicit user action and is not established by these automated tests.
+
 Storage tests inspect ciphertext records for document bytes, metadata, annotations, preferences and upload receipts. They cover incorrect passphrases, tampered/swapped records, atomic failure rollback, encrypted export portability, malformed package parameters and lock-versus-decryption/import races.
 
 API tests exercise encrypted filesystem artifacts, tenant and same-tenant user isolation, expiration/revocation, rejected forged ownership fields, upload integrity and idempotency, interruption/restart, quotas, default quarantine, denied download, authenticated deletion, wrong-key restore failure and correct-key encrypted snapshot recovery. The TLS fixture uses a trusted local certificate and rejects TLS 1.1.
 
 Browser tests cover actual local PDF import and editing, save/reload/unlock, page operations and encrypted exports, Unicode comment appendices, same-document writer exclusion, cross-tab lock refusal/recovery and abandoned lock timeout. Browser Back preserves unfinished drafts and annotations whose saves fail with an injected quota error; retry allows navigation once persistence succeeds. A synthetic 500-page fixture stays at six or fewer canvases and reaches the final page. Library, mobile navigation, settings and the explicitly local teacher/student assignment sequence also pass.
 
-The production offline runner launches and removes its own temporary HTTPS preview. Its readiness request trusts only the generated local CA; its browser pins that certificate's public key. It verifies the complete lazy asset graph, workers and locally bundled fonts. The same runner scans desktop/mobile onboarding; library, settings, assignments and editor in all three themes; and locked screens after changing themes. This is automated coverage, not a full assistive-technology or accessibility conformance assessment.
+The production offline runner launches and removes its own temporary HTTPS preview. Its readiness request trusts only the generated local certificate; its browser pins that certificate's public key. It verifies the complete lazy asset graph, workers and locally bundled fonts. The same runner scans desktop/mobile onboarding; library, settings, assignments and editor in all three themes; and locked screens after changing themes. This is automated coverage, not a full assistive-technology or accessibility conformance assessment.
 
 ## Reproduce
 

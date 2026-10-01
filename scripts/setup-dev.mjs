@@ -1,37 +1,10 @@
-import { mkdirSync, existsSync, chmodSync, writeFileSync } from 'node:fs';
+import { existsSync, chmodSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { ensureLocalTls } from './local-tls.mjs';
 const root = resolve(import.meta.dirname, '..');
 const dir = resolve(root, '.local/tls');
-mkdirSync(dir, { recursive: true, mode: 0o700 });
-const key = resolve(dir, 'key.pem'),
-  cert = resolve(dir, 'cert.pem');
-if (!existsSync(key) || !existsSync(cert)) {
-  execFileSync(
-    'openssl',
-    [
-      'req',
-      '-x509',
-      '-newkey',
-      'rsa:3072',
-      '-nodes',
-      '-keyout',
-      key,
-      '-out',
-      cert,
-      '-days',
-      '30',
-      '-subj',
-      '/CN=localhost',
-      '-addext',
-      'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1',
-    ],
-    { stdio: 'pipe' },
-  );
-  chmodSync(key, 0o600);
-  chmodSync(cert, 0o600);
-}
+const { keyPath: key, certPath: cert, action, backupDirectory } = ensureLocalTls(dir);
 const env = resolve(root, '.local/api.env');
 if (!existsSync(env)) {
   writeFileSync(
@@ -47,6 +20,7 @@ if (!existsSync(env)) {
     { mode: 0o600 },
   );
 }
+chmodSync(env, 0o600);
 process.stdout.write(
-  'Local HTTPS certificate and private API configuration are ready in .local/. Secrets were not printed.\nThe certificate is self-signed; trust it explicitly for local development only. See docs/LOCAL_SECURITY.md.\n',
+  `Local HTTPS server certificate ${action}; private API configuration is ready in .local/. Secrets were not printed.\n${backupDirectory ? `The previous certificate files were preserved in ${backupDirectory}.\n` : ''}Operating-system trust was not changed. On macOS, run npm run trust:dev to explicitly trust this local development certificate. See docs/LOCAL_SECURITY.md.\n`,
 );

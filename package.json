@@ -19,7 +19,10 @@
     "format": "prettier --write \"**/*.{ts,tsx,js,mjs,json,css,html,md,yml}\"",
     "format:check": "prettier --check \"**/*.{ts,tsx,js,mjs,json,css,html,md,yml}\"",
     "test:offline": "npm run setup:dev && node scripts/check-offline.mjs",
-    "test:a11y": "node scripts/check-accessibility.mjs"
+    "test:a11y": "node scripts/check-accessibility.mjs",
+    "trust:dev": "node scripts/trust-local-cert.mjs --trust",
+    "untrust:dev": "node scripts/trust-local-cert.mjs --remove",
+    "check:tls": "node scripts/trust-local-cert.mjs --status"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.13.0",
