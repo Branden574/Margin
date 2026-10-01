@@ -1,5 +1,8 @@
 node_modules/
 dist/
+.next/
+*.tsbuildinfo
+**/next-env.d.ts
 .local/
 .margin-data/
 package-lock.json

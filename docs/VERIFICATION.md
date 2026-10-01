@@ -1,6 +1,6 @@
 # Verification record
 
-Verified locally on October 1, 2026, on macOS/Apple Silicon with Node.js 22.22.2 and isolated Chromium. The repository is an encrypted local foundation; these results do not establish production scale, school privacy compliance or independent security certification.
+The initial baseline below was verified locally on October 1, 2026, on macOS/Apple Silicon with Node.js 22.22.2 and isolated Chromium. Later checkpoints are recorded separately and do not inherit browser or production evidence automatically. The repository is an encrypted local foundation; these results do not establish production scale, school privacy compliance or independent security certification.
 
 | Check                  | Observed result                                                                                                                                                                                               |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -13,6 +13,17 @@ Verified locally on October 1, 2026, on macOS/Apple Silicon with Node.js 22.22.2
 | PostgreSQL proposal    | Schema applied and 7 isolation/authorization assertions passed in a disposable PostgreSQL 18.3 cluster                                                                                                        |
 | Dependencies           | `npm audit` reported zero known vulnerabilities; CycloneDX inventory generated from the committed lockfile                                                                                                    |
 | Local TLS proxy        | Health request through Vite to the API succeeded with the generated certificate as the explicit CA                                                                                                            |
+
+## Expanded implementation checkpoint — October 1, 2026
+
+- `MARGIN_REQUIRE_POSTGRES_TESTS=1 npm test`: **232 tests across 21 files passed**, with the PostgreSQL fixtures required (not silently skipped). This includes identity, operation storage, Canvas launch/assignment authorization, cloud SDK contracts and extended editor regressions.
+- `npm run test:marketing`: **3 contract tests passed**.
+- Full workspace typecheck, formatting, LMS/web/API/extension/marketing build and dependency audit passed. Audit reported zero known vulnerabilities.
+- Built marketing homepage HTML referenced 10 scripts totaling **238,751 gzip bytes**, within its 250,000-byte initial-script budget. This excludes deferred chunks, HTML/RSC, CSS and fonts; it is not a field performance or Lighthouse result.
+- Manual walkthrough in the actual normally trusted HTTPS tab verified signatures, arrows, stamps, reload/unlock, two-tab writer exclusion and draft-protecting cross-tab locks, as well as file organization, Trash/restore, templates, PDF/PNG/JPEG import and local assignment statuses. See [manual verification](MANUAL_VERIFICATION.md) for exact checked flows and unresolved export delivery.
+- Cloud tests use local SDK doubles and static infrastructure assertions. They do not establish live KMS/S3 behavior. Canvas uses actual disposable PostgreSQL and synthetic signed protocol fixtures, not a live institution.
+- The two added editor E2E cases are written but have not been executed locally. Earlier 15-workflow/offline/accessibility results above belong to the initial baseline, not the expanded checkpoint.
+- Production scale, hosted integration, independent security review and actual school device performance remain unverified.
 
 ## What the tests establish
 

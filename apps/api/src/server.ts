@@ -10,6 +10,13 @@ import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { EncryptedStore, LocalKeyProvider, type KeyManagementProvider } from './encryption.js';
+import { createIdentityHandler } from './identity/http.js';
+import type { IdentityService } from './identity/service.js';
+import { IdentityError } from './identity/types.js';
+import type { SessionPrincipal } from './identity/types.js';
+import { handleDocumentSync, type DocumentSyncService } from './sync-routes.js';
+import { SyncError } from './sync/index.js';
+import { createLmsHandler, type LmsService } from './lms/index.js';
 
 const MIB = 1024 * 1024;
 export interface LocalIdentity {
@@ -32,7 +39,11 @@ export interface InspectionResult {
 }
 export interface ApiOptions {
   dataDirectory: string;
-  identities: LocalIdentity[];
+  identities?: LocalIdentity[];
+  /** OIDC sessions replace development bearer tokens; the two modes cannot be combined. */
+  identityService?: IdentityService;
+  syncService?: DocumentSyncService;
+  lmsService?: LmsService;
   keyEncryptionKey?: Buffer;
   keyManagementProvider?: KeyManagementProvider;
   tls?: { key: Buffer; cert: Buffer };
@@ -163,17 +174,27 @@ async function entries(path: string): Promise<string[]> {
 
 /** Encrypted local service. Production still requires OIDC, KMS, isolated scanning and a durable audit sink. */
 export function createApi(options: ApiOptions) {
+  if (
+    options.lmsService &&
+    (!options.identityService ||
+      options.lmsService.applicationOrigin !== options.identityService.applicationOrigin)
+  )
+    throw new Error('LMS and identity must use the same authenticated application origin.');
+  if (options.syncService && !options.identityService)
+    throw new Error('Document synchronization requires authenticated organization sessions.');
   const insecureTest =
     options.allowInsecureTestTransport === true && process.env.NODE_ENV === 'test';
   if (!options.tls && !insecureTest)
     throw new Error(
       'HTTPS is mandatory. Supply a TLS certificate and key; plaintext application transport is disabled.',
     );
+  const identities = options.identities ?? [];
+  if (options.identityService && identities.length)
+    throw new Error('Choose OIDC sessions or local bearer identities, never both.');
   if (
-    !options.identities.length ||
-    options.identities.some(
-      ({ token, tenantId, userId }) => token.length < 32 || !tenantId || !userId,
-    )
+    !options.identityService &&
+    (!identities.length ||
+      identities.some(({ token, tenantId, userId }) => token.length < 32 || !tenantId || !userId))
   )
     throw new Error(
       'Configure authenticated identities with a user, tenant and token of at least 32 characters.',
@@ -192,8 +213,20 @@ export function createApi(options: ApiOptions) {
   const uploadLifetime = options.uploadLifetimeMs ?? 24 * 60 * 60 * 1000;
   const retention = options.documentRetentionMs ?? 30 * 24 * 60 * 60 * 1000;
   const origins = new Set(
-    options.allowedOrigins ?? ['https://localhost:5173', 'https://127.0.0.1:5173'],
+    options.allowedOrigins ??
+      (options.identityService
+        ? [options.identityService.applicationOrigin]
+        : ['https://localhost:5173', 'https://127.0.0.1:5173']),
   );
+  if (
+    options.identityService &&
+    (origins.size !== 1 || !origins.has(options.identityService.applicationOrigin))
+  )
+    throw new Error('Cookie-authenticated API access must use its exact application origin.');
+  const handleIdentity = options.identityService
+    ? createIdentityHandler(options.identityService)
+    : undefined;
+  const handleLms = options.lmsService ? createLmsHandler(options.lmsService) : undefined;
   if (!insecureTest && [...origins].some((origin) => new URL(origin).protocol !== 'https:'))
     throw new Error('Every browser origin must use HTTPS.');
   const locks = new Map<string, Promise<unknown>>();
@@ -320,6 +353,13 @@ export function createApi(options: ApiOptions) {
       }
       concurrentRequests++;
       admitted = true;
+      // LTI form_post is cross-site by design. Its isolated handler validates the
+      // registered installation, signed token and independent browser binding.
+      // Ordinary API origins, cookies and framing protections stay unchanged.
+      if (handleLms && req.url?.startsWith('/api/lms/')) {
+        routeName = '/api/lms/:action';
+        if (await handleLms(req, res)) return;
+      }
       const origin = req.headers.origin;
       if (origin && !origins.has(origin))
         throw new ApiError(
@@ -336,7 +376,7 @@ export function createApi(options: ApiOptions) {
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         res.setHeader(
           'Access-Control-Allow-Headers',
-          'Authorization, Content-Type, X-Chunk-SHA256, Idempotency-Key',
+          'Authorization, Content-Type, X-Chunk-SHA256, Idempotency-Key, X-CSRF-Token',
         );
         res.setHeader('Access-Control-Max-Age', '600');
         res.writeHead(204);
@@ -344,6 +384,10 @@ export function createApi(options: ApiOptions) {
         return;
       }
       const path = new URL(req.url ?? '/', 'https://localhost').pathname;
+      if (handleIdentity && path.startsWith('/api/auth/')) {
+        routeName = '/api/auth/:action';
+        if (await handleIdentity(req, res)) return;
+      }
       routeName = ['/api/health', '/api/uploads', '/api/documents'].includes(path)
         ? path
         : /^\/api\/uploads\//.test(path)
@@ -355,27 +399,68 @@ export function createApi(options: ApiOptions) {
         send(200, {
           status: 'ok',
           mode: 'encrypted-local',
+          authentication: options.identityService ? 'oidc-session' : 'local-bearer',
           transport: insecureTest ? 'synthetic-test' : 'tls',
           scanningConfigured: Boolean(options.inspectDocument),
+          synchronizationConfigured: Boolean(options.syncService),
+          canvasConfigured: Boolean(options.lmsService),
         });
         return;
       }
-      const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
-      const identity = options.identities.find((item) => equalToken(item.token, token));
-      if (
-        !identity ||
-        identity.revoked ||
-        (identity.expiresAt ?? startedAt + 60 * 60 * 1000) <= Date.now()
-      )
-        throw new ApiError(
-          401,
-          'authentication_required',
-          'Your local session is missing, expired or revoked. Reconnect with a current access token.',
-        );
+      let identity: { tenantId: string; userId: string };
+      let principal: SessionPrincipal | undefined;
+      if (options.identityService) {
+        const authenticated = await options.identityService.authenticateRequest(req);
+        principal = authenticated.principal;
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? '')) {
+          options.identityService.verifyCsrf(req, authenticated);
+          if (['viewer', 'support'].includes(authenticated.principal.role))
+            throw new ApiError(
+              403,
+              'write_not_allowed',
+              'This workspace role cannot modify documents.',
+            );
+        }
+        identity = {
+          tenantId: authenticated.principal.organizationId,
+          userId: authenticated.principal.userId,
+        };
+        if (principal.authenticationMethod === 'lti')
+          throw new ApiError(
+            403,
+            'lms_resource_scope_required',
+            'Open the permitted assignment through its Canvas workspace. General document access is not available through an LMS session.',
+          );
+      } else {
+        const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
+        const localIdentity = identities.find((item) => equalToken(item.token, token));
+        if (
+          !localIdentity ||
+          localIdentity.revoked ||
+          (localIdentity.expiresAt ?? startedAt + 60 * 60 * 1000) <= Date.now()
+        )
+          throw new ApiError(
+            401,
+            'authentication_required',
+            'Your local session is missing, expired or revoked. Reconnect with a current access token.',
+          );
+        identity = localIdentity;
+      }
       tenantHash = digest(identity.tenantId).slice(0, 12);
       userHash = digest(identity.userId).slice(0, 12);
       limit(`tenant:${identity.tenantId}`, options.requestsPerMinute ?? 1200);
       limit(`user:${identity.tenantId}:${identity.userId}`, options.requestsPerMinute ?? 1200);
+      if (path.startsWith('/api/sync/')) {
+        routeName = '/api/sync/documents/:id';
+        if (!options.syncService || !principal)
+          throw new ApiError(
+            503,
+            'sync_unavailable',
+            'Organization document synchronization is not configured. Your local work is unchanged.',
+          );
+        if (await handleDocumentSync(req, res, options.syncService, principal)) return;
+        throw new ApiError(404, 'not_found', 'This synchronization route does not exist.');
+      }
       const root = ownerPath(identity.tenantId, identity.userId);
       const now = Date.now();
       if (req.method === 'POST' && path === '/api/uploads') {
@@ -860,7 +945,8 @@ export function createApi(options: ApiOptions) {
       }
       throw new ApiError(404, 'not_found', 'This API route does not exist.');
     } catch (error) {
-      const expected = error instanceof ApiError;
+      const expected =
+        error instanceof ApiError || error instanceof IdentityError || error instanceof SyncError;
       if (!expected)
         logger({ event: 'api_error', correlationId, code: 'integrity_or_service_failure' });
       if (expected && error.status === 429) res.setHeader('Retry-After', '60');
@@ -871,6 +957,7 @@ export function createApi(options: ApiOptions) {
             message: expected
               ? error.message
               : 'The secure service could not verify or complete this request. No unverified document content was released. Check the correlation ID with the service operator.',
+            ...(error instanceof SyncError && error.details ? { details: error.details } : {}),
           },
           correlationId,
         });

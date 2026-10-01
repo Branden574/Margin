@@ -14,7 +14,7 @@ Browser and server data also have different recovery boundaries. Clearing or evi
 
 ## Verification evidence and limits
 
-The current editor work passed strict web TypeScript, 14 editor geometry/PDF unit tests and nine Chromium end-to-end tests over HTTPS. Those browser tests cover:
+The earlier editor work passed strict web TypeScript, 14 editor geometry/PDF unit tests and nine Chromium end-to-end tests over HTTPS. The signature/arrow/stamp increment passed 21 focused geometry, PDF and encrypted round-trip tests in total. Its two new browser test cases are written but have not been run; manual results are recorded separately below. The earlier browser tests cover:
 
 - Text persistence after page reload and vault unlock; shape undo/redo; duplicate-page undo/redo and encrypted export.
 - Merging real PDF pages and extracting a standalone page in an encrypted package. Export tests decrypt with the synthetic test passphrase and inspect the resulting PDF.
@@ -23,6 +23,8 @@ The current editor work passed strict web TypeScript, 14 editor geometry/PDF uni
 - Exporting a 90-line Unicode comment across a complete notes appendix and retaining the original note after reload.
 - Refusing browser Back for an unfinished draft or a quota-failed annotation, then allowing navigation after saving/retry; recovering from an abandoned cross-tab lock request.
 - Importing a synthetic 500-page PDF, asserting at most six canvases, navigating pages 499/500 and reading the final page's text.
+
+The actual in-app browser walkthrough verified typed signature insertion and keyboard movement, two independent drawn signature strokes, Undo stroke/Clear controls, a dashed arrow, preset stamp deletion and undo/redo, and recovery after an actual reload and vault unlock. The new automated tests separately check arrow geometry, line styles, SVG/PDF rendering, encrypted operation replay and encrypted export/decrypt round trips. Manual export delivery in this browser remains unresolved. See [manual verification](MANUAL_VERIFICATION.md). These visual signatures do not cryptographically sign documents or verify a person's identity; the current remote operation protocol does not accept the new tools yet.
 
 Automated scans of 16 states (library, settings, assignments and editor in three themes; desktop/mobile onboarding; locked screens after theme changes) reported zero axe violations for WCAG 2 A/AA, 2.1 AA and 2.2 AA tags. This is a limited automated result, not an accessibility conformance assessment. It does not cover every dialog, assistive technology, device or interaction.
 
@@ -47,7 +49,7 @@ The last command requires a suitable local PostgreSQL installation. Browser test
 - Cloud identity, organization/user/group/license administration and authenticated teacher/student permissions. The current role selector is a local workflow preference.
 - Remote annotation synchronization, real-time coediting, live presence, conflict resolution, durable acknowledgment and cross-device version recovery. Local Web Locks and operation logs do not provide these services.
 - Production OCR, Office and Google document conversion, LMS/cloud-drive APIs, optional AI providers, remote assignment delivery and district reporting.
-- Direct editing of existing PDF text, interactive forms, crop/resize, bulk splitting into many files, stamps/images/signatures, audio/video comments and richer annotation/teacher workflows.
+- Direct editing of existing PDF text, interactive forms, crop/resize, bulk splitting into many files, image annotations, cryptographic document signatures, audio/video comments and richer annotation/teacher workflows. Typed/drawn visual signatures and three preset feedback stamps are available locally; custom stamp libraries are not.
 - Durable product version history and recovery across devices. Current undo history is bounded and lasts for the editor session; exported PDFs flatten annotations and carry full comments in an appendix. Unicode text unsupported by the built-in export font is rasterized and loses text selection/searchability in that export.
 - Broader accessibility testing and reading controls. Browser speech depends on available OS/browser voices; it is not OCR, transcription or guaranteed offline speech.
 

@@ -42,6 +42,16 @@ Copy `MARGIN_API_TOKEN` from your private `.local/api.env` into **Settings → E
 
 Use **Upload encrypted copy** in a document's menu. Uploads have acknowledged progress, pause/resume, digest checks and encrypted filesystem receipts. Completed files remain **quarantined** until an isolated scanner is configured; a completed transfer is not a usable cloud backup or annotation sync. Production mode is intentionally refused.
 
+### Marketing website
+
+Run `npm run dev:marketing` and open `http://127.0.0.1:3000`. The separate Next.js site includes the product story, interactive illustrations, sourced comparisons, security boundaries and a dedicated Canvas integration page. Document content and credentials stay out of the marketing site. [Marketing notes](docs/MARKETING.md) identify current features and planned concepts.
+
+### Organization and Canvas services
+
+The API now includes configurable OIDC sessions, encrypted PostgreSQL annotation operations and the Canvas LTI launch foundation. These are optional operator-configured services, disabled in the default local setup. Follow [identity configuration](docs/IDENTITY.md), [sync contracts](docs/SYNC.md), [Canvas setup boundaries](docs/CANVAS.md) and `infra/identity.env.example`. Apply versioned migrations with separate operator credentials; runtime accounts cannot provision memberships or document grants.
+
+Signed Canvas launches require explicitly provisioned installation, identity, course and enrollment mappings. A valid launch is only the first step: connected assignment authoring, student copies, submission and grade passback remain unfinished. The local editor does not yet synchronize its annotations through the new server operation API. No real institution, cloud identity provider or production storage has been provisioned.
+
 ## Working capabilities
 
 | Area            | Available now                                                                                                                                    |
@@ -73,6 +83,7 @@ The extension requests only `activeTab`, `contextMenus` and `storage`. It hands 
 ```sh
 npm run typecheck
 npm test
+npm run test:marketing
 npm run build
 npx playwright install chromium
 npm run test:e2e
@@ -80,6 +91,8 @@ npm run test:offline
 ```
 
 Browser tests use isolated Chromium profiles and trust only their local test context. They never operate on your normal browser data. [Verification notes](docs/VERIFICATION.md) separate measured results from untested release requirements. [GitHub Actions](.github/workflows/ci.yml) runs compilation, security/integration tests, browser workflows, dependency audit and an isolated PostgreSQL schema check.
+
+[Manual verification](docs/MANUAL_VERIFICATION.md) separately records interaction in the actual in-app browser, including unresolved export delivery and mobile checks. The [requirements matrix](docs/REQUIREMENTS_MATRIX.md) and [delivery plan](docs/DELIVERY_PLAN.md) track the complete briefs rather than treating this checkpoint as finished.
 
 To preview the production web bundle locally:
 
@@ -96,8 +109,17 @@ Open **https://127.0.0.1:4173**. This is a separate browser origin and therefore
 - `apps/web`: React/TypeScript workspace, PDF editor, encrypted vault, import/upload workers and service worker.
 - `apps/api`: loopback-only HTTPS service with encrypted storage, authorization, quarantine and resumable uploads.
 - `apps/extension`: dependency-free Manifest V3 launcher.
+- `apps/marketing`: Next.js product website and Canvas story.
 - `packages/core`: shared document, annotation, classroom and preference types.
+- `packages/lms`: Canvas launch verification and provider contracts.
+- `infra/migrations`: actual identity, document-operation and LMS installation database migrations with restricted runtime roles.
 - `infra/schema.sql`: PostgreSQL schema and fail-closed tenant/RBAC policy proposal, not yet connected to the API.
 - `tests`: unit, integration and Chromium workflow tests.
 
 Read the [architecture](docs/ARCHITECTURE.md), [local security model](docs/LOCAL_SECURITY.md), [backend security model](docs/security-backend.md) and [production readiness](docs/PRODUCTION_READINESS.md) before extending or deploying. Independent review, managed identity/KMS, malware scanning, operational backups, school privacy review and measured capacity remain necessary.
+
+## Service implementation checkpoints
+
+The optional organization services now include OIDC sessions, durable annotation operation storage and Canvas launch verification. [Assignment services](docs/ASSIGNMENTS.md) add encrypted teacher drafts, signed Deep Linking responses, course-bound resource mapping and pending student-copy reservations; their HTTP/UI and trusted ingestion/provisioning adapters are not connected. [AWS artifact adapters](docs/CLOUD.md) use managed KMS and private versioned S3, with a retained infrastructure template and local SDK-contract tests. No AWS resources have been provisioned or verified live.
+
+All document cloud features remain disabled by default. The local encrypted workspace is usable independently. See the requirements matrix for the remaining product, security and scale work.

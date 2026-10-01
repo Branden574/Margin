@@ -4,9 +4,21 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "npm run build -w @margin/lms",
     "dev": "node --env-file=../../.local/api.env --import tsx --watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-kms": "3.1145.0",
+    "@aws-sdk/client-s3": "3.1145.0",
+    "@margin/lms": "0.1.0",
+    "@smithy/node-http-handler": "4.12.1",
+    "openid-client": "6.8.8",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1"
   }
 }

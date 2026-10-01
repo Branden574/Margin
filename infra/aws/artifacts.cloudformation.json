@@ -1,0 +1,479 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Margin private encrypted artifact foundation. No application deployment, plaintext data, public access or automatic data expiry.",
+  "Parameters": {
+    "Environment": {
+      "Type": "String",
+      "AllowedValues": ["development", "staging", "production"],
+      "Default": "staging"
+    },
+    "KeyAdministratorArn": {
+      "Type": "String",
+      "Description": "Existing reviewed key-administration IAM role ARN; not the application task role.",
+      "AllowedPattern": "arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+"
+    }
+  },
+  "Resources": {
+    "EnvelopeKey": {
+      "Type": "AWS::KMS::Key",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Description": "Margin application envelope key; preserves old ciphertext across automatic rotation",
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "EnableKeyRotation": true,
+        "RotationPeriodInDays": 365,
+        "PendingWindowInDays": 30,
+        "KeyPolicy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AccountPolicyDelegation",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+                }
+              },
+              "Action": "kms:*",
+              "Resource": "*"
+            },
+            {
+              "Sid": "SeparateKeyAdministration",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Ref": "KeyAdministratorArn"
+                }
+              },
+              "Action": [
+                "kms:CreateAlias",
+                "kms:DescribeKey",
+                "kms:EnableKey",
+                "kms:DisableKey",
+                "kms:EnableKeyRotation",
+                "kms:DisableKeyRotation",
+                "kms:GetKeyRotationStatus",
+                "kms:GetKeyPolicy",
+                "kms:PutKeyPolicy",
+                "kms:UpdateKeyDescription",
+                "kms:ListResourceTags",
+                "kms:TagResource",
+                "kms:UntagResource",
+                "kms:ScheduleKeyDeletion",
+                "kms:CancelKeyDeletion"
+              ],
+              "Resource": "*"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Application",
+            "Value": "margin"
+          },
+          {
+            "Key": "Environment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      }
+    },
+    "StorageKey": {
+      "Type": "AWS::KMS::Key",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Description": "Margin S3 server-side encryption key; separate from application envelope encryption",
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "EnableKeyRotation": true,
+        "RotationPeriodInDays": 365,
+        "PendingWindowInDays": 30,
+        "KeyPolicy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AccountPolicyDelegation",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+                }
+              },
+              "Action": "kms:*",
+              "Resource": "*"
+            },
+            {
+              "Sid": "SeparateKeyAdministration",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Ref": "KeyAdministratorArn"
+                }
+              },
+              "Action": [
+                "kms:CreateAlias",
+                "kms:DescribeKey",
+                "kms:EnableKey",
+                "kms:DisableKey",
+                "kms:EnableKeyRotation",
+                "kms:DisableKeyRotation",
+                "kms:GetKeyRotationStatus",
+                "kms:GetKeyPolicy",
+                "kms:PutKeyPolicy",
+                "kms:UpdateKeyDescription",
+                "kms:ListResourceTags",
+                "kms:TagResource",
+                "kms:UntagResource",
+                "kms:ScheduleKeyDeletion",
+                "kms:CancelKeyDeletion"
+              ],
+              "Resource": "*"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Application",
+            "Value": "margin"
+          },
+          {
+            "Key": "Environment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      }
+    },
+    "ArtifactBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "aws:kms",
+                "KMSMasterKeyID": {
+                  "Fn::GetAtt": ["StorageKey", "Arn"]
+                }
+              },
+              "BucketKeyEnabled": false
+            }
+          ]
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "AbortIncompleteMultipartOnly",
+              "Status": "Enabled",
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Application",
+            "Value": "margin"
+          },
+          {
+            "Key": "Environment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      }
+    },
+    "ArtifactBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "ArtifactBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyInsecureTransport",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": ["ArtifactBucket", "Arn"]
+                },
+                {
+                  "Fn::Sub": "${ArtifactBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            },
+            {
+              "Sid": "DenyUnexpectedEncryption",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:PutObject",
+              "Resource": {
+                "Fn::Sub": "${ArtifactBucket.Arn}/*"
+              },
+              "Condition": {
+                "StringNotEquals": {
+                  "s3:x-amz-server-side-encryption": "aws:kms"
+                }
+              }
+            },
+            {
+              "Sid": "DenyUnexpectedStorageKey",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:PutObject",
+              "Resource": {
+                "Fn::Sub": "${ArtifactBucket.Arn}/*"
+              },
+              "Condition": {
+                "ArnNotEqualsIfExists": {
+                  "s3:x-amz-server-side-encryption-aws-kms-key-id": {
+                    "Fn::GetAtt": ["StorageKey", "Arn"]
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "DenyUnconditionalArtifactWrites",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:PutObject",
+              "Resource": {
+                "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/v1/*"
+              },
+              "Condition": {
+                "Null": {
+                  "s3:if-none-match": "true"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ArtifactTaskRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "MaxSessionDuration": 3600,
+        "Policies": [
+          {
+            "PolicyName": "MarginPrivateArtifacts",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ImmutableArtifactWrite",
+                  "Effect": "Allow",
+                  "Action": ["s3:PutObject"],
+                  "Resource": {
+                    "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/v1/*"
+                  },
+                  "Condition": {
+                    "Null": {
+                      "s3:if-none-match": "false"
+                    }
+                  }
+                },
+                {
+                  "Sid": "ReadExactVersions",
+                  "Effect": "Allow",
+                  "Action": ["s3:GetObjectVersion"],
+                  "Resource": {
+                    "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/v1/*"
+                  }
+                },
+                {
+                  "Sid": "ApplicationEnvelopes",
+                  "Effect": "Allow",
+                  "Action": ["kms:Encrypt", "kms:Decrypt"],
+                  "Resource": {
+                    "Fn::GetAtt": ["EnvelopeKey", "Arn"]
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:EncryptionContext:application": "margin",
+                      "kms:EncryptionContext:purpose": "envelope-v1"
+                    },
+                    "Null": {
+                      "kms:EncryptionContext:binding": "false"
+                    }
+                  }
+                },
+                {
+                  "Sid": "S3EncryptionOnlyViaS3",
+                  "Effect": "Allow",
+                  "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+                  "Resource": {
+                    "Fn::GetAtt": ["StorageKey", "Arn"]
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:ViaService": {
+                        "Fn::Sub": "s3.${AWS::Region}.${AWS::URLSuffix}"
+                      },
+                      "kms:CallerAccount": {
+                        "Ref": "AWS::AccountId"
+                      }
+                    },
+                    "StringLike": {
+                      "kms:EncryptionContext:aws:s3:arn": {
+                        "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/v1/*"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ArtifactPurgePolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "Description": "Unattached. Explicitly assign only to an approved version-deletion worker after retention review.",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DeleteExactArtifactVersions",
+              "Effect": "Allow",
+              "Action": ["s3:DeleteObjectVersion"],
+              "Resource": {
+                "Fn::Sub": "${ArtifactBucket.Arn}/artifacts/v1/*"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "EnvelopeRewrapPolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "Description": "Unattached. Grant old/new key ARNs deliberately to a separate rotation worker; never the request runtime.",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "RewrapCurrentKey",
+              "Effect": "Allow",
+              "Action": ["kms:ReEncryptFrom", "kms:ReEncryptTo"],
+              "Resource": {
+                "Fn::GetAtt": ["EnvelopeKey", "Arn"]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:application": "margin",
+                  "kms:EncryptionContext:purpose": "envelope-v1"
+                },
+                "Null": {
+                  "kms:EncryptionContext:binding": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "BucketName": {
+      "Value": {
+        "Ref": "ArtifactBucket"
+      }
+    },
+    "BucketOwnerAccount": {
+      "Value": {
+        "Ref": "AWS::AccountId"
+      }
+    },
+    "Region": {
+      "Value": {
+        "Ref": "AWS::Region"
+      }
+    },
+    "EnvelopeKeyArn": {
+      "Value": {
+        "Fn::GetAtt": ["EnvelopeKey", "Arn"]
+      }
+    },
+    "StorageKeyArn": {
+      "Value": {
+        "Fn::GetAtt": ["StorageKey", "Arn"]
+      }
+    },
+    "ArtifactTaskRoleArn": {
+      "Value": {
+        "Fn::GetAtt": ["ArtifactTaskRole", "Arn"]
+      }
+    },
+    "UnattachedPurgePolicyArn": {
+      "Value": {
+        "Ref": "ArtifactPurgePolicy"
+      }
+    },
+    "UnattachedRewrapPolicyArn": {
+      "Value": {
+        "Ref": "EnvelopeRewrapPolicy"
+      }
+    }
+  }
+}

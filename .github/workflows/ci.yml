@@ -18,6 +18,10 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
+      - name: Install PostgreSQL for required service integration tests
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql postgresql-contrib
+          pg_config --bindir >> "$GITHUB_PATH"
       - run: npm audit --audit-level=high
       - run: npm sbom --package-lock-only --sbom-format=cyclonedx > margin-sbom.json
       - name: Retain dependency inventory
@@ -29,7 +33,11 @@ jobs:
       - run: npm run format:check
       - run: npm run typecheck
       - run: npm test
+        env:
+          MARGIN_REQUIRE_POSTGRES_TESTS: '1'
+      - run: npm run test:marketing
       - run: npm run build
+      - run: npm run check:budget -w @margin/marketing
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - run: npm run test:offline
