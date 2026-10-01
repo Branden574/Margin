@@ -13,3 +13,4 @@ test-results/
 *.key
 *.p12
 *.pfx
+margin-sbom.json
