@@ -1,0 +1,37 @@
+{
+  "name": "margin-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @margin/web",
+    "dev:api": "npm run dev -w @margin/api",
+    "build": "npm run build -w @margin/web && npm run build -w @margin/api && npm run build -w @margin/extension",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "setup:dev": "node scripts/setup-dev.mjs",
+    "predev": "npm run setup:dev",
+    "format": "prettier --write \"**/*.{ts,tsx,js,mjs,json,css,html,md,yml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,mjs,json,css,html,md,yml}\"",
+    "test:offline": "npm run setup:dev && node scripts/check-offline.mjs",
+    "test:a11y": "node scripts/check-accessibility.mjs"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.20.4",
+    "fake-indexeddb": "6.2.5",
+    "prettier": "3.6.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

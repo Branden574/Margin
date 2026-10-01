@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Margin</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="logo" aria-hidden="true">m</div>
+        <div>
+          <h1>Margin</h1>
+          <p>A little room for big ideas.</p>
+        </div>
+      </header>
+      <section>
+        <h2>Your document, a fresh start.</h2>
+        <p>Bring a PDF or image link into your workspace. You can also import a downloaded file.</p>
+        <button id="open-current" class="primary">
+          Open this page in Margin <span aria-hidden="true">↗</span></button
+        ><button id="open-workspace">Go to workspace</button>
+      </section>
+      <details>
+        <summary>Workspace settings</summary>
+        <form id="settings">
+          <label for="workspace">Workspace URL</label
+          ><input id="workspace" type="url" required spellcheck="false" autocomplete="off" />
+          <p class="hint">HTTPS is required, including localhost.</p>
+          <button type="submit">Save workspace</button>
+        </form>
+      </details>
+      <p id="status" role="status" aria-live="polite"></p>
+      <footer>No page scanning. No document processing.</footer>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

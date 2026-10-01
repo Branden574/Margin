@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Margin — Open your document workspace",
+  "version": "0.1.0",
+  "description": "Open a PDF link in your Margin workspace. Lightweight document handoff with no background page access.",
+  "minimum_chrome_version": "116",
+  "permissions": ["activeTab", "contextMenus", "storage"],
+  "action": { "default_popup": "popup.html", "default_title": "Open in Margin" },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
+  }
+}

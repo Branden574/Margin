@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+playwright-report/
+test-results/
+.local/
+.DS_Store
+.margin-data/
+*.pem
+*.key
+*.p12
+*.pfx
