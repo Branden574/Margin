@@ -9,9 +9,12 @@ const activeCertificatePath = resolve(root, '.local/tls/cert.pem');
 const trustedCertificatePath = resolve(root, '.local/tls/trusted-cert.pem');
 const lockPath = resolve(root, '.local/tls/.trust-lock');
 const command = process.argv[2] || '--status';
-if (!['--status', '--trust', '--remove'].includes(command)) {
-  throw new Error('Usage: node scripts/trust-local-cert.mjs [--status|--trust|--remove]');
+if (!['--status', '--trust', '--trust-ssl', '--remove'].includes(command)) {
+  throw new Error(
+    'Usage: node scripts/trust-local-cert.mjs [--status|--trust|--trust-ssl|--remove]',
+  );
 }
+const requestingTrust = command === '--trust' || command === '--trust-ssl';
 if (process.platform !== 'darwin') {
   throw new Error(
     'This helper is for macOS user certificate trust. It does not change trust on other operating systems.',
@@ -55,6 +58,13 @@ try {
       'The local server certificate is not currently valid. Run npm run setup:dev first.',
     );
   }
+  if (
+    requestingTrust &&
+    certificate.subjectAltName !== 'DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1'
+  )
+    throw new Error(
+      'Refusing trust: the certificate names must be exactly localhost, 127.0.0.1 and ::1.',
+    );
   console.log(`Certificate: ${certificatePath}\nSHA-256: ${certificate.fingerprint256}`);
   const verify = (path) =>
     spawnSync(
@@ -71,7 +81,7 @@ try {
     );
     process.exitCode = result.status === 0 ? 0 : 1;
   } else {
-    if (command === '--trust') {
+    if (requestingTrust) {
       if (
         existsSync(trustedCertificatePath) &&
         new X509Certificate(readFileSync(trustedCertificatePath)).fingerprint256 !==
@@ -90,9 +100,13 @@ try {
         mode: 0o600,
         flush: true,
       });
-    if (command === '--trust') {
+    if (requestingTrust) {
       console.log(
-        'Requesting user-account trust for this exact server certificate, SSL policy, host 127.0.0.1 only.\nApprove the macOS prompt yourself if shown. No private key is imported and no system-wide trust is changed.',
+        command === '--trust-ssl'
+          ? 'Requesting user-account SSL trust for this exact certificate, without a macOS hostname-policy restriction, for Chromium compatibility. This is broader than --trust.\nThe certificate names are: ' +
+              certificate.subjectAltName +
+              '.\nApprove the macOS prompt yourself if shown. No private key is imported and no system-wide trust is changed.'
+          : 'Requesting user-account trust for this exact server certificate, SSL policy, host 127.0.0.1 only.\nApprove the macOS prompt yourself if shown. No private key is imported and no system-wide trust is changed.',
       );
       const result = spawnSync(
         '/usr/bin/security',
@@ -102,8 +116,7 @@ try {
           'trustRoot',
           '-p',
           'ssl',
-          '-s',
-          '127.0.0.1',
+          ...(command === '--trust' ? ['-s', '127.0.0.1'] : []),
           '-k',
           resolve(homedir(), 'Library/Keychains/login.keychain-db'),
           trustedCertificatePath,

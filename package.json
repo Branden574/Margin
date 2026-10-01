@@ -21,6 +21,7 @@
     "test:offline": "npm run setup:dev && node scripts/check-offline.mjs",
     "test:a11y": "node scripts/check-accessibility.mjs",
     "trust:dev": "node scripts/trust-local-cert.mjs --trust",
+    "trust:dev:chromium": "node scripts/trust-local-cert.mjs --trust-ssl",
     "untrust:dev": "node scripts/trust-local-cert.mjs --remove",
     "check:tls": "node scripts/trust-local-cert.mjs --status"
   },
