@@ -90,6 +90,10 @@
   font-size: 11px;
   align-self: flex-start;
 }
+:root:not([data-theme='dark']):not([data-theme='contrast']) .reading-intro,
+:root:not([data-theme='dark']):not([data-theme='contrast']) .reading-text-button {
+  color: #a34c2f;
+}
 .reading-appearance {
   border-top: 1px solid var(--ed-border);
   border-bottom: 1px solid var(--ed-border);

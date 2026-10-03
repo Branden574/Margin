@@ -1457,7 +1457,11 @@ export default function DocumentEditor({
                       id: a.id,
                     });
                 }}
-                aria-label="Annotation canvas. Choose a tool, then draw or click on the document."
+                aria-label={
+                  focusMode
+                    ? 'Page annotations. Exit focus mode to edit.'
+                    : 'Annotation canvas. Choose a tool, then draw or click on the document.'
+                }
               >
                 {currentPageAnnotations
                   .filter((a) => a.id !== draftAnnotation?.id)
