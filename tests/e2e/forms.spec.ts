@@ -60,7 +60,7 @@ async function importAndOpen(page: Page, name: string, buffer: Buffer) {
   await expect(
     page.getByRole('button', { name: `Actions for ${name}`, exact: true }),
   ).toBeVisible();
-  await page.getByText(name, { exact: true }).first().click();
+  await page.getByRole('button', { name: `${name} PDF document`, exact: true }).click();
   await expect(page.getByRole('button', { name: 'Fill form', exact: true })).toBeEnabled();
 }
 async function openForm(page: Page) {
