@@ -102,3 +102,17 @@ Additional checks passed:
 - Truncated `synthetic-malformed-form.pdf` was rejected during import with a damaged/incomplete message. Dismissed the failed test row and returned to the saved supported form.
 
 Local screenshot evidence: `.local/manual-checks/form-values-recovered.jpg` and `.local/manual-checks/form-multiline-fixed.jpg`. The saved supported form remains open in the app. This is a checked local form workflow, not a claim of form authoring, XFA support, legal completion, third-party PDF-reader interoperability or Canvas submission. Actual encrypted download delivery in this in-app browser remains unresolved; the existing automated decrypted-export regression is separate evidence.
+
+## Reading controls walkthrough — October 2, 2026
+
+Used the existing normally trusted HTTPS in-app tab with a synthetic three-page PDF: text, a deliberately blank page, then different text. Imported it as `d6f259ca-69fc-423d-a23a-84f5ea2fb1bc`. No real student content or remote speech service was used.
+
+- The local voice picker enumerated installed voices and selected Samantha (en-US). Play produced a visible Reading state, sentence highlight and a changing word highlight from native browser events. Pause exposed Resume reading and retained the current highlighted position.
+- While paused, selected 1.25× and Daniel (en-GB). Playback stayed paused with cleared highlights. Resume restarted the current sentence, and native word events resumed with the new settings. A second pause/resume without settings changes advanced naturally from the paused word.
+- Navigated from playing text to the blank page. Status became No text, both playback buttons were disabled, and no old word/sentence highlight or old page text remained. The third page showed only its own text.
+- Copy text showed success and the actual clipboard matched the third page, including its line breaks, with none of the first page's text. Closing the panel removed its text/overlays, exited focus mode and returned focus to Read aloud. Stop cleared highlights and disabled Stop; starting again then closing the panel returned the editor to its normal controls.
+- Focus mode hid annotation/page tools while retaining document navigation. The ruler was moved by keyboard to 100%, switched to paragraph height and then reset. Warm cream and soft blue overlays and 150% reflowed text visibly changed the reading view. Escape from the focus toggle inside the reading panel restored editing controls. Appearance changes did not alter document page count or saved annotations.
+- Document search for `new idea` returned the correct two pages. Navigated to page 3, rotated it, and observed old results clear; Undo restored the original page and its correct reading text.
+- Visually inspected the panel in light, dark and high-contrast modes, including the comfortable reading font. Restored Light and the original standard font through Settings afterward. The reading fixture remains open at page 1, with playback stopped.
+
+Screenshot: `.local/manual-checks/reading-focus-native-tracking.png` shows a paused native Daniel utterance with visible sentence/word highlights, a color overlay and the PDF ruler. This is visual/event evidence, not an assessment of speaker sound quality, word-alignment precision across voices, native screen-reader usability or physical mobile/Chromebook behavior. Restricted-permission, unavailable-voice and stalled-engine paths have deterministic tests; they were not all reproduced on this installed browser/voice combination.

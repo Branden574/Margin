@@ -165,7 +165,9 @@ test('500-page synthetic PDF keeps at most six canvases and navigates to the fin
   await expect(page.getByRole('button', { name: 'Next page', exact: true })).toBeDisabled();
   expect(await page.locator('canvas').count()).toBeLessThanOrEqual(6);
   await page.getByRole('button', { name: 'View page text', exact: true }).click();
-  await expect(page.locator('.editor-page-text')).toContainText('Verification page 500');
+  await expect(page.getByRole('region', { name: 'Page 500 text', exact: true })).toContainText(
+    'Verification page 500',
+  );
 });
 
 test('encrypted export retains long Unicode comments across a complete notes appendix', async ({

@@ -4,15 +4,16 @@ import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 GlobalWorkerOptions.workerSrc = workerUrl;
 
 export function usePdf(blob: Blob) {
-  const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(true);
+  const [snapshot, setSnapshot] = useState<{
+    blob: Blob;
+    pdf: PDFDocumentProxy | null;
+    error: string;
+    loading: boolean;
+  } | null>(null);
   useEffect(() => {
     let stopped = false,
       task: ReturnType<typeof getDocument> | undefined;
-    setLoading(true);
-    setPdf(null);
-    setError('');
+    setSnapshot({ blob, pdf: null, error: '', loading: true });
     void blob
       .arrayBuffer()
       .then((data) => {
@@ -25,15 +26,18 @@ export function usePdf(blob: Blob) {
         });
         return task.promise.then((document) => {
           if (!stopped) {
-            setPdf(document);
-            setLoading(false);
+            setSnapshot({ blob, pdf: document, error: '', loading: false });
           }
         });
       })
       .catch((reason) => {
         if (!stopped) {
-          setError(reason instanceof Error ? reason.message : 'This PDF could not be opened.');
-          setLoading(false);
+          setSnapshot({
+            blob,
+            pdf: null,
+            error: reason instanceof Error ? reason.message : 'This PDF could not be opened.',
+            loading: false,
+          });
         }
       });
     return () => {
@@ -41,5 +45,9 @@ export function usePdf(blob: Blob) {
       void task?.destroy();
     };
   }, [blob]);
-  return { pdf, error, loading };
+  // A replaced file must never expose the previous revision to reading or editing,
+  // including the render before the loading effect has run.
+  return snapshot?.blob === blob
+    ? { pdf: snapshot.pdf, error: snapshot.error, loading: snapshot.loading }
+    : { pdf: null, error: '', loading: true };
 }

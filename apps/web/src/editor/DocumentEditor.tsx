@@ -22,6 +22,7 @@ import {
   Download,
   Eraser,
   FilePlus2,
+  Focus,
   ListChecks,
   Highlighter,
   Loader2,
@@ -41,7 +42,6 @@ import {
   Type,
   Undo2,
   Volume2,
-  VolumeX,
   WifiOff,
   X,
 } from 'lucide-react';
@@ -52,6 +52,9 @@ import { usePdf } from './usePdf';
 import { PdfCanvas } from './PdfCanvas';
 import { AnnotationGraphic } from './AnnotationLayer';
 import { FormsDialog } from './FormsDialog';
+import { ReadingPanel, ReadingPageOverlay, defaultReadingAppearance } from './ReadingPanel';
+import { usePageText } from './usePageText';
+import { readPageText } from './pageText';
 import type { PdfFormChange, PdfFormInspection } from './formTypes';
 import { SignatureDialog, type SignatureInput } from './SignatureDialog';
 import {
@@ -151,6 +154,9 @@ export default function DocumentEditor({
     [panel, setPanel] = useState<'comments' | 'search' | 'text' | null>(null),
     [pageMenu, setPageMenu] = useState(false),
     [shapeMenu, setShapeMenu] = useState(false);
+  const [focusMode, setFocusMode] = useState(false),
+    [readingAppearance, setReadingAppearance] = useState(defaultReadingAppearance);
+  const readingButton = useRef<HTMLButtonElement>(null);
   const [draftAnnotation, setDraftAnnotation] = useState<Annotation | null>(null),
     [selected, setSelected] = useState<string | null>(null);
   const [editing, setEditing] = useState<{
@@ -168,10 +174,8 @@ export default function DocumentEditor({
       if (exportLink) URL.revokeObjectURL(exportLink.url);
     };
   }, [exportLink]);
-  const [online, setOnline] = useState(navigator.onLine),
-    [speaking, setSpeaking] = useState(false),
-    [readSpeed, setReadSpeed] = useState(1),
-    [pageText, setPageText] = useState('');
+  const [online, setOnline] = useState(navigator.onLine);
+  const pageReading = usePageText(panel === 'text' ? pdf : null, pageIndex);
   const [search, setSearch] = useState(''),
     [searching, setSearching] = useState(false),
     [searchProgress, setSearchProgress] = useState(0),
@@ -183,6 +187,7 @@ export default function DocumentEditor({
   const draft = useRef<Draft | null>(null),
     canvasArea = useRef<HTMLDivElement>(null),
     searchGeneration = useRef(0),
+    searchAbort = useRef<AbortController | null>(null),
     editDialog = useRef<HTMLDialogElement>(null),
     commandDialog = useRef<HTMLDialogElement>(null),
     mergeInput = useRef<HTMLInputElement>(null);
@@ -303,40 +308,20 @@ export default function DocumentEditor({
   }, [pageIndex]);
   useEffect(() => {
     searchGeneration.current++;
+    searchAbort.current?.abort();
     setSearching(false);
     setSearchResults([]);
   }, [pdf]);
-  useEffect(() => {
-    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-    setSpeaking(false);
-  }, [pageIndex, workingBlob]);
   useEffect(
     () => () => {
       searchGeneration.current++;
-      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      searchAbort.current?.abort();
     },
     [],
   );
   useEffect(() => {
-    let stale = false;
-    setPageText('');
-    if (pdf)
-      void pdf
-        .getPage(pageIndex + 1)
-        .then((page) => page.getTextContent())
-        .then((content) => {
-          if (!stale)
-            setPageText(
-              content.items
-                .map((item) => ('str' in item ? item.str + (item.hasEOL ? '\n' : ' ') : ''))
-                .join(''),
-            );
-        })
-        .catch(() => {});
-    return () => {
-      stale = true;
-    };
-  }, [pdf, pageIndex]);
+    if (panel !== 'text') setFocusMode(false);
+  }, [panel]);
   function pushHistory(before: Snapshot, after: Snapshot) {
     setHistory((entries) => {
       const next = [...entries, { before, after }].slice(-40);
@@ -422,7 +407,15 @@ export default function DocumentEditor({
     if (!shortcuts) return;
     const keydown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      if (target.closest('input,textarea,[contenteditable="true"],dialog')) return;
+      if (target.closest('input,textarea,select,[contenteditable="true"],dialog,.reading-panel'))
+        return;
+      if (focusMode) {
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        if (e.key === 'Escape') setFocusMode(false);
+        if (e.key === 'ArrowRight') setPageIndex((i) => Math.min(pageCount - 1, i + 1));
+        if (e.key === 'ArrowLeft') setPageIndex((i) => Math.max(0, i - 1));
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setCommandOpen(true);
@@ -843,6 +836,9 @@ export default function DocumentEditor({
   }
   async function runSearch() {
     if (!pdf || !search.trim()) return;
+    searchAbort.current?.abort();
+    const abort = new AbortController();
+    searchAbort.current = abort;
     const generation = ++searchGeneration.current;
     setSearching(true);
     setSearchResults([]);
@@ -850,9 +846,12 @@ export default function DocumentEditor({
     try {
       for (let index = 0; index < pdf.numPages; index++) {
         if (searchGeneration.current !== generation) return;
-        const p = await pdf.getPage(index + 1),
-          content = await p.getTextContent(),
-          text = content.items.map((item) => ('str' in item ? item.str : '')).join(' '),
+        const { text: rawText } = await readPageText(pdf, index, {
+          signal: abort.signal,
+          cleanup: true,
+        });
+        if (searchGeneration.current !== generation) return;
+        const text = rawText.replace(/\s+/g, ' '),
           match = text.toLocaleLowerCase().indexOf(query);
         if (match !== -1)
           setSearchResults((results) => [
@@ -866,7 +865,6 @@ export default function DocumentEditor({
             },
           ]);
         setSearchProgress(index + 1);
-        if (Math.abs(index - pageIndex) > 2) p.cleanup();
         if (index % 8 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
       }
     } catch (e) {
@@ -876,27 +874,15 @@ export default function DocumentEditor({
     }
   }
   function readAloud() {
-    if (!('speechSynthesis' in window)) {
-      setError('Read aloud is unavailable in this browser.');
-      return;
-    }
-    if (speaking) {
-      window.speechSynthesis.cancel();
-      setSpeaking(false);
-      return;
-    }
-    if (!pageText.trim()) {
-      setNotice(
-        'This page has no selectable text. Scanned pages need OCR, which is not connected in this local workspace.',
-      );
-      return;
-    }
-    const utterance = new SpeechSynthesisUtterance(pageText);
-    utterance.rate = readSpeed;
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
-    window.speechSynthesis.speak(utterance);
-    setSpeaking(true);
+    setPanel('text');
+  }
+  function toggleFocusMode(value: boolean) {
+    setFocusMode(value);
+    setSelected(null);
+    setPageMenu(false);
+    setShapeMenu(false);
+    draft.current = null;
+    setDraftAnnotation(null);
   }
   function fitPage() {
     if (canvasArea.current)
@@ -933,7 +919,7 @@ export default function DocumentEditor({
           ? 'Arrow'
           : 'Line');
   return (
-    <div className="document-editor">
+    <div className={`document-editor${focusMode ? ' is-reading-focus' : ''}`}>
       <input
         hidden
         ref={mergeInput}
@@ -988,28 +974,42 @@ export default function DocumentEditor({
           </span>
         </div>
         <button
+          ref={readingButton}
           className="editor-secondary editor-read"
           onClick={readAloud}
-          disabled={!ready}
-          title="Read this page aloud"
+          disabled={!pdf}
+          title="Open reading tools"
+          aria-label="Read aloud"
+          aria-expanded={panel === 'text'}
         >
-          {speaking ? <VolumeX size={16} /> : <Volume2 size={16} />}
-          <span>{speaking ? 'Stop reading' : 'Read aloud'}</span>
+          <Volume2 size={16} />
+          <span>Read aloud</span>
         </button>
+        {focusMode ? (
+          <button
+            className="editor-secondary editor-focus-exit"
+            onClick={() => setFocusMode(false)}
+          >
+            <Focus size={16} />
+            Exit focus mode
+          </button>
+        ) : null}
         <button
-          className="editor-secondary"
+          className="editor-secondary editor-form-button"
           onClick={() => void openForm()}
           disabled={!ready}
           title="Fill existing PDF form fields"
+          aria-label="Fill form"
         >
           <ListChecks size={16} />
           <span>Fill form</span>
         </button>
         <button
-          className="editor-primary"
+          className="editor-primary editor-export-button"
           onClick={() => void exportPdf()}
           disabled={!ready}
           title="Export PDF content in an encrypted .margin package. Reopen in Margin with your vault passphrase."
+          aria-label="Export encrypted file"
         >
           <Download size={16} />
           <span>Export encrypted file</span>
@@ -1302,7 +1302,7 @@ export default function DocumentEditor({
         </div>
       ) : null}
       <div className="editor-body">
-        {sidebar ? (
+        {sidebar && !focusMode ? (
           <aside className="editor-pages" aria-label="Document pages">
             <div className="editor-panel-heading">
               <span>Pages</span>
@@ -1468,6 +1468,12 @@ export default function DocumentEditor({
                   <AnnotationGraphic annotation={draftAnnotation} selected={tool === 'select'} />
                 ) : null}
               </svg>
+              {panel === 'text' ? (
+                <ReadingPageOverlay
+                  appearance={readingAppearance}
+                  pageHeight={pageSize.height * zoom}
+                />
+              ) : null}
             </div>
           ) : null}
           {!loading && pdfError ? (
@@ -1483,13 +1489,13 @@ export default function DocumentEditor({
         </main>
         {panel ? (
           <aside
-            className="editor-sidepanel"
+            className={`editor-sidepanel${panel === 'text' ? ' editor-reading-panel' : ''}`}
             aria-label={
               panel === 'comments'
                 ? 'Comments'
                 : panel === 'search'
                   ? 'Document search'
-                  : 'Page text'
+                  : 'Reading tools'
             }
           >
             <div className="editor-panel-heading">
@@ -1498,11 +1504,14 @@ export default function DocumentEditor({
                   ? 'Comments'
                   : panel === 'search'
                     ? 'Find in document'
-                    : 'Page text'}
+                    : 'Reading tools'}
               </span>
               <button
                 className="editor-icon"
-                onClick={() => setPanel(null)}
+                onClick={() => {
+                  if (panel === 'text') readingButton.current?.focus();
+                  setPanel(null);
+                }}
                 aria-label="Close panel"
               >
                 <X size={16} />
@@ -1614,6 +1623,7 @@ export default function DocumentEditor({
                     <button
                       onClick={() => {
                         searchGeneration.current++;
+                        searchAbort.current?.abort();
                         setSearching(false);
                       }}
                     >
@@ -1637,41 +1647,21 @@ export default function DocumentEditor({
                 </div>
               </>
             ) : null}
-            {panel === 'text' ? (
-              <>
-                <div className="editor-text-tools">
-                  <button
-                    className="editor-secondary"
-                    disabled={!pageText}
-                    onClick={() =>
-                      void navigator.clipboard
-                        .writeText(pageText)
-                        .then(() => setNotice('Page text copied.'))
-                        .catch(() =>
-                          setError(
-                            'Clipboard permission was denied. Select and copy the page text below.',
-                          ),
-                        )
-                    }
-                  >
-                    <Copy size={14} />
-                    Copy text
-                  </button>
-                  <label>
-                    Reading speed
-                    <select value={readSpeed} onChange={(e) => setReadSpeed(+e.target.value)}>
-                      <option value=".75">0.75×</option>
-                      <option value="1">1×</option>
-                      <option value="1.25">1.25×</option>
-                      <option value="1.5">1.5×</option>
-                    </select>
-                  </label>
-                </div>
-                <div className="editor-page-text">
-                  {pageText ||
-                    'This page has no selectable text. OCR is not connected in this local workspace.'}
-                </div>
-              </>
+            {panel === 'text' && !vaultLocking && !leaving ? (
+              <ReadingPanel
+                text={loading ? '' : pageReading.text}
+                contextKey={`${record.id}:${pageIndex}`}
+                pageNumber={pageIndex + 1}
+                loading={loading || pageReading.loading}
+                extractionError={pageReading.error}
+                canCopy={pageReading.canCopy}
+                focusMode={focusMode}
+                onFocusMode={toggleFocusMode}
+                appearance={readingAppearance}
+                onAppearance={setReadingAppearance}
+                onNotice={setNotice}
+                onError={setError}
+              />
             ) : null}
           </aside>
         ) : null}

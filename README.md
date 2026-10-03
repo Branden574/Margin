@@ -54,20 +54,20 @@ Signed Canvas launches require explicitly provisioned installation, identity, co
 
 ## Working capabilities
 
-| Area            | Available now                                                                                                                                    |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Library         | Search, recent files, folders, starred documents, list/grid, sorting, copy, rename, move, Trash/restore and permanent deletion                   |
-| Reader          | Worker-rendered PDF, bounded thumbnails, zoom, page navigation, text search and browser read-aloud                                               |
-| Annotations     | Pen, highlight, text, comments, shapes/arrows/stamps, visual signatures, eraser, selection, bounded undo/redo and local autosave                 |
-| PDF pages       | Rotate, duplicate, insert blank, move, delete, merge and extract; form PDFs allow rotation/insertion while other structural changes are guarded  |
-| PDF forms       | Fill supported existing text/checkbox/radio/choice fields with validation, grouped undo/redo and encrypted local saving; [limits](docs/FORMS.md) |
-| Exports         | Annotated PDF and complete comment appendix inside an authenticated encrypted `.margin` package; encrypted original and metadata-index exports   |
-| Local classroom | Assignment drafts, instructions, class/due date, student submission state and teacher feedback/return                                            |
-| Preferences     | Teacher/student views, light/dark/high contrast, comfortable reading font, reduced motion and keyboard shortcuts                                 |
-| Security        | Passphrase-encrypted vault, in-memory keys/tokens, cross-tab lock/save handshake, HTTPS-only transfer and authenticated encrypted server storage |
-| Chrome          | Minimal Manifest V3 popup and context-menu link launcher                                                                                         |
+| Area            | Available now                                                                                                                                                          |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Library         | Search, recent files, folders, starred documents, list/grid, sorting, copy, rename, move, Trash/restore and permanent deletion                                         |
+| Reader          | Worker-rendered PDF, bounded thumbnails, zoom/navigation/search, local-voice playback controls, focus/ruler/tints and reflowed text; [reading limits](docs/READING.md) |
+| Annotations     | Pen, highlight, text, comments, shapes/arrows/stamps, visual signatures, eraser, selection, bounded undo/redo and local autosave                                       |
+| PDF pages       | Rotate, duplicate, insert blank, move, delete, merge and extract; form PDFs allow rotation/insertion while other structural changes are guarded                        |
+| PDF forms       | Fill supported existing text/checkbox/radio/choice fields with validation, grouped undo/redo and encrypted local saving; [limits](docs/FORMS.md)                       |
+| Exports         | Annotated PDF and complete comment appendix inside an authenticated encrypted `.margin` package; encrypted original and metadata-index exports                         |
+| Local classroom | Assignment drafts, instructions, class/due date, student submission state and teacher feedback/return                                                                  |
+| Preferences     | Teacher/student views, light/dark/high contrast, comfortable reading font, reduced motion and keyboard shortcuts                                                       |
+| Security        | Passphrase-encrypted vault, in-memory keys/tokens, cross-tab lock/save handshake, HTTPS-only transfer and authenticated encrypted server storage                       |
+| Chrome          | Minimal Manifest V3 popup and context-menu link launcher                                                                                                               |
 
-Teacher/student views are workflow preferences, not authorization roles. Local assignments do not send work to another person. Read-aloud uses available browser voices; it does not perform OCR.
+Teacher/student views are workflow preferences, not authorization roles. Local assignments do not send work to another person. Read-aloud uses voices reported as local by the browser; it does not perform OCR.
 
 All exported document files are encrypted to follow the security brief. A `.margin` package is not directly readable in a standard PDF reader; import it into Margin to view its contents. The metadata-index export is a reference file, not a whole-workspace restore archive. Original source files outside Margin are not changed or encrypted by the app.
 
@@ -121,6 +121,6 @@ Read the [architecture](docs/ARCHITECTURE.md), [local security model](docs/LOCAL
 
 ## Service implementation checkpoints
 
-The optional organization services now include OIDC sessions, durable annotation operation storage and Canvas launch verification. [Assignment services](docs/ASSIGNMENTS.md) add encrypted teacher drafts, signed Deep Linking responses, course-bound resource mapping and pending student-copy reservations; their HTTP/UI and trusted ingestion/provisioning adapters are not connected. [AWS artifact adapters](docs/CLOUD.md) use managed KMS and private versioned S3, with a retained infrastructure template and local SDK-contract tests. No AWS resources have been provisioned or verified live.
+The optional organization services now include OIDC sessions, durable annotation operation storage and Canvas launch verification. [Assignment services](docs/ASSIGNMENTS.md) add encrypted teacher drafts, signed Deep Linking responses, course-bound resource mapping and pending student-copy reservations; their authenticated HTTP adapter and source-inspection registry are implemented but disabled in the default entrypoint. Live Canvas UI, scanner/upload coordination and student provisioning are not connected. [AWS artifact adapters](docs/CLOUD.md) use managed KMS and private versioned S3, with a retained infrastructure template and local SDK-contract tests. No AWS resources have been provisioned or verified live.
 
 All document cloud features remain disabled by default. The local encrypted workspace is usable independently. See the requirements matrix for the remaining product, security and scale work.
