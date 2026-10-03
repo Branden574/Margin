@@ -1,0 +1,74 @@
+# Authoritative source ingestion and inspection
+
+`apps/api/src/ingestion/` supplies the database and service boundary between an encrypted cloud source and a Canvas assignment master. It is an independently tested backend slice. It does not replace the application's current upload API, create a sync document, enable cloud storage, mount an HTTP route, run a real malware scanner, or remove the production startup gate. No AWS request, account, object, deployment or institution was used in its tests.
+
+The supported input is an immutable **source PDF owned by a currently enrolled Canvas teacher**. The document/version must already exist in sync storage with an active owner grant. The course comes from the live server-side LTI session binding. Browser-supplied owner, organization, course, inspection state and cloud object path are not accepted by this interface. Other artifact kinds, ordinary OIDC ingestion and document conversion need their own authorization and processing workflows.
+
+## Lifecycle and actual readiness
+
+1. `runtime.reserve(principal, input)` reserves one immutable artifact identity for a document/version and returns `pending`. The input contains a stable request UUID, source reference, claimed filename/MIME, byte length and plaintext SHA-256. The metadata is a claim to verify, not scan approval. Retrying the same request returns the same artifact; changing its content returns a conflict.
+2. A trusted server upload coordinator uses that identity with `S3EncryptedArtifactRepository.put`. Only after a complete successful receipt returns does it call `runtime.stageConfirmed(principal, artifactId, receipt)`. The exact S3 version ID, ETag, ciphertext checksum and byte count are encrypted in an immutable receipt. Receipt insertion and creation of the quarantined inspection job commit together. **Do not expose `stageConfirmed` as a browser endpoint accepting receipt JSON.** Its type/shape validation cannot prove that the caller actually performed the storage operation.
+3. The separate inspector credential calls `claimNext`. A transaction leases one due job with `FOR UPDATE SKIP LOCKED`, an opaque token, a fresh claim UUID and an increasing attempt number. It returns the exact storage receipt and expected source metadata to the trusted worker.
+4. `SourceInspectionWorker.runOne` retrieves the exact object through the authenticated storage reader, verifies the actual bytes/hash and metadata, and invokes a supplied scanner. Mismatched source content is rejected before scanning. The real scanner must validate PDF structure, malware, unsupported active content and resource bounds in an isolated worker. **This repository includes no such scanner implementation.** A caller must never substitute a success stub in application composition.
+5. A current claim can atomically commit an encrypted inspection receipt and a `ready` or `rejected` decision. A ready report must match the expected actual byte count/hash, report a bounded positive page count and use the `clean` verdict. The encrypted result is bound to its tenant/document/version/artifact, request, scan receipt, claim, attempt and verdict. A retry with the same completed report is idempotent; a different report is rejected. Terminal decisions cannot be rewritten or rolled back through service credentials. `inspector.revoke` permanently makes a source unavailable through this service.
+
+`pending` is derived from a reservation without a stored receipt/job. `quarantined` means a receipt exists but no committed ready decision exists. Unknown upload results, unavailable object versions, interrupted scans and exhausted retries never become ready. Retry exhaustion leaves the job quarantined for operator attention; a reviewed repair/reconciliation service is still needed.
+
+An S3 network timeout can occur after a successful immutable write. Keep the reservation pending and retain the user's recoverable local source. Never fabricate the missing receipt, overwrite the object, or treat a conditional-write collision as upload success. Authenticated discovery/reconciliation of an unknown S3 version and cleanup of abandoned objects remain unimplemented. There is no distributed atomic transaction between PostgreSQL and S3.
+
+## Assignment source gateway
+
+`IngestionAssignmentSourceGateway` implements the existing `AssignmentSourceGateway` without changing assignment service contracts. It needs three explicitly supplied dependencies:
+
+```ts
+const runtime = new PostgresIngestionRepository(runtimeDatabase, keys, 'runtime');
+const inspector = new PostgresIngestionRepository(inspectorDatabase, keys, 'inspector');
+const reader = new PostgresIngestionRepository(readerDatabase, keys, 'reader');
+const sources = new IngestionAssignmentSourceGateway(runtime, reader, encryptedS3Artifacts);
+// Supply sources to AssignmentService only when all real dependencies are configured.
+```
+
+`resolveForTeacher` checks the current session, organization membership, installation version, course/account links, enrollment, document ownership, owner grant and immutable version, then authenticates the stored scan and exact object receipt. It only resolves a source reserved in that same current course. Another teacher, course or tenant cannot obtain it by guessing the document/version identifiers.
+
+`stillAvailable` is an internal trusted service call for a source snapshot already stored in an encrypted assignment. It uses the separate read-only credential and exact tenant/owner/document/version/artifact context. It verifies the snapshot against the current encrypted manifest and inspection, rechecking owner account/membership, course enrollment, installation version, links, grants, document deletion and artifact revocation. It does not require the original teacher login session to remain open after an assignment has been created.
+
+**A database receipt is not proof that an object still exists.** Both gateway methods call the supplied authenticated `ArtifactReader.get` with the exact object version and receipt. The existing S3 adapter checks the version, ETag, ciphertext digest and GCM authentication before returning bytes. The gateway additionally checks the actual plaintext digest against the approved scan and clears the returned bytes. A missing, replaced, inaccessible, corrupt or timed-out object returns unavailable. After storage I/O, the gateway repeats the database authorization/readiness check to catch revocation during the read. This is a point-in-time gate; every subsequent content access still needs authorization and an exact-version read.
+
+For the initial Canvas resource binding, `prepareAvailability(source)` performs this object verification **before** the assignment repository opens its write transaction. It returns a one-use closure with a ten-second lifetime bound to the exact source and a digest of the authenticated encrypted reservation, storage receipt, inspection receipt, claim and terminal decision. Inside the final assignment transaction, the closure performs only a live database authorization/state recheck, with a one-second deadline and 750 ms statement timeout. It performs no object or KMS operation there. A changed source, changed encrypted state, revoked authority, expired check, reused check or busy database returns false. The assignment repository independently compares its selected encrypted master against the preflight row before writing the resource mapping. This prevents long object reads from exceeding the assignment database's five-second idle-transaction timeout. The prepared check is an internal capability; never expose it, the digest, or an unbound source lookup to a browser.
+
+This conservative implementation reads/decrypts the complete source to establish availability on each lookup. It is bounded but potentially expensive. It is not a cache, an S3 HEAD-only existence check, a proof of future availability, or a demonstrated design for 100,000 concurrent users. Production may introduce a carefully reviewed version-pinned availability verifier with equivalent security guarantees and revocation semantics, followed by real load measurements.
+
+## Database and credential boundaries
+
+Apply `infra/migrations/005-ingestion.sql` with the migration owner after migrations 001–003. It creates no users, documents, credentials or ready records. It can coexist with assignment migration 004. Use distinct service logins inheriting exactly one ingestion group:
+
+- `margin_ingestion_runtime` can reserve owned sources, stage immutable encrypted storage receipts, create the initial quarantine job and read only the currently authorized course/owner scope. It cannot update a manifest, replace a receipt, write an inspection result, claim a job or mark a source ready.
+- `margin_ingestion_inspector` is a trusted global inspection/control-plane worker. It reads encrypted source manifests and limited authorization columns, claims/updates jobs, inserts immutable inspection results and revokes artifacts. It cannot replace reserved source identities, ciphertext or stored object receipts, create identity sessions, change memberships, or provision sync documents. Inspection content keys must be accessible only to this reviewed worker and other explicitly authorized services.
+- `margin_ingestion_reader` is a read-only source-availability service. Its RLS context pins one tenant/owner/document/version/artifact. It cannot write manifests, receipts, decisions or jobs. Do not hand this credential or its internal snapshot lookup to a browser.
+
+All four ingestion tables use forced RLS. Cross-schema reads are limited to the authorization columns/tables required for current ownership and course checks. The trusted inspector needs cross-tenant discovery of due jobs; it is deliberately a separate privilege boundary from the API runtime. Context values are transaction-local, derived by server code and cleared on commit/rollback. Repositories reject superuser, bypass-RLS, owner/inherited-owner, mixed-purpose, identity/session writer and other application service group credentials. Verified database TLS is required outside a test-only Unix socket. Database durability checks require `fsync`, `full_page_writes` and synchronous commit.
+
+Names, MIME claims, plaintext hashes, sizes, storage-version receipts, scanner version identifiers and result details are encrypted with independent wrapped 256-bit data keys and AES-GCM. Entity/tenant/course/request bindings authenticate every envelope; scan envelopes additionally authenticate the claim and verdict. IDs, relationships, operational states, timestamps, lease tokens' SHA-256 digests and attempts remain structural database metadata. Database/storage encryption, workload IAM, KMS policy and backup controls are still deployment responsibilities. Raw scanner output and document text are not accepted as a report.
+
+## Bounds and recovery
+
+- Source bytes: 1–100 MiB; only `application/pdf`; filename at most 240 characters; ready page count 1–2,000.
+- Metadata envelope: at most 16 KiB; wrapped-key record at most 16 KiB; exact-version ID at most 1,024 characters; scanner identifiers at most 120 characters from a constrained identifier alphabet.
+- At most 1,000 visible outstanding sources per owner/course; owner reservation transactions serialize before the bound/idempotency check.
+- Four database connections per repository instance, a five-second statement/transaction-idle timeout and two-second lock timeout. Upstream request admission and process-wide limits remain necessary.
+- Lease: two minutes; at most ten claims; retry delay 1–3,600 seconds. `runOne` uses exponential retry and one active execution slot per worker instance.
+- Authenticated object retrieval: 20-second deadline; scanner call: 45-second deadline. Cancellation is passed to providers. If a provider ignores cancellation, the worker keeps its slot occupied until it settles; late plaintext results are cleared. Production must still terminate stalled isolated scanner processes and enforce CPU/memory limits. Creating unlimited worker instances would defeat per-instance limits.
+
+A failed queue insert rolls back its receipt insert. A failed decision update rolls back the inspection receipt. Stale tokens, changed claims, expired leases, altered object receipts, source revocations and mismatched content cannot commit approval. Rows persist across a fresh repository instance. Terminal rejection is not silently retried as clean; a corrected source requires a new immutable document version. Automatic rescanning after definition changes, scan approval age policy, administrative reinspection, deletion/retention, signed scanner provenance, scheduling, dead-letter operations and uncertain-object reconciliation remain future work.
+
+## Verification evidence
+
+```sh
+MARGIN_REQUIRE_POSTGRES_TESTS=1 npx vitest run tests/ingestion*.test.ts
+npx tsc -p apps/api/tsconfig.json --noEmit
+npx prettier --check apps/api/src/ingestion tests/ingestion*.test.ts docs/INGESTION.md
+```
+
+The current slice passes **20 disposable real-PostgreSQL tests** plus **one synthetic worker timeout test**. They exercise reservation/staging idempotency, encrypted metadata, forced RLS and isolated credentials, peer/course/actual separate-tenant denial, session/grant/enrollment/account/deletion revocation, atomic outbox and result rollback, concurrent claims, stale/expired claims, exhausted retries, content/version mismatch, exact object disappearance/mutation, post-I/O revocation, authenticated receipt/inspection tampering, immutable terminal decisions, durable reopening, plaintext clearing, inherited/SET-ROLE-only owner escalation, prepared one-use/expiry/state checks without KMS or storage calls, and an abort-ignoring transport.
+
+Cloud storage, KMS and scanning in these tests use explicitly named synthetic providers/local test keys. The checks establish local state-machine and authorization behavior; they do not establish malware detection, valid PDF parsing, actual AWS IAM/encryption/networking, live Canvas functionality, operational recovery or production capacity.

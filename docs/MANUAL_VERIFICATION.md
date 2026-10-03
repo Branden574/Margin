@@ -79,3 +79,26 @@ Disposable synthetic fixtures are under `.local/manual-checks/fixtures/` (Git-ig
 The original preview failed because automated browser tests handled the development certificate differently from the user's browser. The corrected certificate is a server-only leaf naming exactly `127.0.0.1`; its exact public certificate receives user-account SSL trust. Native macOS checks reject `localhost`, `::1` and unrelated hostnames.
 
 Use the same exact origin throughout: different hostnames and ports have separate encrypted vaults. No cloud collaboration, Canvas delivery, production identity deployment, OCR, security certification, school hardware performance or 100,000-user capacity is implied by this record.
+
+## Existing PDF form walkthrough — October 2, 2026
+
+Used the actual in-app browser at the normally trusted `https://127.0.0.1:5173` origin and the existing local vault, with synthetic fixtures only. The development server had stopped between sessions: cached library content remained visible, but a new import reported that its processing worker stopped. Restarted the web and API servers, reloaded, and verified the HTTPS proxy health response with normal certificate validation before retrying successfully. A visible cached page alone did not prove server availability.
+
+Imported `synthetic-acroform.pdf` as document `cbc2b00a-41e3-4a35-b2a6-0c0bf762d373`. Filled all seven editable controls: required title, multiline observation, checkbox, radio group, dropdown, multi-select list and optional text. The eighth fixture-ID field was disabled/read-only. Saved all values, reloaded/unlocked and confirmed every value remained.
+
+The first manual save exposed a real defect: the multiline value persisted but the generated PDF appearance clipped its second line. The appearance provider now measures all lines, preserves a fitting font size, shrinks to a bounded legible size and refuses content that still cannot fit. Retested the corrected page visually with `Synthetic manual form check.` and `Second line is visible.` Both rows are visible inside the field. Unchanged field appearances remain unchanged.
+
+Additional checks passed:
+
+- Empty required title refused saving; the draft stayed open and the original document remained unchanged.
+- Unsupported CJK characters produced an explicit font error and remained in the draft. No successful save or universal Unicode support is claimed.
+- Cancel offered **Keep editing** and **Discard changes**. Continuing preserved the draft.
+- Saved a group of title/checkbox/radio/dropdown/multi-select/optional changes; one Undo restored every prior value, and Redo restored the entire changed group. Undid that test group afterward.
+- Rotation and blank-page insertion preserved all values; both operations were undone to leave the document at one unrotated page.
+- Duplicate page was rejected with an explanation and the page count remained one. Other blocked structural operations have automated coverage; they were not all repeated manually.
+- Browser Back with an unfinished optional-field draft returned to the document route and kept the dialog/value open.
+- A second unlocked tab's lock request was refused while that draft existed. Explicitly discarded only the temporary test edit, retried locking, and observed both tabs reach the locked screen. Closed the temporary tab, unlocked the main tab and confirmed saved values.
+- Imported XFA fixture `synthetic-unsupported-xfa.pdf` as `05cffea3-8377-47a5-9251-17aae30c7437`; **Fill form** and annotated encrypted export both refused safely with an unsupported-form explanation.
+- Truncated `synthetic-malformed-form.pdf` was rejected during import with a damaged/incomplete message. Dismissed the failed test row and returned to the saved supported form.
+
+Local screenshot evidence: `.local/manual-checks/form-values-recovered.jpg` and `.local/manual-checks/form-multiline-fixed.jpg`. The saved supported form remains open in the app. This is a checked local form workflow, not a claim of form authoring, XFA support, legal completion, third-party PDF-reader interoperability or Canvas submission. Actual encrypted download delivery in this in-app browser remains unresolved; the existing automated decrypted-export regression is separate evidence.

@@ -192,7 +192,7 @@ export class AssignmentService {
       enrollment,
       selected,
       resourceDigest,
-      (source) => this.sources().stillAvailable(source),
+      (source) => this.sources().prepareAvailability(source),
     );
     return { redirectPath: '/canvas/work' };
   }

@@ -22,6 +22,7 @@ import {
   Download,
   Eraser,
   FilePlus2,
+  ListChecks,
   Highlighter,
   Loader2,
   Maximize2,
@@ -50,6 +51,8 @@ import { useAnnotations } from './useAnnotations';
 import { usePdf } from './usePdf';
 import { PdfCanvas } from './PdfCanvas';
 import { AnnotationGraphic } from './AnnotationLayer';
+import { FormsDialog } from './FormsDialog';
+import type { PdfFormChange, PdfFormInspection } from './formTypes';
 import { SignatureDialog, type SignatureInput } from './SignatureDialog';
 import {
   bounds,
@@ -61,7 +64,13 @@ import {
   type PageAction,
 } from './model';
 import { downloadBlob } from './pdf';
-import { transformPageInWorker, exportPdfInWorker, mergePdfInWorker } from './pageWorker';
+import {
+  transformPageInWorker,
+  exportPdfInWorker,
+  mergePdfInWorker,
+  inspectPdfFormInWorker,
+  applyPdfFormInWorker,
+} from './pageWorker';
 import { useDocumentLock } from './useDocumentLock';
 import { encryptExport, onBeforeVaultLock } from '../lib/vault';
 import './editor.css';
@@ -135,6 +144,9 @@ export default function DocumentEditor({
     [opacity, setOpacity] = useState(0.32),
     [lineStyle, setLineStyle] = useState<NonNullable<Annotation['lineStyle']>>('solid'),
     [signatureOpen, setSignatureOpen] = useState(false);
+  const [formInspection, setFormInspection] = useState<PdfFormInspection | null>(null),
+    [formDirty, setFormDirty] = useState(false),
+    [formError, setFormError] = useState('');
   const [sidebar, setSidebar] = useState(true),
     [panel, setPanel] = useState<'comments' | 'search' | 'text' | null>(null),
     [pageMenu, setPageMenu] = useState(false),
@@ -175,8 +187,8 @@ export default function DocumentEditor({
     commandDialog = useRef<HTMLDialogElement>(null),
     mergeInput = useRef<HTMLInputElement>(null);
   const transition = useRef<Promise<void> | null>(null),
-    transitionState = useRef({ busy, editing, signatureOpen });
-  transitionState.current = { busy, editing, signatureOpen };
+    transitionState = useRef({ busy, editing, signatureOpen, formDirty });
+  transitionState.current = { busy, editing, signatureOpen, formDirty };
   const currentPageAnnotations = annotations.filter((a) => a.pageIndex === pageIndex);
   const pageCount = pdf?.numPages ?? record.pageCount;
   const ready =
@@ -225,8 +237,8 @@ export default function DocumentEditor({
     const state = transitionState.current;
     const refusal = state.busy
       ? 'Wait for the current PDF operation to finish before leaving or locking.'
-      : draft.current || state.editing?.text.trim() || state.signatureOpen
-        ? 'Finish or cancel the pending annotation before leaving or locking.'
+      : draft.current || state.editing?.text.trim() || state.signatureOpen || state.formDirty
+        ? 'Save or cancel the pending annotation or form changes before leaving or locking.'
         : '';
     if (refusal) {
       setError(refusal);
@@ -249,7 +261,7 @@ export default function DocumentEditor({
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
       const state = transitionState.current;
-      if (state.signatureOpen || state.editing?.text.trim() || draft.current) {
+      if (state.signatureOpen || state.formDirty || state.editing?.text.trim() || draft.current) {
         event.preventDefault();
         event.returnValue = '';
       }
@@ -669,6 +681,49 @@ export default function DocumentEditor({
     setEditing(null);
     if (item.type === 'comment') setPanel('comments');
   }
+  async function openForm() {
+    if (!ready || transition.current) return;
+    setBusy('Reading PDF form');
+    setError('');
+    setFormError('');
+    try {
+      await flush();
+      setFormInspection(await inspectPdfFormInWorker(workingBlob));
+    } catch (reason) {
+      setError(`Could not open this form: ${errorMessage(reason)}`);
+    } finally {
+      setBusy('');
+    }
+  }
+  async function saveForm(changes: PdfFormChange[]) {
+    if (!ready || transition.current) return;
+    setBusy('Saving form');
+    setFormError('');
+    try {
+      await flush();
+      const nextBlob = await applyPdfFormInWorker(workingBlob, changes);
+      const saved = await replaceDocumentWithAnnotations(
+        record.id,
+        nextBlob,
+        pageCount,
+        current.current,
+      );
+      syncTimestamp(saved.updatedAt);
+      pushHistory(
+        { annotations: current.current, blob: workingBlob, pageIndex, pageCount },
+        { annotations: current.current, blob: nextBlob, pageIndex, pageCount },
+      );
+      setWorkingBlob(nextBlob);
+      setFormDirty(false);
+      setFormInspection(null);
+      await onDocumentChange({ blob: nextBlob, pageCount });
+      setNotice('Form changes saved on this device.');
+    } catch (reason) {
+      setFormError(errorMessage(reason));
+    } finally {
+      setBusy('');
+    }
+  }
   async function editPage(action: PageAction) {
     if (!pdf || !ready || transition.current) return;
     setPageMenu(false);
@@ -858,6 +913,7 @@ export default function DocumentEditor({
   const commands = [
     ...tools.map((t) => ({ label: `${t.label} tool`, detail: t.key, run: () => chooseTool(t.id) })),
     { label: 'Arrow tool', detail: 'Shapes', run: () => chooseTool('arrow') },
+    { label: 'Fill PDF form', detail: 'Existing document fields', run: () => void openForm() },
     { label: 'Add signature', detail: 'Typed or drawn', run: () => setSignatureOpen(true) },
     { label: 'Add reviewed stamp', detail: 'Feedback', run: () => insertStamp('REVIEWED') },
     { label: 'Export encrypted file', detail: '.margin', run: () => void exportPdf() },
@@ -939,6 +995,15 @@ export default function DocumentEditor({
         >
           {speaking ? <VolumeX size={16} /> : <Volume2 size={16} />}
           <span>{speaking ? 'Stop reading' : 'Read aloud'}</span>
+        </button>
+        <button
+          className="editor-secondary"
+          onClick={() => void openForm()}
+          disabled={!ready}
+          title="Fill existing PDF form fields"
+        >
+          <ListChecks size={16} />
+          <span>Fill form</span>
         </button>
         <button
           className="editor-primary"
@@ -1689,6 +1754,20 @@ export default function DocumentEditor({
           {notice}
         </div>
       ) : null}
+      {formInspection && (
+        <FormsDialog
+          inspection={formInspection}
+          busy={!!busy}
+          error={formError}
+          onDirtyChange={setFormDirty}
+          onSave={saveForm}
+          onClose={() => {
+            setFormInspection(null);
+            setFormDirty(false);
+            setFormError('');
+          }}
+        />
+      )}
       <SignatureDialog
         ink={color}
         open={signatureOpen}

@@ -8,6 +8,7 @@ import { canonical } from '../sync/validation.js';
 import {
   AssignmentError,
   type AssignmentInput,
+  type AssignmentSourceGateway,
   type AssignmentRecord,
   type AssignmentRepository,
   type DeepLinkSelection,
@@ -115,7 +116,7 @@ export class PostgresAssignmentRepository implements AssignmentRepository {
       await client.query("SET LOCAL lock_timeout='2s'");
       await client.query("SET LOCAL idle_in_transaction_session_timeout='5s'");
       const privileges = await client.query<{ unsafe: boolean }>(
-        "SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,'margin_assignments_runtime','MEMBER') OR pg_has_role(current_user,'margin_identity_runtime','MEMBER') OR pg_has_role(current_user,'margin_identity_provisioner','MEMBER') OR pg_has_role(current_user,'margin_sync_provisioner','MEMBER') OR pg_has_role(current_user,'margin_lms_provisioner','MEMBER') OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_assignments','margin_lms','margin_identity','margin_sync') AND pg_has_role(current_user,c.relowner,'USAGE'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user",
+        "SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,'margin_assignments_runtime','MEMBER') OR pg_has_role(current_user,'margin_identity_runtime','MEMBER') OR pg_has_role(current_user,'margin_identity_provisioner','MEMBER') OR pg_has_role(current_user,'margin_sync_provisioner','MEMBER') OR pg_has_role(current_user,'margin_lms_provisioner','MEMBER') OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_assignments','margin_lms','margin_identity','margin_sync') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user",
       );
       if (!privileges.rows[0] || privileges.rows[0].unsafe)
         throw new Error(
@@ -440,13 +441,14 @@ export class PostgresAssignmentRepository implements AssignmentRepository {
     enrollment: VerifiedLmsEnrollment,
     selected: string,
     resourceDigest: string,
-    sourceAvailable: (source: ReadyAssignmentSource) => Promise<boolean>,
+    prepareSource: AssignmentSourceGateway['prepareAvailability'],
   ): Promise<void> {
     if (!/^[a-f0-9]{64}$/.test(resourceDigest))
       throw new AssignmentError(400, 'invalid_resource', 'The signed resource mapping is invalid.');
-    await this.transaction(principal, enrollment, async (client) => {
+    // Only this trusted verified-launch path can read an unbound selected assignment.
+    // Return its encrypted row internally; perform all KMS/storage I/O after this transaction commits.
+    const readCandidate = async (client: PoolClient) => {
       await context(client, 'resource_digest', resourceDigest);
-      // Only this trusted verified-launch path gets a narrow selected-assignment lookup.
       await context(client, 'verified_assignment_id', assignmentId(selected));
       const candidate = (
         await client.query<AssignmentRow>(
@@ -460,12 +462,33 @@ export class PostgresAssignmentRepository implements AssignmentRepository {
           'assignment_unavailable',
           'This selected assignment is unavailable in the verified course.',
         );
-      const record = await this.record(candidate);
-      if (!(await sourceAvailable(record.source)))
+      return candidate;
+    };
+    const candidate = await this.transaction(principal, enrollment, readCandidate);
+    const fingerprint = createHash('sha256').update(JSON.stringify(candidate)).digest('hex');
+    const record = await this.record(candidate);
+    const recheck = await prepareSource(record.source);
+    if (!recheck)
+      throw new AssignmentError(
+        409,
+        'source_unavailable',
+        'The assignment source is unavailable or no longer approved.',
+      );
+    await this.transaction(principal, enrollment, async (client) => {
+      const current = await readCandidate(client);
+      if (createHash('sha256').update(JSON.stringify(current)).digest('hex') !== fingerprint)
+        throw new AssignmentError(
+          409,
+          'assignment_changed',
+          'The selected assignment changed. Restart from Canvas.',
+        );
+      // Prepared checks only re-read authorization and their exact authenticated state fingerprint.
+      // They must not perform network or KMS work inside this final write transaction.
+      if (!(await recheck(record.source)))
         throw new AssignmentError(
           409,
           'source_unavailable',
-          'The assignment source is unavailable or no longer approved.',
+          'The assignment source changed or its verification expired.',
         );
       await client.query(
         'INSERT INTO margin_assignments.resource_links(installation_id,resource_digest,organization_id,course_id,assignment_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',

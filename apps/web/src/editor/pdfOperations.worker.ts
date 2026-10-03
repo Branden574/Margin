@@ -5,6 +5,8 @@ import {
   extractPdfPage,
   type ExportPageView,
 } from './pdf';
+import { inspectPdfForm, applyPdfFormChanges } from './forms';
+import type { PdfFormChange } from './formTypes';
 import type { PageAction } from './model';
 import type { Annotation } from '@margin/core';
 type Request =
@@ -17,7 +19,9 @@ type Request =
       extractIndex?: number;
       originalPageCount: number;
     }
-  | { operation: 'merge'; blob: Blob; incoming: Blob };
+  | { operation: 'merge'; blob: Blob; incoming: Blob }
+  | { operation: 'inspect-form'; blob: Blob }
+  | { operation: 'apply-form'; blob: Blob; changes: PdfFormChange[] };
 self.onmessage = async (event: MessageEvent<Request>) => {
   try {
     const data = event.data;
@@ -27,6 +31,14 @@ self.onmessage = async (event: MessageEvent<Request>) => {
     }
     if (data.operation === 'merge') {
       self.postMessage(await mergePdf(data.blob, data.incoming));
+      return;
+    }
+    if (data.operation === 'inspect-form') {
+      self.postMessage({ form: await inspectPdfForm(data.blob) });
+      return;
+    }
+    if (data.operation === 'apply-form') {
+      self.postMessage({ blob: await applyPdfFormChanges(data.blob, data.changes) });
       return;
     }
     let output = await exportAnnotatedPdf(data.blob, data.annotations, data.views);

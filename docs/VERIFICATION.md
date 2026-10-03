@@ -25,6 +25,17 @@ The initial baseline below was verified locally on October 1, 2026, on macOS/App
 - The two added editor E2E cases are written but have not been executed locally. Earlier 15-workflow/offline/accessibility results above belong to the initial baseline, not the expanded checkpoint.
 - Production scale, hosted integration, independent security review and actual school device performance remain unverified.
 
+## Form and inspected-source checkpoint — October 2, 2026
+
+- `MARGIN_REQUIRE_POSTGRES_TESTS=1 npm test`: **302 tests across 25 files passed**. PostgreSQL tools were required, and the suite completed without unhandled errors.
+- All workspace TypeScript checks, full LMS/web/API/extension/marketing build, formatting and three marketing contract tests passed. `npm audit --audit-level=high` reported zero known vulnerabilities. The homepage script-gzip estimate remains 238,751 bytes against its 250,000-byte scoped budget.
+- Manually filled every supported field type in a synthetic AcroForm in the actual normally trusted HTTPS tab. Found and fixed clipped multiline appearances, then verified required/unsupported-character errors retain drafts, grouped undo/redo, reload and cross-tab lock recovery, safe page-operation guards, XFA refusal and malformed import rejection. See [manual evidence](MANUAL_VERIFICATION.md). Third-party PDF-reader interoperability and actual in-app encrypted-download delivery remain unverified.
+- Added authenticated assignment HTTP boundaries and an encrypted inspected-source registry. Real PostgreSQL tests cover ownership, current enrollment/session checks, isolated roles, stale claims, atomic receipts/outboxes, revocation/tampering and prepared object verification outside assignment transactions. Storage, KMS and scanner providers in these tests are synthetic. No live scanner, AWS deployment, connected Canvas UI, provisioned student copy or grade delivery is established.
+- Independent review found owner-role membership checks that missed NOINHERIT accounts able to SET ROLE. Identity, sync, LMS, assignments and ingestion now reject any protected table-owner membership. Real PostgreSQL regressions demonstrate the escalation capability before verifying rejection.
+- Remote CI for `6756840` passed install/audit/SBOM/build/unit gates and 16 of 17 browser workflows, including signature/arrow/stamp export. Its one failure was an outdated expectation that editor-lock retry reloads the page. The regression was corrected in `b575eb9` to test retry without reload, new edits and recovery.
+- Remote CI for `b575eb9` passed 242 assertions but failed on an unhandled PostgreSQL fixture-shutdown error before browser/offline checks. Fixtures now await asynchronous graceful shutdown instead of interrupting client sockets with a synchronous fast stop. Teardown errors still fail the test; they are not suppressed. The corrected revision requires its own remote result.
+- This remains a local/application-service checkpoint. It does not establish all-feature completion, native Chrome qualification, production deployment, independent security certification or 100,000-user capacity.
+
 ## What the tests establish
 
 Local certificate tests cover server-only leaf constraints, hostnames, key matching, private permissions, valid-pair reuse, and backed-up replacement of legacy, expired, incomplete or mismatched pairs. The migration test verifies that existing API secrets remain byte-for-byte unchanged. macOS certificate trust requires an explicit user action and is not established by these automated tests.

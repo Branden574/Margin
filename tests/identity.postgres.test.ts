@@ -11,6 +11,8 @@ import {
   type NewSession,
 } from '../apps/api/src/identity/index';
 import { tokenHash } from '../apps/api/src/identity/crypto';
+import { withTableOwnerMembership } from './helpers/owner-role';
+import { stopDisposablePostgres } from './helpers/postgres';
 
 // Actual SQL/RLS integration in a disposable Unix-socket-only cluster. Never touches a running DB.
 const available = ['initdb', 'pg_ctl', 'psql'].every((tool) => {
@@ -132,10 +134,7 @@ describe.skipIf(!available)('identity PostgreSQL repository and enforced RLS', (
   }, 30000);
   afterAll(async () => {
     await Promise.all([repository?.close(), runtime?.end(), provisioner?.end(), admin?.end()]);
-    if (started)
-      execFileSync('pg_ctl', ['-D', join(directory, 'data'), '-m', 'fast', '-w', 'stop'], {
-        stdio: 'pipe',
-      });
+    if (started) await stopDisposablePostgres(join(directory, 'data'));
     if (directory) rmSync(directory, { recursive: true, force: true });
   });
   it('resolves only a provisioned identity and denies missing context, cross-user reads and role escalation', async () => {
@@ -292,6 +291,24 @@ describe.skipIf(!available)('identity PostgreSQL repository and enforced RLS', (
       () =>
         new PostgresIdentityRepository({ host: 'db.example', ssl: { rejectUnauthorized: false } }),
     ).toThrow('TLS');
+  });
+  it.each([true, false])('rejects table-owner membership with inheritance=%s', async (inherit) => {
+    await withTableOwnerMembership(
+      admin,
+      { host: join(directory, 'socket'), port: 55489, database: 'postgres' },
+      'margin_identity.login_attempts',
+      'margin_identity_runtime',
+      inherit,
+      async (config) => {
+        const unsafe = new PostgresIdentityRepository(config);
+        try {
+          await expect(unsafe.findIdentity(identityA)).rejects.toThrow('table owner');
+        } finally {
+          await unsafe.close();
+        }
+      },
+    );
+    expect((await repository.findIdentity(identityA))?.userId).toBe(userA);
   });
   it('cancels a slow database statement and leaves the pool usable after rollback', async () => {
     await admin.query(`CREATE FUNCTION margin_identity.synthetic_slow_login() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(6); RETURN NEW; END $$;

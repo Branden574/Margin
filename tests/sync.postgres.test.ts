@@ -7,6 +7,8 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Pool, type PoolConfig } from 'pg';
 import { LocalKeyProvider, type KeyManagementProvider } from '../apps/api/src/encryption';
 import type { SessionPrincipal, IdentityRole } from '../apps/api/src/identity/types';
+import { withTableOwnerMembership } from './helpers/owner-role';
+import { stopDisposablePostgres } from './helpers/postgres';
 import {
   PostgresSyncProvisioner,
   PostgresSyncService,
@@ -176,10 +178,7 @@ describe.skipIf(!available)('durable encrypted PostgreSQL document sync', () => 
   }, 30000);
   afterAll(async () => {
     await Promise.all([service?.close(), provisioner?.close(), runtime?.end(), admin?.end()]);
-    if (started)
-      execFileSync('pg_ctl', ['-D', join(directory, 'data'), '-m', 'fast', '-w', 'stop'], {
-        stdio: 'pipe',
-      });
+    if (started) await stopDisposablePostgres(join(directory, 'data'));
     if (directory) rmSync(directory, { recursive: true, force: true });
   });
   it('provisions immutable server page identities and grants, never a name or object safety claim', async () => {
@@ -536,6 +535,25 @@ describe.skipIf(!available)('durable encrypted PostgreSQL document sync', () => 
     } finally {
       await privileged.close();
     }
+  });
+  it.each([true, false])('rejects table-owner membership with inheritance=%s', async (inherit) => {
+    const doc = await document();
+    await withTableOwnerMembership(
+      admin,
+      config,
+      'margin_sync.documents',
+      'margin_sync_runtime',
+      inherit,
+      async (database) => {
+        const unsafe = new PostgresSyncService({ database, keyManagementProvider: keys });
+        try {
+          await expect(unsafe.describeDocument(owner, doc.documentId)).rejects.toThrow('dedicated');
+        } finally {
+          await unsafe.close();
+        }
+      },
+    );
+    expect((await service.describeDocument(owner, doc.documentId)).documentId).toBe(doc.documentId);
   });
   it('rolls back the entire write if the outbox cannot commit; retry gets the first durable cursor', async () => {
     const doc = await document(),

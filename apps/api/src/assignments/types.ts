@@ -42,6 +42,7 @@ export interface ReadyAssignmentSource {
   encrypted: true;
   pageCount: number;
 }
+export type PreparedAssignmentSourceCheck = (source: ReadyAssignmentSource) => Promise<boolean>;
 export interface AssignmentSourceGateway {
   resolveForTeacher(
     principal: SessionPrincipal,
@@ -49,6 +50,8 @@ export interface AssignmentSourceGateway {
   ): Promise<ReadyAssignmentSource | null>;
   /** Must recheck current scan/revocation/object-version availability, never merely trust a stored snapshot. */
   stillAvailable(source: ReadyAssignmentSource): Promise<boolean>;
+  /** Object I/O occurs here, outside assignment transactions. Returned one-use check is short-lived and DB-only. */
+  prepareAvailability(source: ReadyAssignmentSource): Promise<PreparedAssignmentSourceCheck | null>;
 }
 export interface AssignmentRecord {
   id: string;
@@ -129,7 +132,7 @@ export interface AssignmentRepository {
     enrollment: VerifiedLmsEnrollment,
     assignmentId: string,
     resourceDigest: string,
-    sourceAvailable: (source: ReadyAssignmentSource) => Promise<boolean>,
+    prepareSource: AssignmentSourceGateway['prepareAvailability'],
   ): Promise<void>;
   getBoundAssignment(
     principal: SessionPrincipal,

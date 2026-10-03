@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { withTableOwnerMembership } from './helpers/owner-role';
+import { stopDisposablePostgres } from './helpers/postgres';
 import { execFileSync } from 'node:child_process';
 import { generateKeyPairSync, randomBytes, randomUUID, createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
@@ -317,6 +319,16 @@ describe.skipIf(!available)(
             ? structuredClone(source)
             : null,
         stillAvailable: async () => ready,
+        prepareAvailability: async (snapshot) => {
+          if (!ready) return null;
+          const fingerprint = JSON.stringify(snapshot);
+          let used = false;
+          return async (current) => {
+            if (used) return false;
+            used = true;
+            return ready && JSON.stringify(current) === fingerprint;
+          };
+        },
       };
       const pair = generateKeyPairSync('rsa', { modulusLength: 2048 });
       signer = new AssignmentDeepLinkSigner(
@@ -333,14 +345,36 @@ describe.skipIf(!available)(
       });
     }, 30000);
     afterAll(async () => {
-      service?.close();
-      await Promise.all([repository?.close(), lms?.close(), runtime?.end(), admin?.end()]);
-      if (started)
-        execFileSync('pg_ctl', ['-D', join(directory, 'data'), '-m', 'fast', '-w', 'stop'], {
-          stdio: 'pipe',
-        });
-      if (directory) rmSync(directory, { recursive: true, force: true });
-    });
+      const errors: unknown[] = [];
+      try {
+        service?.close();
+      } catch (error) {
+        errors.push(error);
+      }
+      const closed = await Promise.allSettled([
+        repository?.close(),
+        lms?.close(),
+        runtime?.end(),
+        admin?.end(),
+      ]);
+      for (const result of closed) if (result.status === 'rejected') errors.push(result.reason);
+      let stopped = !started;
+      try {
+        if (started) await stopDisposablePostgres(join(directory, 'data'));
+        stopped = true;
+      } catch (error) {
+        errors.push(error);
+      }
+      // Keep diagnostics/data if shutdown could not be confirmed; never delete a running fixture.
+      if (stopped && directory) {
+        try {
+          rmSync(directory, { recursive: true, force: true });
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length) throw new AggregateError(errors, 'PostgreSQL fixture cleanup failed.');
+    }, 15000);
     it('creates encrypted immutable assignment metadata and deduplicates concurrent identical authoring requests', async () => {
       const request = input();
       const records = await Promise.all([
@@ -687,6 +721,161 @@ describe.skipIf(!available)(
       await expect(repository.get(teacherSession, enrollment, assignment.id)).rejects.toMatchObject(
         { code: 'assignment_unavailable' },
       );
+    });
+    it('rejects inherited and SET-ROLE-only membership in an assignment table owner', async () => {
+      for (const inherit of [true, false])
+        await withTableOwnerMembership(
+          admin,
+          { host: socket, port: 55492, database: 'postgres' },
+          'margin_assignments.assignments',
+          'margin_assignments_runtime',
+          inherit,
+          async (unsafeConfig) => {
+            const unsafe = new PostgresAssignmentRepository(unsafeConfig, kms);
+            try {
+              await expect(
+                unsafe.get(
+                  teacherSession,
+                  (await lms.getSessionEnrollment(teacherSession))!,
+                  randomUUID(),
+                ),
+              ).rejects.toThrow('least-privilege');
+            } finally {
+              await unsafe.close();
+            }
+          },
+        );
+    });
+    it('performs slow object verification and KMS outside the resource-binding transaction', async () => {
+      const record = await service.create(teacherSession, input());
+      await select(record.id);
+      const fresh = await session(student, 'student'),
+        enrollment = (await lms.getSessionEnrollment(fresh))!;
+      let unwraps = 0,
+        checks = 0;
+      const active = async () =>
+        Number(
+          (
+            await admin.query(
+              "SELECT count(*) FROM pg_stat_activity WHERE application_name='assignment_prepared_boundary' AND xact_start IS NOT NULL",
+            )
+          ).rows[0].count,
+        );
+      const auditedKeys = {
+        wrapKey: (key: Buffer, context: string) => kms.wrapKey(key, context),
+        unwrapKey: async (envelope: Parameters<typeof kms.unwrapKey>[0], context: string) => {
+          expect(await active()).toBe(0);
+          unwraps++;
+          return kms.unwrapKey(envelope, context);
+        },
+      };
+      const boundedRepository = new PostgresAssignmentRepository(
+        {
+          host: socket,
+          port: 55492,
+          user: 'assignments_test',
+          database: 'postgres',
+          application_name: 'assignment_prepared_boundary',
+        },
+        auditedKeys,
+      );
+      try {
+        await boundedRepository.bindResource(
+          fresh,
+          enrollment,
+          record.id,
+          hash('slow verified source'),
+          async (source) => {
+            expect(await active()).toBe(0);
+            expect(source).toEqual(record.source);
+            const before = unwraps;
+            // Longer than the repository's five-second idle transaction timeout.
+            await new Promise((resolve) => setTimeout(resolve, 5200));
+            return async (candidate) => {
+              checks++;
+              expect(await active()).toBe(1);
+              expect(unwraps).toBe(before);
+              return JSON.stringify(candidate) === JSON.stringify(source);
+            };
+          },
+        );
+        expect(unwraps).toBe(1);
+        expect(checks).toBe(1);
+        expect(
+          (
+            await admin.query(
+              'SELECT * FROM margin_assignments.launch_bindings WHERE session_id=$1',
+              [fresh.sessionId],
+            )
+          ).rowCount,
+        ).toBe(1);
+      } finally {
+        await boundedRepository.close();
+      }
+    }, 10000);
+    it('rechecks authorization and the immutable assignment after outside-transaction verification', async () => {
+      const record = await service.create(teacherSession, input());
+      await select(record.id);
+      const fresh = await session(student, 'student'),
+        enrollment = (await lms.getSessionEnrollment(fresh))!;
+      let checked = false;
+      try {
+        await expect(
+          repository.bindResource(
+            fresh,
+            enrollment,
+            record.id,
+            hash('revocation during source I/O'),
+            async () => {
+              await admin.query(
+                'UPDATE margin_lms.enrollments SET disabled_at=now() WHERE user_id=$1 AND course_id=$2',
+                [student, course],
+              );
+              return async () => {
+                checked = true;
+                return true;
+              };
+            },
+          ),
+        ).rejects.toMatchObject({ code: 'course_access_revoked' });
+      } finally {
+        await admin.query(
+          'UPDATE margin_lms.enrollments SET disabled_at=NULL WHERE user_id=$1 AND course_id=$2',
+          [student, course],
+        );
+      }
+      expect(checked).toBe(false);
+      expect(
+        (
+          await admin.query(
+            'SELECT * FROM margin_assignments.launch_bindings WHERE session_id=$1',
+            [fresh.sessionId],
+          )
+        ).rowCount,
+      ).toBe(0);
+      await expect(
+        repository.bindResource(
+          fresh,
+          enrollment,
+          record.id,
+          hash('changed assignment during source I/O'),
+          async () => {
+            await admin.query(
+              'UPDATE margin_assignments.assignments SET ciphertext=set_byte(ciphertext,0,get_byte(ciphertext,0)#1) WHERE id=$1',
+              [record.id],
+            );
+            return async () => true;
+          },
+        ),
+      ).rejects.toMatchObject({ code: 'assignment_changed' });
+      expect(
+        (
+          await admin.query(
+            'SELECT * FROM margin_assignments.launch_bindings WHERE session_id=$1',
+            [fresh.sessionId],
+          )
+        ).rowCount,
+      ).toBe(0);
     });
     it('rejects unsafe credentials and database transport and leaves the pool usable after an error', async () => {
       expect(() => new PostgresAssignmentRepository({ host: 'db.test', ssl: false }, kms)).toThrow(

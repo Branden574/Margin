@@ -48,7 +48,7 @@ Run `npm run dev:marketing` and open `http://127.0.0.1:3000`. The separate Next.
 
 ### Organization and Canvas services
 
-The API now includes configurable OIDC sessions, encrypted PostgreSQL annotation operations and the Canvas LTI launch foundation. These are optional operator-configured services, disabled in the default local setup. Follow [identity configuration](docs/IDENTITY.md), [sync contracts](docs/SYNC.md), [Canvas setup boundaries](docs/CANVAS.md) and `infra/identity.env.example`. Apply versioned migrations with separate operator credentials; runtime accounts cannot provision memberships or document grants.
+The API now includes configurable OIDC sessions, encrypted PostgreSQL annotation operations and the Canvas LTI launch foundation. These are optional operator-configured services, disabled in the default local setup. Follow [identity configuration](docs/IDENTITY.md), [sync contracts](docs/SYNC.md), [Canvas setup boundaries](docs/CANVAS.md), [assignment HTTP/service contracts](docs/ASSIGNMENTS.md), [source inspection registry](docs/INGESTION.md) and `infra/identity.env.example`. Apply versioned migrations with separate operator credentials; runtime accounts cannot provision memberships or document grants.
 
 Signed Canvas launches require explicitly provisioned installation, identity, course and enrollment mappings. A valid launch is only the first step: connected assignment authoring, student copies, submission and grade passback remain unfinished. The local editor does not yet synchronize its annotations through the new server operation API. No real institution, cloud identity provider or production storage has been provisioned.
 
@@ -58,8 +58,9 @@ Signed Canvas launches require explicitly provisioned installation, identity, co
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Library         | Search, recent files, folders, starred documents, list/grid, sorting, copy, rename, move, Trash/restore and permanent deletion                   |
 | Reader          | Worker-rendered PDF, bounded thumbnails, zoom, page navigation, text search and browser read-aloud                                               |
-| Annotations     | Pen, highlight, text, comments, rectangle/ellipse/line, eraser, selection, bounded undo/redo and local autosave                                  |
-| PDF pages       | Rotate, duplicate, insert blank, move, delete, merge and extract                                                                                 |
+| Annotations     | Pen, highlight, text, comments, shapes/arrows/stamps, visual signatures, eraser, selection, bounded undo/redo and local autosave                 |
+| PDF pages       | Rotate, duplicate, insert blank, move, delete, merge and extract; form PDFs allow rotation/insertion while other structural changes are guarded  |
+| PDF forms       | Fill supported existing text/checkbox/radio/choice fields with validation, grouped undo/redo and encrypted local saving; [limits](docs/FORMS.md) |
 | Exports         | Annotated PDF and complete comment appendix inside an authenticated encrypted `.margin` package; encrypted original and metadata-index exports   |
 | Local classroom | Assignment drafts, instructions, class/due date, student submission state and teacher feedback/return                                            |
 | Preferences     | Teacher/student views, light/dark/high contrast, comfortable reading font, reduced motion and keyboard shortcuts                                 |

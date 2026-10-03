@@ -1,0 +1,56 @@
+.forms-dialog {
+  width: min(600px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow-y: auto;
+}
+.forms-fields {
+  display: grid;
+  gap: 18px;
+  margin: 24px 0;
+}
+.forms-field {
+  display: grid;
+  gap: 7px;
+  text-align: left;
+}
+.forms-field label {
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.forms-field input:not([type='checkbox']),
+.forms-field select,
+.forms-field textarea {
+  width: 100%;
+  border: 1px solid var(--ed-border);
+  background: var(--ed-bg);
+  color: var(--ed-ink);
+  padding: 10px 12px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 14px;
+}
+.forms-field input[type='checkbox'] {
+  width: 22px;
+  height: 22px;
+  accent-color: var(--ed-accent);
+}
+.forms-field :disabled {
+  opacity: 0.65;
+}
+.forms-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ed-muted);
+}
+.forms-discard {
+  border: 1px solid var(--ed-border);
+  padding: 12px;
+  border-radius: 8px;
+}
+.forms-discard button + button {
+  margin-left: 8px;
+}
+.forms-error {
+  overflow-wrap: anywhere;
+}

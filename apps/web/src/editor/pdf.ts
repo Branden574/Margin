@@ -1,9 +1,15 @@
 import { PDFDocument, StandardFonts, LineCapStyle, degrees, rgb } from 'pdf-lib';
+import { auditPdfForEditing, loadEditablePdf } from './forms';
 import type { Annotation } from '@margin/core';
 import { annotationPaths, dashPattern, pathData, textLike, type PageAction } from './model';
 
 export async function transformPage(blob: Blob, action: PageAction, index: number): Promise<Blob> {
-  const pdf = await PDFDocument.load(await blob.arrayBuffer());
+  const pdf = await loadEditablePdf(blob);
+  const { hasFields } = auditPdfForEditing(pdf);
+  if (hasFields && action !== 'rotate' && action !== 'insert')
+    throw new Error(
+      'Copying, reordering, or deleting pages with form fields is not supported yet. Your original PDF is unchanged.',
+    );
   const page = pdf.getPage(index);
   if (action === 'rotate') page.setRotation(degrees((page.getRotation().angle + 90) % 360));
   if (action === 'duplicate') {
@@ -23,7 +29,7 @@ export async function transformPage(blob: Blob, action: PageAction, index: numbe
     pdf.removePage(index);
     pdf.insertPage(next, copy);
   }
-  const bytes = await pdf.save();
+  const bytes = await pdf.save({ updateFieldAppearances: false });
   return new Blob([bytes as BlobPart], { type: 'application/pdf' });
 }
 const color = (hex: string) =>
@@ -63,7 +69,8 @@ export async function exportAnnotatedPdf(
   annotations: Annotation[],
   views: ExportPageView[],
 ): Promise<Blob> {
-  const pdf = await PDFDocument.load(await blob.arrayBuffer());
+  const pdf = await loadEditablePdf(blob);
+  auditPdfForEditing(pdf);
   const font = await pdf.embedFont(StandardFonts.Helvetica);
   const signatureFont = annotations.some((a) => a.type === 'signature' && a.text)
     ? await pdf.embedFont(StandardFonts.TimesRomanItalic)
@@ -285,7 +292,7 @@ export async function exportAnnotatedPdf(
       y -= 22;
     }
   }
-  const bytes = await pdf.save();
+  const bytes = await pdf.save({ updateFieldAppearances: false });
   return new Blob([bytes as BlobPart], { type: 'application/pdf' });
 }
 export function downloadBlob(blob: Blob, name: string) {
@@ -301,8 +308,14 @@ export async function mergePdf(
   original: Blob,
   incoming: Blob,
 ): Promise<{ blob: Blob; pageCount: number }> {
-  const target = await PDFDocument.load(await original.arrayBuffer()),
-    extra = await PDFDocument.load(await incoming.arrayBuffer());
+  const target = await loadEditablePdf(original),
+    extra = await loadEditablePdf(incoming);
+  const targetForm = auditPdfForEditing(target),
+    extraForm = auditPdfForEditing(extra);
+  if (targetForm.hasFields || extraForm.hasFields)
+    throw new Error(
+      'Merging PDFs with form fields is not supported yet. Your original PDFs are unchanged.',
+    );
   for (const page of await target.copyPages(extra, extra.getPageIndices())) target.addPage(page);
   return {
     blob: new Blob([(await target.save()) as BlobPart], { type: 'application/pdf' }),
@@ -314,8 +327,12 @@ export async function extractPdfPage(
   index: number,
   appendixStart?: number,
 ): Promise<Blob> {
-  const source = await PDFDocument.load(await blob.arrayBuffer()),
+  const source = await loadEditablePdf(blob),
     result = await PDFDocument.create();
+  if (auditPdfForEditing(source).hasFields)
+    throw new Error(
+      'Extracting pages with form fields is not supported yet. Your original PDF is unchanged.',
+    );
   const indices = [
     index,
     ...(appendixStart === undefined

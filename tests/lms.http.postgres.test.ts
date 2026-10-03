@@ -20,6 +20,8 @@ import { IdentityService } from '../apps/api/src/identity/service';
 import { createIdentityHandler } from '../apps/api/src/identity/http';
 import { PostgresIdentityRepository } from '../apps/api/src/identity/postgres';
 import { createApi } from '../apps/api/src/server';
+import { withTableOwnerMembership } from './helpers/owner-role';
+import { stopDisposablePostgres } from './helpers/postgres';
 
 const available = ['initdb', 'pg_ctl', 'psql'].every((tool) => {
   try {
@@ -338,10 +340,7 @@ describe.skipIf(!available)(
         provisioner?.end(),
         admin?.end(),
       ]);
-      if (started)
-        execFileSync('pg_ctl', ['-D', join(directory, 'data'), '-m', 'fast', '-w', 'stop'], {
-          stdio: 'pipe',
-        });
+      if (started) await stopDisposablePostgres(join(directory, 'data'));
       if (directory) rmSync(directory, { recursive: true, force: true });
     });
     it('performs a certificate-verified HTTPS form_post launch, creates a bound session and retains Lax application cookies', async () => {
@@ -703,6 +702,27 @@ describe.skipIf(!available)(
         await forbidden.close();
       }
     });
+    it.each([true, false])(
+      'rejects table-owner membership with inheritance=%s',
+      async (inherit) => {
+        await withTableOwnerMembership(
+          admin,
+          { host: socket, port: 55491, database: 'postgres' },
+          'margin_lms.installations',
+          'margin_lms_runtime',
+          inherit,
+          async (config) => {
+            const unsafe = new PostgresLmsRepository(config, lookupKey);
+            try {
+              await expect(unsafe.findById(installA)).rejects.toThrow('must not');
+            } finally {
+              await unsafe.close();
+            }
+          },
+        );
+        expect((await repository.findById(installA))?.id).toBe(installA);
+      },
+    );
     it('exposes only current minimal course context and denies unauthenticated or malformed context access', async () => {
       const { cookies } = await successfulSession();
       const response = await request('/api/lms/context', {
