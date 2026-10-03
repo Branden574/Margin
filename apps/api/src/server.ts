@@ -17,6 +17,8 @@ import type { SessionPrincipal } from './identity/types.js';
 import { handleDocumentSync, type DocumentSyncService } from './sync-routes.js';
 import { SyncError } from './sync/index.js';
 import { createLmsHandler, type LmsService } from './lms/index.js';
+import { handleCanvasAssignments, type CanvasAssignmentService } from './assignment-routes.js';
+import { AssignmentError } from './assignments/types.js';
 
 const MIB = 1024 * 1024;
 export interface LocalIdentity {
@@ -44,6 +46,7 @@ export interface ApiOptions {
   identityService?: IdentityService;
   syncService?: DocumentSyncService;
   lmsService?: LmsService;
+  assignmentService?: CanvasAssignmentService;
   keyEncryptionKey?: Buffer;
   keyManagementProvider?: KeyManagementProvider;
   tls?: { key: Buffer; cert: Buffer };
@@ -174,6 +177,8 @@ async function entries(path: string): Promise<string[]> {
 
 /** Encrypted local service. Production still requires OIDC, KMS, isolated scanning and a durable audit sink. */
 export function createApi(options: ApiOptions) {
+  if (options.assignmentService && (!options.identityService || !options.lmsService))
+    throw new Error('Canvas assignments require authenticated identity and LMS launch services.');
   if (
     options.lmsService &&
     (!options.identityService ||
@@ -404,6 +409,7 @@ export function createApi(options: ApiOptions) {
           scanningConfigured: Boolean(options.inspectDocument),
           synchronizationConfigured: Boolean(options.syncService),
           canvasConfigured: Boolean(options.lmsService),
+          assignmentsConfigured: Boolean(options.assignmentService),
         });
         return;
       }
@@ -425,12 +431,6 @@ export function createApi(options: ApiOptions) {
           tenantId: authenticated.principal.organizationId,
           userId: authenticated.principal.userId,
         };
-        if (principal.authenticationMethod === 'lti')
-          throw new ApiError(
-            403,
-            'lms_resource_scope_required',
-            'Open the permitted assignment through its Canvas workspace. General document access is not available through an LMS session.',
-          );
       } else {
         const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
         const localIdentity = identities.find((item) => equalToken(item.token, token));
@@ -450,6 +450,23 @@ export function createApi(options: ApiOptions) {
       userHash = digest(identity.userId).slice(0, 12);
       limit(`tenant:${identity.tenantId}`, options.requestsPerMinute ?? 1200);
       limit(`user:${identity.tenantId}:${identity.userId}`, options.requestsPerMinute ?? 1200);
+      if (path === '/api/assignments' || path.startsWith('/api/assignments/')) {
+        routeName = '/api/assignments/:action';
+        if (!options.assignmentService || !principal)
+          throw new ApiError(
+            503,
+            'assignments_unavailable',
+            'Canvas assignment authoring is not configured.',
+          );
+        await handleCanvasAssignments(req, res, options.assignmentService, principal);
+        return;
+      }
+      if (principal?.authenticationMethod === 'lti')
+        throw new ApiError(
+          403,
+          'lms_resource_scope_required',
+          'Open the permitted assignment through its Canvas workspace. General document access is not available through an LMS session.',
+        );
       if (path.startsWith('/api/sync/')) {
         routeName = '/api/sync/documents/:id';
         if (!options.syncService || !principal)
@@ -946,7 +963,10 @@ export function createApi(options: ApiOptions) {
       throw new ApiError(404, 'not_found', 'This API route does not exist.');
     } catch (error) {
       const expected =
-        error instanceof ApiError || error instanceof IdentityError || error instanceof SyncError;
+        error instanceof ApiError ||
+        error instanceof IdentityError ||
+        error instanceof SyncError ||
+        error instanceof AssignmentError;
       if (!expected)
         logger({ event: 'api_error', correlationId, code: 'integrity_or_service_failure' });
       if (expected && error.status === 429) res.setHeader('Retry-After', '60');

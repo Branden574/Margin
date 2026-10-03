@@ -281,4 +281,10 @@ export class AssignmentService {
     await this.available(assignment);
     return this.options.repository.reserveStudentWork(principal, enrollment);
   }
+  async currentAssignment(principal: SessionPrincipal): Promise<AssignmentRecord | null> {
+    const enrollment = await this.course(principal);
+    const assignment = await this.options.repository.getBoundAssignment(principal, enrollment);
+    if (assignment) await this.available(assignment);
+    return assignment;
+  }
 }

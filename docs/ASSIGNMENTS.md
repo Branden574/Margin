@@ -1,6 +1,6 @@
 # Canvas assignment authoring foundation
 
-This increment provides a tested backend service, not a finished Canvas assignment workflow. [`AssignmentService`](../apps/api/src/assignments/service.ts) persists immutable assignment masters, captures verified Deep Linking selections, signs content responses and reserves private student work IDs. It is not exposed through application HTTP routes or a Canvas authoring/editor UI. No institution is connected, no live Canvas content response was sent and no student workspace is reported as provisioned.
+This increment provides a tested backend service, not a finished Canvas assignment workflow. [`AssignmentService`](../apps/api/src/assignments/service.ts) persists immutable assignment masters, captures verified Deep Linking selections, signs content responses and reserves private student work IDs. An optional authenticated HTTP adapter exposes the service to a configured application server; the default local entry point leaves it disabled, and a Canvas authoring/editor UI is not connected. No institution is connected, no live Canvas content response was sent and no student workspace is reported as provisioned.
 
 ## Current behavior
 
@@ -18,11 +18,29 @@ The optional LMS `onVerifiedLaunch` hook runs after token validation and committ
 
 A teacher Deep Linking request that accepts `ltiResourceLink` creates an encrypted, session-bound selection with a ten-minute expiry. Its return URL must have an approved installation service origin; its resource launch target must be the single registered Resource Link target. A selected master must belong to that teacher and course and still have an approved source. Completion signs an RS256 `LtiDeepLinkingResponse` with the tool client ID as issuer, the platform issuer as audience, deployment/version claims, a five-minute expiry and one resource item containing the opaque assignment UUID. It echoes platform data exactly. Cancellation produces an empty item list. No user identity, grade, score or due-date claim is fabricated.
 
-[`AssignmentDeepLinkSigner`](../apps/api/src/assignments/deep-link.ts) accepts an independently managed RSA key and exposes its public JWK. It prepares an escaped HTTPS form POST using the `JWT` field, restricted form action, nonce-based CSP and no-store headers. No public-key/configuration endpoint, signing-key rotation service or authenticated authoring HTTP adapter is included yet. An adapter must authenticate the current session and enforce CSRF/origin checks before returning that document.
+[`AssignmentDeepLinkSigner`](../apps/api/src/assignments/deep-link.ts) accepts an independently managed RSA key and exposes its public JWK. It prepares an escaped HTTPS form POST using the `JWT` field, restricted form action, nonce-based CSP and no-store headers. The authenticated adapter now enforces current identity, LMS method, CSRF and origin checks before returning that document. A public-key/configuration endpoint, signing-key rotation service and consuming browser return flow remain unconnected.
 
 Selection consumption is atomic and one-use. `selected_at` records a local signed selection, not confirmation that Canvas created or published an assignment. Delivery/response recovery is not implemented: a consumed selection requires a fresh Canvas launch after an uncertain return. The signed response omits a line item and uses Canvas's documented `preserveExistingAssignmentName` extension. Behavior still needs verification in an authorized Canvas test tenant.
 
 The hook may return only an exact configured same-origin path. The service proposes `/canvas/author` or `/canvas/work`; these routes and their UI do not yet exist. The root LMS composition must add those exact paths to `launchReturnPaths` and configure the hook only when the consuming routes are ready. The current default hook remains absent, and generic document/upload/sync access remains denied for LTI sessions.
+
+## Authenticated HTTP adapter
+
+`createApi({ assignmentService, identityService, lmsService, ... })` enables the adapter only with both identity and LMS services. The local runtime does not configure it automatically. It accepts current LTI sessions only; an ordinary OIDC login, a development bearer token or browser-supplied role/course does not grant Canvas assignment access. Generic document, upload and sync routes remain denied to LTI sessions.
+
+| Route                                           | Behavior                                                                                                                 |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `GET /api/assignments/selection`                | Current teacher's session-bound selection or null                                                                        |
+| `GET /api/assignments/current`                  | Current signed resource's title, instructions and policy; no source object/scan receipts                                 |
+| `POST /api/assignments`                         | Create immutable master using the service's ownership, course and inspected-source checks                                |
+| `POST /api/assignments/work`                    | Empty JSON object reserves the currently launched student's private work; HTTP 202 and `pending` do not mean provisioned |
+| `POST /api/assignments/selections/:id/complete` | JSON `{assignmentId: UUID}` or explicit null cancellation returns the signed HTML form and restricted CSP                |
+
+Every mutation requires the ordinary session-derived `X-CSRF-Token` and exact application origin. Authentication rechecks LMS federation before dispatch. Routes share the API's IP, tenant, user and concurrency limits. JSON has a 64 KiB limit and five-second input deadline; compressed bodies, invalid UTF-8, query overrides, unsupported methods and client-supplied work ownership are rejected. No HTTP route accepts a normalized launch or calls the trusted launch-capture hook from browser JSON. Request logs contain route templates, status and correlation identifiers, not titles, answers or response JWTs.
+
+The return response is HTML, not proof of Canvas delivery. The consuming UI must arrange an authenticated, CSRF-protected top-level response flow before the launch hook can be enabled. Authoring screens, source selection, browser return recovery and live Canvas registration are still required. The existing service's fail-closed source gateway and pending student-copy boundary remain in force.
+
+`tests/assignments.http.test.ts` exercises real HTTPS, ordinary identity and CSRF handling with synthetic in-memory identity and assignment repositories. Its ten cases cover revoked sessions/federation, origin/CSRF/role denial, bounded and stalled bodies, selection/cancellation response headers, private-source redaction and continued generic LTI denial. These adapter tests do not replace the actual PostgreSQL/RLS or signed-protocol suites. The PostgreSQL assignment suite also checks current-resource reads, absent launch, source revocation and enrollment revocation.
 
 ## Student work and provisioning boundary
 

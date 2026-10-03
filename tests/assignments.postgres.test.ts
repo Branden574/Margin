@@ -492,6 +492,7 @@ describe.skipIf(!available)(
         principal: studentSession,
         launch: launch(studentSession, false, assignment.id, 'student-work-resource'),
       });
+      expect((await service.currentAssignment(studentSession))?.id).toBe(assignment.id);
       const work = await Promise.all([
         service.reserveStudentWork(studentSession),
         service.reserveStudentWork(studentSession),
@@ -523,6 +524,7 @@ describe.skipIf(!available)(
     });
     it('does not reserve without a bound launch or remap an existing Canvas resource/session to another assignment', async () => {
       const fresh = await session(student, 'student');
+      expect(await service.currentAssignment(fresh)).toBeNull();
       await expect(service.reserveStudentWork(fresh)).rejects.toMatchObject({
         code: 'assignment_launch_required',
       });
@@ -547,6 +549,9 @@ describe.skipIf(!available)(
         await expect(service.reserveStudentWork(studentSession)).rejects.toMatchObject({
           code: 'source_unavailable',
         });
+        await expect(service.currentAssignment(studentSession)).rejects.toMatchObject({
+          code: 'source_unavailable',
+        });
       } finally {
         ready = true;
       }
@@ -555,6 +560,9 @@ describe.skipIf(!available)(
       ]);
       try {
         await expect(service.reserveStudentWork(studentSession)).rejects.toMatchObject({
+          status: 403,
+        });
+        await expect(service.currentAssignment(studentSession)).rejects.toMatchObject({
           status: 403,
         });
       } finally {
