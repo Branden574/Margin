@@ -125,13 +125,18 @@ test('prevents two local editors from silently overwriting the same PDF', async 
   await expect(second.getByText(/This document is open for editing in another tab/)).toBeVisible();
   await expect(second.getByRole('button', { name: 'Text', exact: true })).toBeDisabled();
   await page.close();
-  await Promise.all([
-    second.waitForEvent('domcontentloaded'),
-    second.getByRole('button', { name: 'Reload and retry', exact: true }).click(),
-  ]);
-  await unlockWorkspace(second);
+  await second.getByRole('button', { name: 'Retry editing', exact: true }).click();
   await expect(second.getByRole('button', { name: 'Text', exact: true })).toBeEnabled();
+  await expect(second.getByText(/This document is open for editing in another tab/)).toHaveCount(0);
+  await expect(second.getByLabel('Workspace passphrase', { exact: true })).toHaveCount(0);
   await expect(second.getByText('Protected local annotation', { exact: true })).toBeVisible();
+  await textNote(second, 'Saved after the editing lock transferred');
+  await second.reload();
+  await unlockWorkspace(second);
+  await expect(second.getByText('Protected local annotation', { exact: true })).toBeVisible();
+  await expect(
+    second.getByText('Saved after the editing lock transferred', { exact: true }),
+  ).toBeVisible();
 });
 
 test('500-page synthetic PDF keeps at most six canvases and navigates to the final page', async ({
