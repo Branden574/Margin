@@ -122,7 +122,7 @@ test('real OCR exports as encrypted searchable PDF and imports into a separate v
         .fill(String(number));
       await expect(
         imported.getByRole('region', { name: `Page ${number} text`, exact: true }),
-      ).toContainText(/silver moon/i);
+      ).toContainText(/silver\s+moon/i);
       await expect(imported.getByRole('heading', { name: 'Page text', exact: true })).toBeVisible();
       await expect(
         imported.getByRole('heading', { name: 'Recognized text', exact: true }),
@@ -141,7 +141,7 @@ test('real OCR exports as encrypted searchable PDF and imports into a separate v
     await unlockWorkspace(imported);
     await imported.getByRole('button', { name: 'Read aloud', exact: true }).click();
     await expect(imported.getByRole('region', { name: 'Page 1 text', exact: true })).toContainText(
-      /silver moon/i,
+      /silver\s+moon/i,
     );
     expect(await encryptedOcrCount(imported)).toBe(0);
     expect(failures).toEqual([]);

@@ -79,6 +79,8 @@ export default defineConfig(({ command }) => {
     );
   return {
     plugins: [react(), localOcrWorkerPolicy()],
+    // The PDF worker imports this lazily; prebundle it before an export can trigger a reload.
+    optimizeDeps: { include: ['@pdf-lib/fontkit'] },
     server: {
       port: 5173,
       host: '127.0.0.1',

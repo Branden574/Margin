@@ -255,7 +255,7 @@ try {
         .fill(String(number));
       await expect(
         page.getByRole('region', { name: `Page ${number} text`, exact: true }),
-      ).toContainText(/silver moon/i);
+      ).toContainText(/silver\s+moon/i);
       await expect(page.getByRole('heading', { name: 'Page text', exact: true })).toBeVisible();
       await expect(page.getByRole('heading', { name: 'Recognized text', exact: true })).toHaveCount(
         0,
