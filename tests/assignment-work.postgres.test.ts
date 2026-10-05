@@ -342,6 +342,7 @@ describe.skipIf(!available)(
         '005-ingestion.sql',
         '006-assignment-work.sql',
         '007-assignment-work-runtime.sql',
+        '008-authorization-plan-cache.sql',
       ])
         await admin.query(
           readFileSync(new URL('../infra/migrations/' + name, import.meta.url), 'utf8'),

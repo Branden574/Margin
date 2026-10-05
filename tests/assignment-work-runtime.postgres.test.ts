@@ -40,6 +40,7 @@ if (process.env.MARGIN_REQUIRE_POSTGRES_TESTS === '1' && !available)
   throw new Error('Required work PostgreSQL binaries unavailable.');
 const hash = (v: string | Buffer) => createHash('sha256').update(v).digest('hex');
 let workApi: PostgresAssignmentWorkService, sqlApi: Pool;
+let authorityBefore: unknown[], authorityAfter: unknown[];
 const kms = new LocalKeyProvider(randomBytes(32), 'synthetic-work-test');
 const body = Buffer.from('%PDF synthetic authenticated source fixture, not a real scanner result');
 const metadata = { name: 'Private synthetic worksheet.pdf', mimeType: 'application/pdf' as const };
@@ -56,6 +57,16 @@ let runtime: PostgresIngestionRepository,
   assignments: PostgresAssignmentRepository,
   worker: PostgresStudentWorkProvisioner;
 const config = (user: string) => ({ host: socket, port: 55497, user, database: 'postgres' });
+async function authorityDefinitions() {
+  return (
+    await admin.query(
+      `SELECT p.proname,p.provolatile,p.prosecdef,p.proconfig,p.proacl,p.proowner,
+       p.prosrc,l.lanname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+       JOIN pg_language l ON l.oid=p.prolang WHERE n.nspname='margin_work'
+       AND p.proname IN ('active','request_active') ORDER BY p.proname`,
+    )
+  ).rows;
+}
 const objects = new Map<string, ArtifactReceipt>();
 const storage: ArtifactReader = {
   async get(identity, receipt) {
@@ -361,10 +372,16 @@ describe.skipIf(!available)(
         '005-ingestion.sql',
         '006-assignment-work.sql',
         '007-assignment-work-runtime.sql',
-      ])
+        '008-authorization-plan-cache.sql',
+      ]) {
+        if (name === '008-authorization-plan-cache.sql')
+          authorityBefore = await authorityDefinitions();
         await admin.query(
           readFileSync(new URL('../infra/migrations/' + name, import.meta.url), 'utf8'),
         );
+        if (name === '008-authorization-plan-cache.sql')
+          authorityAfter = await authorityDefinitions();
+      }
       for (const [login, group] of [
         ['work_api', 'margin_assignment_work_runtime'],
         ['work_runtime', 'margin_assignments_runtime'],
@@ -425,6 +442,99 @@ describe.skipIf(!available)(
         }
       }
       if (errors.length) throw new AggregateError(errors, 'PostgreSQL fixture cleanup failed.');
+    });
+    it('preserves authorization predicates, volatility, caller privileges and ACLs when caching plans', () => {
+      const normalized = (definitions: unknown[]) =>
+        definitions.map((value) => {
+          const { lanname, prosrc, ...metadata } = value as Record<string, unknown>;
+          expect(lanname).toBe(definitions === authorityBefore ? 'sql' : 'plpgsql');
+          const predicate = String(prosrc)
+            .trim()
+            .replace(/^SELECT\s+/, '')
+            .replace(/^BEGIN\s+RETURN\s+/, '')
+            .replace(/;\s*END$/, '');
+          return { ...metadata, predicate };
+        });
+      expect(authorityBefore).toHaveLength(2);
+      expect(normalized(authorityAfter)).toEqual(normalized(authorityBefore));
+    });
+    it('reuses warmed plans on one connection without retaining tenant, peer or revoked authority', async () => {
+      const first = await ready(),
+        second = await ready();
+      const c = await sqlApi.connect();
+      const provisioner = await sqlWorker.connect();
+      const workerActive = async (workId: string) =>
+        (await provisioner.query('SELECT margin_work.active($1) AS active', [workId])).rows[0]
+          .active;
+      const scoped = async (p: SessionPrincipal, teacher: string, run: () => Promise<void>) => {
+        await c.query('BEGIN');
+        try {
+          for (const [key, value] of [
+            ['user_id', p.userId],
+            ['organization_id', p.organizationId],
+            ['session_id', p.sessionId],
+            ['source_owner_id', teacher],
+          ])
+            await c.query('SELECT set_config($1,$2,true)', ['margin_work.' + key, value]);
+          await run();
+        } finally {
+          await c.query('ROLLBACK');
+        }
+      };
+      const active = async () =>
+        (await c.query('SELECT margin_work.request_active() AS active')).rows[0].active;
+      const visible = async (documentId: string) =>
+        (
+          await c.query('SELECT document_id FROM margin_sync.document_keys WHERE document_id=$1', [
+            documentId,
+          ])
+        ).rows;
+      try {
+        // More than five executions exercises the PL/pgSQL generic-plan decision.
+        for (let i = 0; i < 8; i++) {
+          expect(await workerActive(first.reservation.id)).toBe(true);
+          await scoped(first.studentP, first.teacher, async () => {
+            expect(await active()).toBe(true);
+            expect(await visible(first.reservation.documentId)).toHaveLength(1);
+            expect(await visible(second.reservation.documentId)).toEqual([]);
+          });
+        }
+        expect(await workerActive(second.reservation.id)).toBe(true);
+        expect(await workerActive(randomUUID())).toBe(false);
+        await scoped(second.studentP, second.teacher, async () => {
+          expect(await active()).toBe(true);
+          expect(await visible(second.reservation.documentId)).toHaveLength(1);
+          expect(await visible(first.reservation.documentId)).toEqual([]);
+        });
+        await scoped(first.peerP, first.teacher, async () => {
+          expect(await active()).toBe(true);
+          expect(await visible(first.reservation.documentId)).toEqual([]);
+          expect(await visible(second.reservation.documentId)).toEqual([]);
+        });
+        await scoped({ ...first.studentP, organizationId: second.org }, first.teacher, async () => {
+          expect(await active()).toBe(false);
+          expect(await visible(first.reservation.documentId)).toEqual([]);
+        });
+        await scoped(first.studentP, first.teacher, async () => {
+          expect(await active()).toBe(true);
+          await admin.query(
+            'UPDATE margin_identity.memberships SET revoked_at=clock_timestamp() WHERE organization_id=$1 AND user_id=$2',
+            [first.org, first.student],
+          );
+          // A new statement in the same transaction must observe committed revocation.
+          expect(await active()).toBe(false);
+          expect(await visible(first.reservation.documentId)).toEqual([]);
+          expect(await workerActive(first.reservation.id)).toBe(false);
+          expect(await workerActive(second.reservation.id)).toBe(true);
+        });
+        await scoped(second.studentP, second.teacher, async () => {
+          expect(await active()).toBe(true);
+          expect(await visible(second.reservation.documentId)).toHaveLength(1);
+        });
+      } finally {
+        c.release();
+        provisioner.release();
+      }
     });
     it('distinguishes pending work, authenticates source and durably appends/catches up without exposing teacher identities', async () => {
       const f = await fixture();
