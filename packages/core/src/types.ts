@@ -12,6 +12,27 @@ export interface DocumentRecord {
   trashed: boolean;
   cover: CoverStyle;
   source: 'sample' | 'upload' | 'created';
+  /** Opaque identity of the stored PDF bytes. Legacy records acquire one on first use. */
+  contentRevision?: string;
+}
+/** Page OCR is bound to immutable local PDF bytes; offsets use JavaScript UTF-16 indices. */
+export interface OcrPageRecord {
+  schema: 1;
+  documentId: string;
+  contentRevision: string;
+  pageIndex: number;
+  engine: string;
+  language: string;
+  text: string;
+  words: {
+    start: number;
+    end: number;
+    /** Recognition confidence from 0 through 100. */
+    confidence: number;
+    /** Four corners in PDF user coordinates, independent of viewport zoom/rotation. */
+    quad: [number, number, number, number, number, number, number, number];
+  }[];
+  createdAt: string;
 }
 export interface FolderRecord {
   id: string;

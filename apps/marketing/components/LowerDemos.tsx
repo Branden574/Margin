@@ -275,14 +275,17 @@ export function OCRDemo() {
         <div className="text-lines" />
       </div>
       <div className="ocr-actions">
-        <span className="status-stamp">COMING SOON / CONCEPT</span>
+        <span className="status-stamp">ILLUSTRATIVE PREVIEW</span>
         <h3>
           A scan with
           <br />a second life.
         </h3>
-        <p>This shows the intended experience. It does not recognize an uploaded image.</p>
+        <p>
+          This illustration uses prepared text. The local editor recognizes printed English scans,
+          one page at a time.
+        </p>
         <button className="button primary" onClick={() => setRecognized(!recognized)}>
-          {recognized ? 'Reset illustration' : 'Recognize sample text'} <Search size={16} />
+          {recognized ? 'Reset illustration' : 'Reveal sample text'} <Search size={16} />
         </button>
         {recognized && (
           <>
@@ -294,12 +297,16 @@ export function OCRDemo() {
               {translated ? 'Show original' : 'Preview Spanish translation'}
             </button>
             <p className="fine-print">
-              The translation is a prepared example. OCR, translation, and scanned-text selection
-              are not connected services. The web editor can read existing PDF text using browser
-              voices.
+              The Spanish translation is a prepared example. In the local editor, recognized text is
+              stored encrypted beside the original PDF for selection, copy, search, highlighting,
+              and read aloud with available local voices.
             </p>
           </>
         )}
+        <p className="fine-print">
+          Batch OCR, translation, other languages, hosted OCR, and searchable-PDF export are
+          planned.
+        </p>
       </div>
     </div>
   );
@@ -385,9 +392,9 @@ export function AccessibilityDemo() {
         <details>
           <summary>What’s still ahead?</summary>
           <p>
-            Browser read aloud is available in the web editor; voices vary by device.
-            Speech-to-text, OpenDyslexic, Lexend, translation, dictionary, and OCR require further
-            implementation. No accessibility conformance claim is made.
+            Browser read aloud and single-page printed English OCR are available locally; voices
+            vary by device. Speech-to-text, OpenDyslexic, Lexend, translation, and dictionary
+            require further implementation. No accessibility conformance claim is made.
           </p>
         </details>
       </div>
@@ -540,7 +547,7 @@ const commands = [
   { name: 'Insert page', status: 'Local tool' },
   { name: 'Split PDF', status: 'Selected-page export available' },
   { name: 'Export', status: 'Encrypted export available' },
-  { name: 'OCR', status: 'Coming soon' },
+  { name: 'OCR', status: 'Local printed English · one page at a time' },
   { name: 'Read aloud', status: 'Browser voices in web editor' },
   { name: 'Translate', status: 'Coming soon' },
 ];
@@ -557,6 +564,10 @@ export function CommandPaletteDemo() {
     } else if (name === 'Split PDF') {
       setResult(
         'Selected-page export exists in the web editor. This illustration does not contain a real PDF.',
+      );
+    } else if (name === 'OCR') {
+      setResult(
+        'Open the local editor to recognize one printed English page at a time. This illustration uses prepared text.',
       );
     } else if (name === 'Read aloud') {
       setResult(

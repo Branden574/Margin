@@ -453,17 +453,14 @@ export default function App() {
       setBusy(false);
     }
   }
-  const documentChanged = async (changes: { blob?: Blob; pageCount?: number; name?: string }) => {
-    if (!opened) return;
-    const next = await db.patchDocument(
-      opened.document.id,
-      {
-        ...(changes.name ? { name: changes.name } : {}),
-        ...(changes.pageCount ? { pageCount: changes.pageCount } : {}),
-      },
-      changes.blob,
+  const documentChanged = async (changes: { blob: Blob; document: DocumentRecord }) => {
+    if (activeDocumentId.current !== changes.document.id) return;
+    // The editor already atomically committed the bytes, revision, and annotations.
+    setOpened((current) =>
+      current?.document.id === changes.document.id
+        ? { document: changes.document, blob: changes.blob }
+        : current,
     );
-    setOpened({ document: next, blob: changes.blob ?? opened.blob });
     await refresh();
   };
   const breadcrumb = page.startsWith('folder:')

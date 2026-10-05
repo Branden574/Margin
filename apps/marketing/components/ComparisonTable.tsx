@@ -65,7 +65,7 @@ const rows: Row[] = [
   },
   {
     feature: 'OCR for scanned PDFs',
-    margin: 'Coming soon',
+    margin: 'Local printed English · one page at a time',
     kami: 'Text Recognition available on all plans',
     source: 'ocr',
   },

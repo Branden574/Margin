@@ -46,7 +46,7 @@ import {
   X,
 } from 'lucide-react';
 import type { Annotation, AnnotationTool, DocumentRecord, Point } from '@margin/core';
-import { getDocument, getDocumentBlob, replaceDocumentWithAnnotations } from '../lib/storage';
+import { getDocumentForOcr, replaceDocumentWithAnnotations } from '../lib/storage';
 import { useAnnotations } from './useAnnotations';
 import { usePdf } from './usePdf';
 import { PdfCanvas } from './PdfCanvas';
@@ -54,7 +54,11 @@ import { AnnotationGraphic } from './AnnotationLayer';
 import { FormsDialog } from './FormsDialog';
 import { ReadingPanel, ReadingPageOverlay, defaultReadingAppearance } from './ReadingPanel';
 import { usePageText } from './usePageText';
-import { readPageText } from './pageText';
+import { resolvePageText } from './resolvedPageText';
+import { usePageOcr } from './usePageOcr';
+import { OcrTools } from './OcrTools';
+import { OcrTextLayer, type OcrSelection } from './OcrTextLayer';
+import { pdfQuadToRect } from './ocrPage';
 import type { PdfFormChange, PdfFormInspection } from './formTypes';
 import { SignatureDialog, type SignatureInput } from './SignatureDialog';
 import {
@@ -82,7 +86,7 @@ interface Props {
   document: DocumentRecord;
   blob: Blob;
   onClose: () => void;
-  onDocumentChange: (changes: { blob?: Blob; pageCount?: number; name?: string }) => Promise<void>;
+  onDocumentChange: (changes: { blob: Blob; document: DocumentRecord }) => Promise<void>;
   shortcuts?: boolean;
   registerLeaveGuard?: (guard: (() => Promise<void>) | null) => void;
 }
@@ -122,6 +126,10 @@ export default function DocumentEditor({
   registerLeaveGuard,
 }: Props) {
   const [workingBlob, setWorkingBlob] = useState(blob);
+  const [contentRevision, setContentRevision] = useState('');
+  const [ocrRefresh, setOcrRefresh] = useState(0);
+  const [selectingOcr, setSelectingOcr] = useState(false);
+  const [ocrSelection, setOcrSelection] = useState<OcrSelection | null>(null);
   const { lockStatus, retryLock } = useDocumentLock(record.id);
   const [lockInitialized, setLockInitialized] = useState(false),
     [vaultLocking, setVaultLocking] = useState(false),
@@ -175,7 +183,11 @@ export default function DocumentEditor({
     };
   }, [exportLink]);
   const [online, setOnline] = useState(navigator.onLine);
-  const pageReading = usePageText(panel === 'text' ? pdf : null, pageIndex);
+  const pageReading = usePageText(!vaultLocking && !leaving ? pdf : null, pageIndex, {
+    documentId: record.id,
+    contentRevision,
+    refresh: ocrRefresh,
+  });
   const [search, setSearch] = useState(''),
     [searching, setSearching] = useState(false),
     [searchProgress, setSearchProgress] = useState(0),
@@ -204,6 +216,15 @@ export default function DocumentEditor({
     !vaultLocking &&
     !leaving &&
     !busy;
+  const ocr = usePageOcr(pdf, record.id, contentRevision, pageIndex, ready, () =>
+    setOcrRefresh((value) => value + 1),
+  );
+  const editorIdentity = useRef({ pdf, pageIndex, contentRevision, ready, ocrRecord: ocr.record });
+  editorIdentity.current = { pdf, pageIndex, contentRevision, ready, ocrRecord: ocr.record };
+  useEffect(() => {
+    setSelectingOcr(false);
+    setOcrSelection(null);
+  }, [pdf, pageIndex, contentRevision, panel, ocr.record]);
   const onSize = useCallback(
     (size: { width: number; height: number }) =>
       setPageSize((previous) =>
@@ -215,13 +236,14 @@ export default function DocumentEditor({
     setLockInitialized(false);
     if (lockStatus !== 'owned') return;
     let active = true;
-    void Promise.all([getDocumentBlob(record.id), getDocument(record.id), reload()])
-      .then(([freshBlob, freshRecord]) => {
+    void Promise.all([getDocumentForOcr(record.id), reload()])
+      .then(([fresh]) => {
         if (!active) return;
-        if (!freshBlob || !freshRecord)
+        if (!fresh)
           throw new Error('This document was removed in another tab. Return to the workspace.');
-        setWorkingBlob(freshBlob);
-        syncTimestamp(freshRecord.updatedAt);
+        setWorkingBlob(fresh.blob);
+        setContentRevision(fresh.record.contentRevision);
+        syncTimestamp(fresh.record.updatedAt);
         setLockInitialized(true);
       })
       .catch((reason) => {
@@ -311,7 +333,7 @@ export default function DocumentEditor({
     searchAbort.current?.abort();
     setSearching(false);
     setSearchResults([]);
-  }, [pdf]);
+  }, [pdf, ocrRefresh]);
   useEffect(
     () => () => {
       searchGeneration.current++;
@@ -353,9 +375,10 @@ export default function DocumentEditor({
         snapshot.annotations,
       );
       syncTimestamp(saved.updatedAt);
+      setContentRevision(saved.contentRevision!);
       replace(snapshot.annotations, false);
       setWorkingBlob(snapshot.blob);
-      await onDocumentChange({ blob: snapshot.blob, pageCount: snapshot.pageCount });
+      await onDocumentChange({ blob: snapshot.blob, document: saved });
     } else replace(snapshot.annotations);
     setPageIndex(snapshot.pageIndex);
     setSelected(null);
@@ -394,6 +417,8 @@ export default function DocumentEditor({
     draft.current = null;
     setDraftAnnotation(null);
     setTool(next);
+    setSelectingOcr(false);
+    setOcrSelection(null);
     setShapeMenu(false);
     if (next === 'highlight' && color === colors[0]) setColor(colors[1]);
   };
@@ -407,7 +432,11 @@ export default function DocumentEditor({
     if (!shortcuts) return;
     const keydown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      if (target.closest('input,textarea,select,[contenteditable="true"],dialog,.reading-panel'))
+      if (
+        target.closest(
+          'input,textarea,select,[contenteditable="true"],dialog,.reading-panel,.ocr-tools,.ocr-text-layer',
+        )
+      )
         return;
       if (focusMode) {
         if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -702,6 +731,7 @@ export default function DocumentEditor({
         current.current,
       );
       syncTimestamp(saved.updatedAt);
+      setContentRevision(saved.contentRevision!);
       pushHistory(
         { annotations: current.current, blob: workingBlob, pageIndex, pageCount },
         { annotations: current.current, blob: nextBlob, pageIndex, pageCount },
@@ -709,7 +739,7 @@ export default function DocumentEditor({
       setWorkingBlob(nextBlob);
       setFormDirty(false);
       setFormInspection(null);
-      await onDocumentChange({ blob: nextBlob, pageCount });
+      await onDocumentChange({ blob: nextBlob, document: saved });
       setNotice('Form changes saved on this device.');
     } catch (reason) {
       setFormError(errorMessage(reason));
@@ -744,6 +774,7 @@ export default function DocumentEditor({
         nextAnnotations,
       );
       syncTimestamp(saved.updatedAt);
+      setContentRevision(saved.contentRevision!);
       pushHistory(
         { annotations: current.current, blob: workingBlob, pageIndex, pageCount },
         {
@@ -756,7 +787,7 @@ export default function DocumentEditor({
       replace(nextAnnotations, false);
       setWorkingBlob(nextBlob);
       setPageIndex(nextIndex);
-      await onDocumentChange({ blob: nextBlob, pageCount: nextCount });
+      await onDocumentChange({ blob: nextBlob, document: saved });
       setNotice('Pages updated and saved on this device.');
     } catch (e) {
       setError(`Could not update pages: ${errorMessage(e)}`);
@@ -814,6 +845,7 @@ export default function DocumentEditor({
         current.current,
       );
       syncTimestamp(saved.updatedAt);
+      setContentRevision(saved.contentRevision!);
       pushHistory(
         { annotations: current.current, blob: workingBlob, pageIndex, pageCount },
         {
@@ -825,7 +857,7 @@ export default function DocumentEditor({
       );
       setWorkingBlob(merged.blob);
       setPageIndex(pageCount);
-      await onDocumentChange({ blob: merged.blob, pageCount: merged.pageCount });
+      await onDocumentChange({ blob: merged.blob, document: saved });
       setNotice(`Added ${merged.pageCount - pageCount} pages. Saved on this device.`);
     } catch (e) {
       setError(`Could not merge this PDF: ${errorMessage(e)}`);
@@ -846,10 +878,15 @@ export default function DocumentEditor({
     try {
       for (let index = 0; index < pdf.numPages; index++) {
         if (searchGeneration.current !== generation) return;
-        const { text: rawText } = await readPageText(pdf, index, {
-          signal: abort.signal,
-          cleanup: true,
-        });
+        const { text: rawText } = await resolvePageText(
+          pdf,
+          index,
+          {
+            signal: abort.signal,
+            cleanup: true,
+          },
+          { documentId: record.id, contentRevision },
+        );
         if (searchGeneration.current !== generation) return;
         const text = rawText.replace(/\s+/g, ' '),
           match = text.toLocaleLowerCase().indexOf(query);
@@ -873,11 +910,70 @@ export default function DocumentEditor({
       if (searchGeneration.current === generation) setSearching(false);
     }
   }
+  async function highlightOcrSelection() {
+    if (
+      !ready ||
+      !pdf ||
+      !ocr.record ||
+      !ocrSelection ||
+      !pageReading.canCopy ||
+      !ocr.canHighlight ||
+      focusMode
+    )
+      return;
+    const expected = ocr.record;
+    const page = await pdf.getPage(pageIndex + 1);
+    if (
+      editorIdentity.current.pdf !== pdf ||
+      editorIdentity.current.pageIndex !== pageIndex ||
+      editorIdentity.current.contentRevision !== expected.contentRevision ||
+      editorIdentity.current.ocrRecord !== expected ||
+      !editorIdentity.current.ready
+    )
+      return;
+    const transform = page.getViewport({ scale: 1 }).transform;
+    const boxes = expected.words
+      .slice(ocrSelection.start, ocrSelection.end)
+      .map((word) => pdfQuadToRect(word.quad, transform));
+    const lines: typeof boxes = [];
+    for (const box of boxes) {
+      const previous = lines.at(-1);
+      if (
+        previous &&
+        Math.abs(previous.y - box.y) < Math.min(previous.height, box.height) * 0.35 &&
+        box.x >= previous.x &&
+        box.x - (previous.x + previous.width) < box.height * 1.5
+      ) {
+        previous.width = Math.max(previous.x + previous.width, box.x + box.width) - previous.x;
+        previous.height = Math.max(previous.height, box.y + box.height - previous.y);
+      } else lines.push({ ...box });
+    }
+    if (lines.length > 500) {
+      setError('Select a smaller passage to highlight.');
+      return;
+    }
+    commit([
+      ...current.current,
+      ...lines.map((box) => ({
+        ...baseAnnotation('highlight', box),
+        ...box,
+        color: colors[1],
+        opacity: 0.32,
+      })),
+    ]);
+    setNotice('Recognized passage highlighted.');
+    setOcrSelection(null);
+    window.getSelection()?.removeAllRanges();
+  }
   function readAloud() {
     setPanel('text');
   }
   function toggleFocusMode(value: boolean) {
     setFocusMode(value);
+    if (value) {
+      setSelectingOcr(false);
+      setOcrSelection(null);
+    }
     setSelected(null);
     setPageMenu(false);
     setShapeMenu(false);
@@ -1420,6 +1516,26 @@ export default function DocumentEditor({
               <p>Preparing the page in a background worker.</p>
             </div>
           ) : null}
+          {pdf &&
+          panel !== 'text' &&
+          !pageReading.loading &&
+          !pageReading.error &&
+          !ocr.record &&
+          pageReading.text.replace(/\s/g, '').length < 24 ? (
+            <div className="ocr-offer">
+              <span>
+                This page has little selectable text. Make a printed English scan searchable and
+                readable.
+              </span>
+              <button
+                className="editor-secondary"
+                disabled={!ready}
+                onClick={() => setPanel('text')}
+              >
+                Recognize text
+              </button>
+            </div>
+          ) : null}
           {pdf ? (
             <div
               className={`editor-paper tool-${tool}`}
@@ -1472,6 +1588,14 @@ export default function DocumentEditor({
                   <AnnotationGraphic annotation={draftAnnotation} selected={tool === 'select'} />
                 ) : null}
               </svg>
+              {selectingOcr && ocr.record && pageReading.canCopy && !focusMode && ready ? (
+                <OcrTextLayer
+                  pdf={pdf}
+                  record={ocr.record}
+                  zoom={zoom}
+                  onSelection={setOcrSelection}
+                />
+              ) : null}
               {panel === 'text' ? (
                 <ReadingPageOverlay
                   appearance={readingAppearance}
@@ -1638,7 +1762,7 @@ export default function DocumentEditor({
                   <p className="editor-panel-description">
                     {searchResults.length
                       ? `${searchResults.length} matching pages`
-                      : 'Search selectable PDF text. Scanned pages require OCR.'}
+                      : 'Search PDF text and saved recognized text. Recognize scanned pages first.'}
                   </p>
                 )}
                 <div className="editor-search-results">
@@ -1652,20 +1776,37 @@ export default function DocumentEditor({
               </>
             ) : null}
             {panel === 'text' && !vaultLocking && !leaving ? (
-              <ReadingPanel
-                text={loading ? '' : pageReading.text}
-                contextKey={`${record.id}:${pageIndex}`}
-                pageNumber={pageIndex + 1}
-                loading={loading || pageReading.loading}
-                extractionError={pageReading.error}
-                canCopy={pageReading.canCopy}
-                focusMode={focusMode}
-                onFocusMode={toggleFocusMode}
-                appearance={readingAppearance}
-                onAppearance={setReadingAppearance}
-                onNotice={setNotice}
-                onError={setError}
-              />
+              <>
+                <OcrTools
+                  ocr={ocr}
+                  disabled={!ready || !!pageReading.error || pageReading.loading}
+                  selecting={selectingOcr}
+                  onSelecting={(value) => {
+                    setSelectingOcr(value);
+                    setOcrSelection(null);
+                    if (value) setFocusMode(false);
+                  }}
+                  canSelect={pageReading.canCopy}
+                  canHighlight={ocr.canHighlight}
+                  hasSelection={!!ocrSelection}
+                  onHighlight={() => void highlightOcrSelection()}
+                />
+                <ReadingPanel
+                  text={loading ? '' : pageReading.text}
+                  contextKey={`${record.id}:${contentRevision}:${pageIndex}:${ocrRefresh}`}
+                  source={pageReading.source}
+                  pageNumber={pageIndex + 1}
+                  loading={loading || pageReading.loading}
+                  extractionError={pageReading.error}
+                  canCopy={pageReading.canCopy}
+                  focusMode={focusMode}
+                  onFocusMode={toggleFocusMode}
+                  appearance={readingAppearance}
+                  onAppearance={setReadingAppearance}
+                  onNotice={setNotice}
+                  onError={setError}
+                />
+              </>
             ) : null}
           </aside>
         ) : null}

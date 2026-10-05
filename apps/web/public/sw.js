@@ -1,5 +1,10 @@
 /* Build-only registration in the app keeps development HMR out of the offline cache. */
+// This small verification helper contains no model or user document data. Language/core
+// bytes are cached only after an explicit MARGIN_OCR_PREPARE request from a live client.
+importScripts('/ocr/tesseract-7.0.0-eng-1/ocr-runtime.js');
 const CACHE = 'margin-shell-v4';
+const OCR = self.MarginOcrAssets;
+let ocrPreparation = null;
 const ASSET = /["'(]((?:\/?assets\/|\.{1,2}\/)[^"'()\s]+\.(?:m?js|css|woff2?|png|jpe?g|webp|svg))/g;
 function discoverAssets(source, base) {
   return [...source.matchAll(ASSET)]
@@ -59,6 +64,58 @@ self.addEventListener('activate', (event) => {
     ]),
   );
 });
+self.addEventListener('message', (event) => {
+  const type = event.data?.type;
+  if (!['MARGIN_OCR_PREPARE', 'MARGIN_OCR_STATUS', 'MARGIN_OCR_ABORT'].includes(type)) return;
+  const source = event.source;
+  if (!source?.id || !source.url || new URL(source.url).origin !== self.location.origin) return;
+  const requestId = event.data?.requestId;
+  if (typeof requestId !== 'string' || !/^[a-zA-Z0-9-]{1,64}$/.test(requestId)) return;
+  if (type === 'MARGIN_OCR_ABORT') {
+    if (ocrPreparation?.requestId === requestId && ocrPreparation.clientId === source.id)
+      ocrPreparation.controller.abort();
+    return;
+  }
+  const port = event.ports?.[0];
+  if (!port) return;
+  const send = (message) => port.postMessage(message);
+  if (type === 'MARGIN_OCR_STATUS') {
+    event.waitUntil(
+      OCR.getOcrAssetStatus()
+        .then((status) =>
+          send({ kind: 'result', status: { ...status, offlineReady: status.ready } }),
+        )
+        .catch(() => send({ kind: 'error', error: 'OCR cache status could not be read.' })),
+    );
+    return;
+  }
+  if (ocrPreparation) {
+    send({
+      kind: 'error',
+      error: 'OCR preparation is already running in another request. Try again shortly.',
+    });
+    return;
+  }
+  const controller = new AbortController();
+  ocrPreparation = { requestId, clientId: source.id, controller };
+  event.waitUntil(
+    OCR.prepareOcrAssets(controller.signal, (progress) => send({ kind: 'progress', progress }))
+      .then(async (status) => {
+        if (!status.ready) throw new Error('OCR preparation did not complete.');
+        await Promise.all(
+          (await caches.keys())
+            .filter((name) => name.startsWith('margin-ocr-') && name !== OCR.OCR_CACHE)
+            .map((name) => caches.delete(name)),
+        );
+        send({ kind: 'result', status: { ...status, offlineReady: true } });
+      })
+      .catch((error) => send({ kind: 'error', error: error.message || 'OCR preparation failed.' }))
+      .finally(() => {
+        ocrPreparation = null;
+        port.close();
+      }),
+  );
+});
 self.addEventListener('fetch', (event) => {
   const request = event.request;
   const url = new URL(request.url);
@@ -68,6 +125,18 @@ self.addEventListener('fetch', (event) => {
     url.pathname.startsWith('/api/')
   )
     return;
+  if (url.pathname.startsWith(OCR.OCR_BASE_URL) && !url.search) {
+    event.respondWith(
+      (async () => {
+        const cache = await caches.open(OCR.OCR_CACHE);
+        const cached = (await cache.match(`${OCR.OCR_BASE_URL}.ready`))
+          ? await cache.match(request, { ignoreVary: true })
+          : undefined;
+        return cached || fetch(request);
+      })(),
+    );
+    return;
+  }
   if (request.mode === 'navigate') {
     event.respondWith(
       fetch(request)

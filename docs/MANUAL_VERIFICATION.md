@@ -116,3 +116,20 @@ Used the existing normally trusted HTTPS in-app tab with a synthetic three-page 
 - Visually inspected the panel in light, dark and high-contrast modes, including the comfortable reading font. Restored Light and the original standard font through Settings afterward. The reading fixture remains open at page 1, with playback stopped.
 
 Screenshot: `.local/manual-checks/reading-focus-native-tracking.png` shows a paused native Daniel utterance with visible sentence/word highlights, a color overlay and the PDF ruler. This is visual/event evidence, not an assessment of speaker sound quality, word-alignment precision across voices, native screen-reader usability or physical mobile/Chromebook behavior. Restricted-permission, unavailable-voice and stalled-engine paths have deterministic tests; they were not all reproduced on this installed browser/voice combination.
+
+## Scanned-page OCR walkthrough — October 5, 2026
+
+Used the actual normally trusted in-app browser and existing vault. Synthetic document `9ac528b8-6280-483c-8527-5cca29abd213` contains an image-only page, a blank page, and an upright scan embedded in a cropped PDF page with 180-degree page rotation. The visible text says that it is synthetic and contains no personal information.
+
+The first attempt exposed a real asset-serving defect: Vite set HTTP `Content-Encoding: gzip` on the trained-data gzip file, so the browser decompressed it before the expected compressed-byte integrity check. A dedicated allowlisted route now serves the exact file bytes without that header. Retesting reached actual local recognition and encrypted save.
+
+- The image-only page offered recognition automatically. The recognized text matched the printed fixture, including the phrase `silver moon`; **Copy text** placed that text on the actual clipboard.
+- **Select recognized text**, Home and three Shift+Right presses selected the three-word heading. **Highlight selection** created one ordinary highlight aligned with that heading. Home then Shift+End selected the whole recognized passage without an exception.
+- A native double-click on `silver` selected that word; highlighting produced a second narrow rectangle aligned with the printed word. This was a mouse interaction, not an injected DOM selection.
+- Samantha's native local voice reached Reading, then Pause retained sentence and word `clearer`. Navigating to the blank page stopped playback and cleared both text and speech tracking.
+- Cancel recognition returned an explicit cancelled state and permitted retry. Recognizing the blank page reported no printed text; no prior page's text appeared.
+- The cropped, rotated page recognized the same passage. Its heading highlight mapped to the same displayed page coordinates as the unrotated page, within floating-point rounding.
+- Search for `silver moon` returned exactly pages 1 and 3. Reloading and unlocking restored the saved text and heading highlight.
+- Rotating the PDF removed saved OCR from the reading view. Undo restored PDF bytes/annotations but conservatively required recognition again. Re-recognized page 1 and left it available with saved highlights.
+
+Screenshot: `.local/manual-checks/ocr-recognized-highlight.png`. This establishes the tested local workflow; it does not establish OCR accuracy for handwriting, tables/equations, other languages, searchable-text PDF export, physical-device performance or hosted scale. Offline production-browser checks are tracked separately from this development-preview walkthrough.

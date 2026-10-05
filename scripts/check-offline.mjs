@@ -110,13 +110,20 @@ try {
       `The pinned-certificate HTTPS preview did not start: ${String(lastError)} ${logs}`,
     );
   console.log(`Verifying offline workspace against a temporary HTTPS preview on port ${port}.`);
-  for (const script of ['tests/storage.offline.mjs', 'scripts/check-accessibility.mjs']) {
+  for (const script of [
+    'tests/storage.offline.mjs',
+    'tests/ocr.offline.mjs',
+    'scripts/check-accessibility.mjs',
+  ]) {
     verification = spawn(process.execPath, [fileURLToPath(new URL(script, root))], {
       cwd: workspace,
       env: { ...process.env, MARGIN_OFFLINE_URL: url, MARGIN_CHECK_URL: url },
       stdio: 'inherit',
     });
-    const timer = setTimeout(() => verification.kill('SIGTERM'), 120_000);
+    const timer = setTimeout(
+      () => verification.kill('SIGTERM'),
+      script === 'tests/ocr.offline.mjs' ? 240_000 : 120_000,
+    );
     const exitCode = await new Promise((resolve, reject) => {
       verification.once('error', reject);
       verification.once('exit', (code, signal) => resolve(signal ? 1 : code));

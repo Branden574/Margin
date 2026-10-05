@@ -201,12 +201,12 @@ export default function Home() {
               <p>
                 Searchable text. A sentence you can select. A page you can listen to.
                 <br />
-                OCR and translation are coming soon. Browser read aloud is available for existing
-                PDF text.
+                Recognize printed English locally, one page at a time. Copy, search, highlight, or
+                listen with local voices. Recognized text is stored encrypted beside your PDF.
               </p>
             </div>
           </Reveal>
-          <LazyDemo name="ocr" label="A clearly marked OCR and translation concept" />
+          <LazyDemo name="ocr" label="An illustrative OCR preview with a prepared translation" />
         </section>
 
         <section className="soft-section" id="students">

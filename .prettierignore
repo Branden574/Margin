@@ -9,3 +9,4 @@ package-lock.json
 playwright-report/
 test-results/
 margin-sbom.json
+apps/web/public/ocr/

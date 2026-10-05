@@ -31,7 +31,7 @@ export function AccessButton({
   const [focus, setFocus] = useState('Document editing and recovery');
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
-  const brief = `Margin school evaluation brief\n\nOrganization: ${school || 'Not specified'}\nEvaluation focus: ${focus}\n\nReview: local PDF editing, encrypted storage, recovery, accessibility, and Chromebook behavior.\nPlanned services to discuss: school identity, collaboration, OCR, LMS integration, managed policies, and production data protection.\n\nThis brief is prepared locally. It has not been submitted or sent to anyone.\n`;
+  const brief = `Margin school evaluation brief\n\nOrganization: ${school || 'Not specified'}\nEvaluation focus: ${focus}\n\nReview: local PDF editing, encrypted storage, recovery, accessibility, and Chromebook behavior. Local OCR recognizes printed English one page at a time and stores recognized text encrypted beside the original PDF for selection, copy, search, highlighting, and read aloud with available local voices.\nPlanned capabilities to discuss: batch OCR, other OCR languages, translation, searchable-PDF export, hosted OCR, school identity, collaboration, LMS integration, managed policies, and production data protection.\n\nThis brief is prepared locally. It has not been submitted or sent to anyone.\n`;
   async function copy() {
     try {
       await navigator.clipboard.writeText(brief);

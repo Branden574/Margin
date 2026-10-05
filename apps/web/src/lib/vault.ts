@@ -8,6 +8,7 @@ export type VaultStore =
   | 'blobs'
   | 'folders'
   | 'annotations'
+  | 'ocr'
   | 'assignments'
   | 'uploads'
   | 'settings';
@@ -577,6 +578,8 @@ export async function listVaultRecords<T>(store: VaultStore): Promise<{ key: str
 }
 export interface VaultTransaction {
   get<T>(store: VaultStore, key: string): Promise<T | undefined>;
+  /** Tests encrypted-record presence without decrypting potentially large PDF bytes. */
+  has(store: VaultStore, key: string): Promise<boolean>;
   list<T>(store: VaultStore): Promise<{ key: string; value: T }[]>;
   put(store: VaultStore, key: string, value: unknown): void;
   delete(store: VaultStore, key: string): void;
@@ -584,11 +587,18 @@ export interface VaultTransaction {
 /** Encrypt before opening IDB write transactions. A revision comparison retries conflicting cross-tab writes. */
 export function vaultTransaction<T>(
   body: (transaction: VaultTransaction) => Promise<T>,
+  options: { signal?: AbortSignal } = {},
 ): Promise<T> {
   const requestedSession = requireSession();
+  const signal = options.signal;
+  const assertActive = () => {
+    assertSession(requestedSession);
+    if (signal?.aborted)
+      throw new DOMException('This vault operation was cancelled.', 'AbortError');
+  };
   const run = async () => {
     for (let attempt = 0; attempt < 8; attempt++) {
-      assertSession(requestedSession);
+      assertActive();
       const db = await database();
       const snapshot = await db.get('public', 'vault');
       if (!snapshot || snapshot.vaultId !== requestedSession.config.vaultId)
@@ -600,6 +610,7 @@ export function vaultTransaction<T>(
       const cacheKey = (store: VaultStore, key: string) => JSON.stringify([store, key]);
       const transaction: VaultTransaction = {
         async get<Value>(store: VaultStore, key: string) {
+          assertActive();
           const pending = writes.get(cacheKey(store, key));
           return pending
             ? pending.deleted
@@ -607,8 +618,19 @@ export function vaultTransaction<T>(
               : (pending.value as Value)
             : readRecord<Value>(requestedSession, store, key);
         },
+        async has(store, key) {
+          assertActive();
+          const pending = writes.get(cacheKey(store, key));
+          if (pending) return !pending.deleted;
+          const address = await storageKey(requestedSession, store, key);
+          const exists = (await db.getKey('records', address)) !== undefined;
+          assertActive();
+          return exists;
+        },
         async list<Value>(store: VaultStore) {
+          assertActive();
           const rows = await listVaultRecords<Value>(store);
+          assertActive();
           const combined = new Map(rows.map((row) => [row.key, row.value]));
           for (const write of writes.values())
             if (write.store === store) {
@@ -618,15 +640,19 @@ export function vaultTransaction<T>(
           return [...combined].map(([key, value]) => ({ key, value }));
         },
         put(store, key, value) {
+          assertActive();
           writes.set(cacheKey(store, key), { store, key, value, deleted: false });
         },
         delete(store, key) {
+          assertActive();
           writes.set(cacheKey(store, key), { store, key, deleted: true });
         },
       };
       const result = await body(transaction);
+      assertActive();
       const prepared: { storageKey: string; record?: EncryptedRecord }[] = [];
       for (const write of writes.values()) {
+        assertActive();
         const address = await storageKey(requestedSession, write.store, write.key);
         if (write.deleted) {
           prepared.push({ storageKey: address });
@@ -647,10 +673,19 @@ export function vaultTransaction<T>(
           },
         });
       }
-      assertSession(requestedSession);
+      assertActive();
       const tx = db.transaction(['public', 'records'], 'readwrite');
       activeWrites.add(tx);
+      const abort = () => {
+        try {
+          tx.abort();
+        } catch {
+          /* Already completed or aborted. */
+        }
+      };
+      signal?.addEventListener('abort', abort, { once: true });
       try {
+        assertActive();
         const latest = await tx.objectStore('public').get('vault');
         if (!latest || latest.vaultId !== snapshot.vaultId)
           throw new Error('The vault identity changed while saving.');
@@ -658,15 +693,16 @@ export function vaultTransaction<T>(
           await tx.done;
           continue;
         }
-        assertSession(requestedSession);
+        assertActive();
         for (const change of prepared) {
+          assertActive();
           if (change.record) await tx.objectStore('records').put(change.record);
           else await tx.objectStore('records').delete(change.storageKey);
         }
         if (prepared.length)
           await tx.objectStore('public').put({ ...latest, revision: latest.revision + 1 });
         await tx.done;
-        assertSession(requestedSession);
+        assertActive();
         return result;
       } catch (error) {
         try {
@@ -677,6 +713,7 @@ export function vaultTransaction<T>(
         await tx.done.catch(() => undefined);
         throw error;
       } finally {
+        signal?.removeEventListener('abort', abort);
         activeWrites.delete(tx);
       }
     }

@@ -10,7 +10,7 @@ Speech progress comes from native speech events. Sentence tracking follows the c
 
 The controller holds one utterance at a time, uses bounded chunks and preserves the original UTF-16 offsets. It prevents PDF text from being interpreted as SSML by substituting full-width angle brackets in speech-only strings. Displayed and copied page text remains unchanged. Page/document/revision changes, panel closure, editor exit and workspace lock cancel the current reader. Cancellation invalidates queued callbacks. A startup/resume deadline reports a stalled speech engine rather than inventing playback progress.
 
-This implements selectable PDF text reading. OCR, translation, dictionary lookup, speech recognition, audio-file export and legally licensed speech redistribution are not provided by this panel. Text order follows the PDF's extraction order and may differ from its visual layout.
+This implements selectable PDF text reading and saved printed-English OCR text. The recognition controls process one page locally; see [OCR](OCR.md). Translation, dictionary lookup, speech recognition, audio-file export and legally licensed speech redistribution remain unavailable. Text order follows PDF extraction or recognition order and may differ from the visual layout.
 
 Reference: [Web Speech API specification](https://webaudio.github.io/web-speech-api/) defines voice locality, pause/resume/cancel semantics and the approximate character offsets used by boundary events.
 

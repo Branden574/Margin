@@ -135,8 +135,8 @@ export function AnnotationDemo() {
             More room when you need it.
           </h3>
           <p>
-            Try a toolbar preset concept. Custom presets, rubric, OCR, forms, and answer-key tools
-            are planned.
+            Try a toolbar preset concept. Printed English OCR and filling supported existing PDF
+            forms work locally. Custom presets, rubrics, form creation, and answer keys are planned.
           </p>
         </div>
         <div>
@@ -152,7 +152,7 @@ export function AnnotationDemo() {
               ? ['Text', 'Pen', 'Highlight', 'Eraser', 'Comment']
               : preset === 'Teacher'
                 ? ['Text', 'Highlight', 'Comment', 'Rubric ◐', 'Answer key ◐']
-                : ['Pages', 'OCR ◐', 'Forms ◐', 'Signature']
+                : ['Pages', 'English OCR', 'Fill forms', 'Signature']
             ).map((name) => (
               <span key={name}>{name}</span>
             ))}

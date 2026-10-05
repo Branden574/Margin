@@ -24,6 +24,7 @@ interface Props {
   loading: boolean;
   extractionError: string;
   canCopy: boolean;
+  source?: 'pdf' | 'ocr';
   focusMode: boolean;
   onFocusMode: (value: boolean) => void;
   appearance: ReadingAppearance;
@@ -39,6 +40,7 @@ export function ReadingPanel({
   loading,
   extractionError,
   canCopy,
+  source,
   focusMode,
   onFocusMode,
   appearance,
@@ -275,7 +277,7 @@ export function ReadingPanel({
         </div>
       </details>
       <div className="reading-text-heading">
-        <h3>Page text</h3>
+        <h3>{source === 'ocr' ? 'Recognized text' : 'Page text'}</h3>
         <button
           className="reading-text-button"
           disabled={!text || !canCopy}
@@ -322,8 +324,8 @@ export function ReadingPanel({
           </p>
         ) : !text.trim() ? (
           <p className="reading-empty">
-            This page has no selectable text. Scanned pages need OCR, which is not connected in this
-            workspace.
+            This page has no selectable text. Use Recognize this page to read a printed English
+            scan.
           </p>
         ) : sentence ? (
           <>

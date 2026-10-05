@@ -4,7 +4,7 @@
 
 Margin takes its name from the place where questions, sketches and discoveries begin. The original visual direction combines warm paper, terracotta and restrained document tools. [Design references](docs/DESIGN.md) were inspected through the connected Mobbin MCP; the supplied Kami research informed the requirements.
 
-This is a runnable local foundation. It includes real PDF editing, encrypted browser persistence, encrypted exports and a tested HTTPS upload service. Cloud identity, multi-user collaboration, OCR and school integrations are not provisioned. See the [release gates](docs/PRODUCTION_READINESS.md).
+This is a runnable local foundation. It includes real PDF editing, encrypted browser persistence, encrypted exports and a tested HTTPS upload service. Printed-English OCR runs locally on individual pages. Cloud identity, multi-user collaboration and school integrations are not provisioned. See the [release gates](docs/PRODUCTION_READINESS.md).
 
 ![Margin document workspace with original sample documents](docs/images/margin-workspace.png)
 
@@ -67,7 +67,7 @@ Signed Canvas launches require explicitly provisioned installation, identity, co
 | Security        | Passphrase-encrypted vault, in-memory keys/tokens, cross-tab lock/save handshake, HTTPS-only transfer and authenticated encrypted server storage                       |
 | Chrome          | Minimal Manifest V3 popup and context-menu link launcher                                                                                                               |
 
-Teacher/student views are workflow preferences, not authorization roles. Local assignments do not send work to another person. Read-aloud uses voices reported as local by the browser; it does not perform OCR.
+Teacher/student views are workflow preferences, not authorization roles. Local assignments do not send work to another person. Read-aloud uses voices reported as local by the browser and can read saved OCR text. See [local OCR limits and verification](docs/OCR.md).
 
 All exported document files are encrypted to follow the security brief. A `.margin` package is not directly readable in a standard PDF reader; import it into Margin to view its contents. The metadata-index export is a reference file, not a whole-workspace restore archive. Original source files outside Margin are not changed or encrypted by the app.
 
