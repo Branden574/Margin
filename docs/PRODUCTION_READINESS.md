@@ -14,7 +14,7 @@ Browser and server data also have different recovery boundaries. Clearing or evi
 
 ## Verification evidence and limits
 
-The earlier editor work passed strict web TypeScript, 14 editor geometry/PDF unit tests and nine Chromium end-to-end tests over HTTPS. The signature/arrow/stamp increment passed 21 focused geometry, PDF and encrypted round-trip tests in total. Its two new browser test cases are written but have not been run; manual results are recorded separately below. The earlier browser tests cover:
+The commit-specific [verification record](VERIFICATION.md) is the authority for current results. It includes successful remote signature/arrow, form, reader and searchable OCR export workflows, followed by crop and student-work checkpoints with explicit failed CI stages. Passing an earlier revision does not verify subsequent changes. Automated browser coverage includes:
 
 - Text persistence after page reload and vault unlock; shape undo/redo; duplicate-page undo/redo and encrypted export.
 - Merging real PDF pages and extracting a standalone page in an encrypted package. Export tests decrypt with the synthetic test passphrase and inspect the resulting PDF.
@@ -30,7 +30,7 @@ Automated scans of 16 states (library, settings, assignments and editor in three
 
 Storage tests exercise encrypted records and exports, wrong passphrases, ciphertext modification and record substitution, atomic rollback, manual-lock refusal, package portability and encrypted-file import. API tests exercise encrypted chunks/metadata, object substitution and wrong-key failure, owner isolation within and across tenants, expired/revoked identities, forged fields, quarantined download denial, quota/expiry behavior, authenticated recovery and deletion. Upload tests also cover chunk integrity, idempotency, incomplete uploads, pause/retry, restart and finalization. A real HTTPS fixture verifies certificate trust and rejects TLS 1.1. Extension tests reject HTTP and unsafe source URLs. These are automated local fixtures, not independent penetration testing or deployment evidence.
 
-The PostgreSQL proposal is disconnected from runtime storage. `infra/verify-schema.py` applies it in a disposable PostgreSQL cluster and exercises restrictive tenant/owner policies, missing identity context, cross-tenant denial, student escalation denial and transaction-context reset. The schema still requires migration management, runtime role grants, document/class sharing rules, broader adversarial tests and operational recovery work.
+The standalone PostgreSQL proposal is disconnected from runtime storage. `infra/verify-schema.py` applies it in a disposable cluster and exercises seven tenant/authorization assertions. Separately, versioned migrations and actual PostgreSQL integration tests cover the optional identity, sync, LMS, assignment, ingestion and student-work services. These services remain disabled in the default application; reviewed deployment, browser integration and operational recovery are still required.
 
 See [verification](VERIFICATION.md) for the complete run record. Use the current test output as the authority after further changes:
 
@@ -49,9 +49,9 @@ The last command requires a suitable local PostgreSQL installation. Browser test
 - Cloud identity, organization/user/group/license administration and authenticated teacher/student permissions. The current role selector is a local workflow preference.
 - Remote annotation synchronization, real-time coediting, live presence, conflict resolution, durable acknowledgment and cross-device version recovery. Local Web Locks and operation logs do not provide these services.
 - Production OCR, Office and Google document conversion, LMS/cloud-drive APIs, optional AI providers, remote assignment delivery and district reporting.
-- Direct editing of existing PDF text, interactive forms, crop/resize, bulk splitting into many files, image annotations, cryptographic document signatures, audio/video comments and richer annotation/teacher workflows. Typed/drawn visual signatures and three preset feedback stamps are available locally; custom stamp libraries are not.
+- Direct editing of existing PDF text, form creation and unsupported form variants, page resizing, bulk splitting into many files, image annotations, cryptographic document signatures, audio/video comments and richer annotation/teacher workflows. Supported existing form filling and page cropping/reset are implemented locally, with their limits in [forms](FORMS.md) and [crop](CROP.md). Typed/drawn visual signatures and three preset feedback stamps are available locally; custom stamp libraries are not.
 - Durable product version history and recovery across devices. Current undo history is bounded and lasts for the editor session; exported PDFs flatten annotations and carry full comments in an appendix. Unicode text unsupported by the built-in export font is rasterized and loses text selection/searchability in that export.
-- Broader accessibility testing and reading controls. Browser speech depends on available OS/browser voices; it is not OCR, transcription or guaranteed offline speech.
+- Broader assistive-technology, device and reading support. Local-voice controls, reading appearance/focus and printed-English OCR are implemented; browser speech still depends on installed local voices and is not guaranteed offline speech or transcription.
 
 ## Required before an internet beta
 
