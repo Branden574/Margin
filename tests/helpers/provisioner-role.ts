@@ -10,14 +10,49 @@ export async function withAssignmentProvisionerMembership(
   inherit: boolean,
   check: (unsafe: PoolConfig) => Promise<void>,
 ) {
+  return withAssignmentRoleMembership(
+    admin,
+    config,
+    runtimeGroup,
+    'margin_assignment_provisioner',
+    inherit,
+    check,
+  );
+}
+
+export async function withAssignmentWorkRuntimeMembership(
+  admin: Pool,
+  config: PoolConfig,
+  runtimeGroup: string,
+  inherit: boolean,
+  check: (unsafe: PoolConfig) => Promise<void>,
+) {
+  return withAssignmentRoleMembership(
+    admin,
+    config,
+    runtimeGroup,
+    'margin_assignment_work_runtime',
+    inherit,
+    check,
+  );
+}
+
+async function withAssignmentRoleMembership(
+  admin: Pool,
+  config: PoolConfig,
+  runtimeGroup: string,
+  privileged: 'margin_assignment_provisioner' | 'margin_assignment_work_runtime',
+  inherit: boolean,
+  check: (unsafe: PoolConfig) => Promise<void>,
+) {
   if (!/^margin_[a-z_]+$/.test(runtimeGroup))
     throw new Error('Use a fixed application runtime role in this fixture.');
-  const privileged = 'margin_assignment_provisioner';
+  if (runtimeGroup === privileged) throw new Error('Choose distinct application roles.');
   const login = `test_assignment_member_${randomUUID().replaceAll('-', '')}`;
   const present = (await admin.query('SELECT 1 FROM pg_roles WHERE rolname=$1', [privileged]))
     .rowCount;
   // Older identity/LMS/sync fixtures deliberately apply only their own migrations.
-  // An empty role is sufficient to exercise the guard; retain the real role when 006 exists.
+  // An empty role exercises the guard; retain the real role when its migration exists.
   if (!present)
     await admin.query(
       `CREATE ROLE ${privileged} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`,

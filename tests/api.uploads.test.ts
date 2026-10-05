@@ -94,6 +94,10 @@ describe('durable authenticated uploads', () => {
     ).toBe(403);
     const allowed = await request('/api/health', { headers: { Origin: 'https://localhost:5173' } });
     expect(allowed.headers.get('access-control-allow-origin')).toBe('https://localhost:5173');
+    expect(await allowed.json()).toMatchObject({
+      assignmentsConfigured: false,
+      assignmentWorkConfigured: false,
+    });
   });
   it('replays upload creation without duplicating sessions and rejects changed input', async () => {
     const bytes = pdf();

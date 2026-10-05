@@ -201,3 +201,144 @@ export async function handleCanvasAssignments(
     res.end(result.html);
   }
 }
+
+let activeSourceResponses = 0;
+
+/** Returns false only for another assignment route; all work ownership comes from the launch. */
+export async function handleCanvasWork(
+  req: IncomingMessage,
+  res: ServerResponse,
+  service: import('./assignments/work/types.js').AssignmentWorkService,
+  principal: SessionPrincipal,
+): Promise<boolean> {
+  if ((req.url?.length ?? 0) > 8192)
+    throw new AssignmentError(414, 'request_too_large', 'The work request is too large.');
+  const url = new URL(req.url ?? '/', 'https://localhost');
+  const manifest = url.pathname === '/api/assignments/work' && req.method !== 'POST';
+  const source = url.pathname === '/api/assignments/work/source';
+  const operations = url.pathname === '/api/assignments/work/operations';
+  if (!manifest && !source && !operations) return false;
+  if (principal.authenticationMethod !== 'lti' || principal.role !== 'student')
+    throw new AssignmentError(
+      403,
+      'student_launch_required',
+      'Open your work from an approved Canvas assignment.',
+    );
+  const methods = operations ? ['GET', 'POST'] : ['GET'];
+  if (!methods.includes(req.method ?? '')) {
+    res.setHeader('Allow', methods.join(', '));
+    throw new AssignmentError(405, 'method_not_allowed', 'This work action is not supported.');
+  }
+  if (req.headers.range)
+    throw new AssignmentError(
+      400,
+      'range_not_supported',
+      'Partial work responses are not supported.',
+    );
+  const parameters: { afterCursor?: number; limit?: number } = {};
+  for (const [key, value] of url.searchParams) {
+    if (
+      !operations ||
+      req.method !== 'GET' ||
+      !['afterCursor', 'limit'].includes(key) ||
+      url.searchParams.getAll(key).length !== 1 ||
+      !/^(0|[1-9][0-9]{0,5})$/.test(value)
+    )
+      throw new AssignmentError(
+        400,
+        'invalid_query',
+        'Use only bounded operation cursor and limit parameters.',
+      );
+    parameters[key as 'afterCursor' | 'limit'] = Number(value);
+  }
+  if (
+    req.method === 'GET' &&
+    (req.headers['transfer-encoding'] || Number(req.headers['content-length'] ?? 0) !== 0)
+  )
+    throw new AssignmentError(400, 'body_not_allowed', 'Work reads do not accept request bodies.');
+  const controller = new AbortController();
+  let bytes: Buffer | undefined;
+  let sourceSlot = false;
+  const dispose = () => {
+    if (sourceSlot) {
+      sourceSlot = false;
+      activeSourceResponses--;
+    }
+    bytes?.fill(0);
+    bytes = undefined;
+  };
+  const closed = () => {
+    if (!res.writableFinished) controller.abort();
+    dispose();
+  };
+  const aborted = () => controller.abort();
+  req.once('aborted', aborted);
+  res.once('close', closed);
+  res.once('finish', dispose);
+  const timeout = setTimeout(() => {
+    controller.abort();
+    if (res.headersSent) res.destroy();
+  }, 35000);
+  const options = { signal: controller.signal };
+  try {
+    const value = manifest
+      ? await service.describe(principal, options)
+      : operations
+        ? req.method === 'POST'
+          ? await service.append(principal, await jsonObject(req), options)
+          : await service.catchUp(principal, parameters, options)
+        : undefined;
+    if (source) {
+      if (activeSourceResponses >= 2)
+        throw new AssignmentError(
+          503,
+          'source_reader_busy',
+          'Source delivery is busy. Retry shortly.',
+        );
+      activeSourceResponses++;
+      sourceSlot = true;
+      bytes = await service.source(principal, options);
+    }
+    if (controller.signal.aborted || res.destroyed)
+      throw new AssignmentError(409, 'work_request_cancelled', 'The work request was interrupted.');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    if (source) {
+      res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        'Content-Length': bytes!.length,
+        'Content-Disposition': 'inline; filename="assignment.pdf"',
+      });
+      // Keep bytes intact until Node finishes flushing or closes; end() can retain this buffer.
+      res.end(bytes);
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify(
+          manifest ? value : operations && req.method === 'POST' ? { receipt: value } : value,
+        ),
+      );
+    }
+    return true;
+  } catch (error) {
+    clearTimeout(timeout);
+    dispose();
+    throw error;
+  } finally {
+    req.removeListener('aborted', aborted);
+    // Response listeners own disposal after end() and remove each other once settled.
+    const cleanup = () => {
+      clearTimeout(timeout);
+      res.removeListener('close', closed);
+      res.removeListener('finish', dispose);
+    };
+    if (res.writableFinished || res.destroyed) {
+      dispose();
+      cleanup();
+    } else {
+      res.once('finish', cleanup);
+      res.once('close', cleanup);
+    }
+  }
+}

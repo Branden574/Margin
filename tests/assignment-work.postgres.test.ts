@@ -7,10 +7,16 @@ import { join } from 'node:path';
 import { Pool, type PoolClient } from 'pg';
 import { stopDisposablePostgres } from './helpers/postgres';
 import { withTableOwnerMembership } from './helpers/owner-role';
-import { withAssignmentProvisionerMembership } from './helpers/provisioner-role';
+import {
+  withAssignmentProvisionerMembership,
+  withAssignmentWorkRuntimeMembership,
+} from './helpers/provisioner-role';
 import { LocalKeyProvider } from '../apps/api/src/encryption';
 import { PostgresIngestionRepository, type ArtifactReader } from '../apps/api/src/ingestion';
 import { PostgresAssignmentRepository } from '../apps/api/src/assignments';
+import { PostgresIdentityRepository } from '../apps/api/src/identity/postgres';
+import { PostgresLmsRepository } from '../apps/api/src/lms/postgres';
+import { SyncPool } from '../apps/api/src/sync/pool';
 import {
   PostgresStudentWorkProvisioner,
   StudentWorkProvisioningWorker,
@@ -67,6 +73,17 @@ async function seedTransaction(run: (client: PoolClient) => Promise<void>) {
     throw error;
   } finally {
     client.release();
+  }
+}
+async function rejectsMixedRole<T extends { close(): Promise<unknown> }>(
+  pool: T,
+  run: (pool: T) => Promise<unknown>,
+  message: string,
+) {
+  try {
+    await expect(run(pool)).rejects.toThrow(message);
+  } finally {
+    await pool.close();
   }
 }
 async function fixture(geometry = true) {
@@ -324,6 +341,7 @@ describe.skipIf(!available)(
         '004-assignments.sql',
         '005-ingestion.sql',
         '006-assignment-work.sql',
+        '007-assignment-work-runtime.sql',
       ])
         await admin.query(
           readFileSync(new URL('../infra/migrations/' + name, import.meta.url), 'utf8'),
@@ -747,6 +765,102 @@ describe.skipIf(!available)(
             }
           },
         );
+      },
+    );
+    it.each(
+      [
+        'margin_identity_runtime',
+        'margin_lms_runtime',
+        'margin_sync_runtime',
+        'margin_sync_provisioner',
+        'margin_assignments_runtime',
+        'margin_ingestion_runtime',
+        'margin_ingestion_inspector',
+        'margin_ingestion_reader',
+        'margin_assignment_provisioner',
+      ].flatMap((group) => [true, false].map((inherit) => ({ group, inherit }))),
+    )(
+      'rejects assignment-work runtime membership on $group inherited=$inherit',
+      async ({ group, inherit }) => {
+        // This suite applies the real work-runtime migration, so the test exercises its grants.
+        expect(
+          (
+            await admin.query(
+              "SELECT 1 FROM pg_roles WHERE rolname='margin_assignment_work_runtime'",
+            )
+          ).rowCount,
+        ).toBe(1);
+        const f = [
+          'margin_assignments_runtime',
+          'margin_ingestion_runtime',
+          'margin_ingestion_reader',
+        ].includes(group)
+          ? await fixture()
+          : undefined;
+        await withAssignmentWorkRuntimeMembership(
+          admin,
+          config('unused_fixture_login'),
+          group,
+          inherit,
+          async (unsafe) => {
+            if (group === 'margin_identity_runtime')
+              await rejectsMixedRole(
+                new PostgresIdentityRepository(unsafe),
+                (pool) => pool.findIdentity(hash(randomUUID())),
+                'mixed application role',
+              );
+            else if (group === 'margin_lms_runtime')
+              await rejectsMixedRole(
+                new PostgresLmsRepository(unsafe, randomBytes(32)),
+                (pool) => pool.findById(randomUUID()),
+                'must not',
+              );
+            else if (group === 'margin_sync_runtime' || group === 'margin_sync_provisioner') {
+              const run = vi.fn(async () => undefined);
+              await rejectsMixedRole(
+                new SyncPool(unsafe, group === 'margin_sync_runtime' ? 'runtime' : 'provisioner'),
+                (pool) => pool.transaction(undefined, run),
+                'dedicated',
+              );
+              expect(run).not.toHaveBeenCalled();
+            } else if (group === 'margin_assignments_runtime')
+              await rejectsMixedRole(
+                new PostgresAssignmentRepository(unsafe, kms),
+                (pool) => pool.get(f!.teacherP, f!.enrollment(f!.teacherP), f!.assignment.id),
+                'least-privilege',
+              );
+            else if (group === 'margin_ingestion_runtime')
+              await rejectsMixedRole(
+                new PostgresIngestionRepository(unsafe, kms, 'runtime'),
+                (pool) => pool.get(f!.teacherP, f!.source.identity.artifactId),
+                'least-privilege',
+              );
+            else if (group === 'margin_ingestion_inspector')
+              await rejectsMixedRole(
+                new PostgresIngestionRepository(unsafe, kms, 'inspector'),
+                (pool) => pool.claimNext(),
+                'least-privilege',
+              );
+            else if (group === 'margin_ingestion_reader')
+              await rejectsMixedRole(
+                new PostgresIngestionRepository(unsafe, kms, 'reader'),
+                (pool) => pool.readySnapshot(f!.manifest.source),
+                'least-privilege',
+              );
+            else
+              await rejectsMixedRole(
+                new PostgresStudentWorkProvisioner(unsafe, kms),
+                (pool) => pool.claimNext(),
+                'least-privilege',
+              );
+          },
+        );
+        if (f)
+          expect(
+            await assignments.get(f.teacherP, f.enrollment(f.teacherP), f.assignment.id),
+          ).toMatchObject({
+            id: f.assignment.id,
+          });
       },
     );
     it.each([true, false])(

@@ -17,7 +17,12 @@ import type { SessionPrincipal } from './identity/types.js';
 import { handleDocumentSync, type DocumentSyncService } from './sync-routes.js';
 import { SyncError } from './sync/index.js';
 import { createLmsHandler, type LmsService } from './lms/index.js';
-import { handleCanvasAssignments, type CanvasAssignmentService } from './assignment-routes.js';
+import {
+  handleCanvasAssignments,
+  handleCanvasWork,
+  type CanvasAssignmentService,
+} from './assignment-routes.js';
+import type { AssignmentWorkService } from './assignments/work/types.js';
 import { AssignmentError } from './assignments/types.js';
 
 const MIB = 1024 * 1024;
@@ -47,6 +52,8 @@ export interface ApiOptions {
   syncService?: DocumentSyncService;
   lmsService?: LmsService;
   assignmentService?: CanvasAssignmentService;
+  /** Optional current-launch student adapter; never configured by the default local entry point. */
+  assignmentWorkService?: AssignmentWorkService;
   keyEncryptionKey?: Buffer;
   keyManagementProvider?: KeyManagementProvider;
   tls?: { key: Buffer; cert: Buffer };
@@ -177,7 +184,10 @@ async function entries(path: string): Promise<string[]> {
 
 /** Encrypted local service. Production still requires OIDC, KMS, isolated scanning and a durable audit sink. */
 export function createApi(options: ApiOptions) {
-  if (options.assignmentService && (!options.identityService || !options.lmsService))
+  if (
+    (options.assignmentService || options.assignmentWorkService) &&
+    (!options.identityService || !options.lmsService)
+  )
     throw new Error('Canvas assignments require authenticated identity and LMS launch services.');
   if (
     options.lmsService &&
@@ -410,6 +420,7 @@ export function createApi(options: ApiOptions) {
           synchronizationConfigured: Boolean(options.syncService),
           canvasConfigured: Boolean(options.lmsService),
           assignmentsConfigured: Boolean(options.assignmentService),
+          assignmentWorkConfigured: Boolean(options.assignmentWorkService),
         });
         return;
       }
@@ -452,6 +463,12 @@ export function createApi(options: ApiOptions) {
       limit(`user:${identity.tenantId}:${identity.userId}`, options.requestsPerMinute ?? 1200);
       if (path === '/api/assignments' || path.startsWith('/api/assignments/')) {
         routeName = '/api/assignments/:action';
+        if (
+          options.assignmentWorkService &&
+          principal &&
+          (await handleCanvasWork(req, res, options.assignmentWorkService, principal))
+        )
+          return;
         if (!options.assignmentService || !principal)
           throw new ApiError(
             503,

@@ -4,6 +4,8 @@ The service in `apps/api/src/sync/` commits encrypted annotation operations, the
 
 This is a bounded backend slice. It does not configure a cloud KMS, run an outbox dispatcher, deliver realtime messages, scan documents, store PDF objects, grant classroom access automatically, or adopt a local vault into an account. Those boundaries must be integrated deliberately. Capacity for 100,000 simultaneous users has **not** been tested or established.
 
+Assignment-origin documents remain denied by this generic service. The separate [student work adapter](ASSIGNMENT_WORK.md) reuses internal operation commit/decoding with current LTI resource authorization and assignment tool policy; it does not relax generic access.
+
 ## Integration contract
 
 ```ts

@@ -188,6 +188,12 @@ function request(
 }
 const post = (body = '{}') => ({ method: 'POST', body });
 describe('Canvas assignment HTTP boundary', () => {
+  it('reports authoring composition independently from student work composition', async () => {
+    expect(JSON.parse((await request('/api/health')).body)).toMatchObject({
+      assignmentsConfigured: true,
+      assignmentWorkConfigured: false,
+    });
+  });
   it('requires fresh authenticated Canvas sessions before any assignment read', async () => {
     expect(
       (await request('/api/assignments/current', { headers: { cookie: undefined } })).status,

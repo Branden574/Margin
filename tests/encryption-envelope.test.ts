@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { decrypt, encrypt } from '../apps/api/src/sync/encryption';
 import { MAX_OPERATION_BYTES } from '../apps/api/src/sync/validation';
@@ -39,5 +39,24 @@ describe('bounded authenticated geometry envelopes', () => {
     changed.ciphertext[changed.ciphertext.length - 1] ^= 1;
     expect(() => decrypt(key, changed, context, 262144)).toThrow();
     expect(() => decrypt(randomBytes(32), encrypted, context, 262144)).toThrow();
+  });
+  it('clears temporary successful decryption plaintext without clearing the returned copy', () => {
+    const key = randomBytes(32),
+      plain = Buffer.from('Private synthetic envelope');
+    const encrypted = encrypt(key, plain, context),
+      concat = Buffer.concat;
+    let temporary: Uint8Array | undefined;
+    const spy = vi.spyOn(Buffer, 'concat').mockImplementation((chunks, length) => {
+      temporary = chunks[0];
+      return concat(chunks, length);
+    });
+    let result: Buffer;
+    try {
+      result = decrypt(key, encrypted, context);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(result!).toEqual(plain);
+    expect(temporary?.every((v) => v === 0)).toBe(true);
   });
 });

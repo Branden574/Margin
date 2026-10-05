@@ -102,8 +102,8 @@ export function decrypt(
   const pending = decipher.update(record.ciphertext);
   try {
     return Buffer.concat([pending, decipher.final()]);
-  } catch (error) {
+  } finally {
+    // concat returns independent storage; clear the temporary plaintext on success and failure.
     pending.fill(0);
-    throw error;
   }
 }
