@@ -81,9 +81,17 @@ export function encrypt(key: Buffer, body: Buffer, context: string): Ciphertext 
     tag: cipher.getAuthTag(),
   };
 }
-export function decrypt(key: Buffer, record: Ciphertext, context: string): Buffer {
+export function decrypt(
+  key: Buffer,
+  record: Ciphertext,
+  context: string,
+  maximumBytes = MAX_OPERATION_BYTES,
+): Buffer {
   if (
-    record.ciphertext.length > MAX_OPERATION_BYTES ||
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 1 ||
+    maximumBytes > 262144 ||
+    record.ciphertext.length > maximumBytes ||
     record.nonce.length !== 12 ||
     record.tag.length !== 16
   )

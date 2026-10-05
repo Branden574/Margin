@@ -13,8 +13,17 @@ import {
   type InspectionClaim,
   type InspectionReport,
   type InspectionReceipt,
+  type SourcePageGeometry,
 } from './types.js';
-import { id, digest, reservation, receipt, report } from './validation.js';
+import {
+  id,
+  digest,
+  reservation,
+  receipt,
+  report,
+  geometry,
+  GEOMETRY_MAX_BYTES,
+} from './validation.js';
 type Kind = 'runtime' | 'inspector' | 'reader';
 interface Envelope extends Ciphertext {
   wrapped_key: WrappedDataKey;
@@ -46,6 +55,18 @@ interface ScanRow extends Envelope {
   claim_id: string;
   attempt: number;
   verdict: 'ready' | 'rejected';
+  has_geometry?: boolean;
+}
+interface GeometryRow extends Envelope {
+  scan_receipt_id: string;
+  artifact_id: string;
+}
+interface ReadyRows {
+  r: Row;
+  j: Job;
+  stored: Envelope;
+  scan: ScanRow;
+  pages?: GeometryRow;
 }
 interface PrivateReservation extends SourceReservationInput {
   fingerprint: string;
@@ -68,7 +89,14 @@ const envelopeState = (e: Envelope) => [
   e.tag.toString('base64'),
   e.wrapped_key,
 ];
-const stateToken = (r: Row, j: Job, stored: Envelope, scan: ScanRow) =>
+const stateToken = (
+  r: Row,
+  j: Job,
+  stored: Envelope,
+  scan: ScanRow,
+  source: ReadyAssignmentSource,
+  pages?: GeometryRow,
+) =>
   hash(
     canonical([
       binding('approval-state', r),
@@ -80,6 +108,9 @@ const stateToken = (r: Row, j: Job, stored: Envelope, scan: ScanRow) =>
       j.scan_receipt_id,
       scanBinding(scan),
       envelopeState(scan),
+      scan.has_geometry === true,
+      pages ? [pages.scan_receipt_id, pages.artifact_id, envelopeState(pages)] : null,
+      source,
     ]),
   );
 const binding = (kind: string, r: Row, extra = '') =>
@@ -103,6 +134,113 @@ export interface ReadyManifest {
   receipt: ArtifactReceipt;
   /** Opaque digest of the authenticated immutable database state; contains no plaintext metadata. */
   stateToken: string;
+  /** Present only when every page was authenticated by the inspected geometry envelope. */
+  pageGeometry?: SourcePageGeometry[];
+}
+const geometryBinding = (
+  scan: Pick<ScanRow, 'id' | 'claim_id' | 'attempt' | 'verdict'>,
+  object: ArtifactReceipt,
+  decision: InspectionReport,
+) =>
+  canonical([
+    scanBinding(scan),
+    object,
+    decision.plaintextSha256,
+    decision.plaintextBytes,
+    decision.pageCount,
+  ]);
+async function activeSource(c: PoolClient, r: Row) {
+  return (
+    !r.revoked_at &&
+    (
+      await c.query<{ ok: boolean }>(
+        'SELECT margin_ingestion.active_source($1,$2,$3,$4,$5,$6,$7) AS ok',
+        [
+          r.organization_id,
+          r.owner_id,
+          r.document_id,
+          r.version_id,
+          r.installation_id,
+          r.course_id,
+          r.registration_version,
+        ],
+      )
+    ).rows[0]?.ok === true
+  );
+}
+async function pageGeometryRow(
+  c: PoolClient,
+  r: Row,
+  scan: ScanRow,
+): Promise<GeometryRow | undefined> {
+  // Older 005-only installations have no geometry table; legacy approvals remain readable.
+  if (!scan.has_geometry) return undefined;
+  const value = (
+    await c.query<GeometryRow>(
+      'SELECT * FROM margin_ingestion.page_geometry WHERE scan_receipt_id=$1 AND artifact_id=$2',
+      [scan.id, r.artifact_id],
+    )
+  ).rows[0];
+  return value;
+}
+/** Recheck authenticated immutable state inside the caller's transaction, with no KMS or object I/O. */
+export async function recheckReadyManifest(
+  c: PoolClient,
+  source: ReadyAssignmentSource,
+  expectedStateToken: string,
+): Promise<boolean> {
+  digest(expectedStateToken);
+  for (const [k, v] of [
+    ['user_id', source.ownerId],
+    ['organization_id', source.organizationId],
+    ['document_id', source.documentId],
+    ['version_id', source.versionId],
+    ['artifact_id', source.artifactId],
+  ])
+    await ctx(c, k, v);
+  const r = (
+    await c.query<Row>('SELECT * FROM margin_ingestion.artifacts WHERE artifact_id=$1', [
+      id(source.artifactId),
+    ])
+  ).rows[0];
+  if (
+    !r ||
+    r.organization_id !== source.organizationId ||
+    r.owner_id !== source.ownerId ||
+    r.document_id !== source.documentId ||
+    r.version_id !== source.versionId ||
+    !(await activeSource(c, r))
+  )
+    return false;
+  const j = (
+    await c.query<Job>('SELECT * FROM margin_ingestion.inspection_jobs WHERE artifact_id=$1', [
+      r.artifact_id,
+    ])
+  ).rows[0];
+  if (j?.status !== 'ready' || j.scan_receipt_id !== source.scanReceiptId) return false;
+  const stored = (
+    await c.query<Envelope>(
+      'SELECT * FROM margin_ingestion.storage_receipts WHERE artifact_id=$1',
+      [r.artifact_id],
+    )
+  ).rows[0];
+  const scan = (
+    await c.query<ScanRow>('SELECT * FROM margin_ingestion.inspection_receipts WHERE id=$1', [
+      j.scan_receipt_id,
+    ])
+  ).rows[0];
+  if (
+    !stored ||
+    !scan ||
+    scan.artifact_id !== r.artifact_id ||
+    scan.verdict !== 'ready' ||
+    scan.claim_id !== j.claim_id ||
+    scan.attempt !== j.attempt
+  )
+    return false;
+  const pages = await pageGeometryRow(c, r, scan);
+  if (scan.has_geometry && !pages) return false;
+  return stateToken(r, j, stored, scan, source, pages) === expectedStateToken;
 }
 /** Separate instance and database login per purpose; never combine these groups on one credential. */
 export class PostgresIngestionRepository {
@@ -166,9 +304,10 @@ export class PostgresIngestionRepository {
         'margin_lms_runtime',
         'margin_lms_provisioner',
         'margin_assignments_runtime',
+        'margin_assignment_provisioner',
       ].filter((g) => g !== group);
       const safe = await c.query<{ unsafe: boolean }>(
-        `SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,$1,'MEMBER') OR EXISTS(SELECT 1 FROM pg_roles other WHERE other.rolname=ANY($2::text[]) AND pg_has_role(current_user,other.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_ingestion','margin_identity','margin_lms','margin_sync','margin_assignments') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user`,
+        `SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,$1,'MEMBER') OR EXISTS(SELECT 1 FROM pg_roles other WHERE other.rolname=ANY($2::text[]) AND pg_has_role(current_user,other.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_ingestion','margin_identity','margin_lms','margin_sync','margin_assignments','margin_work') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user`,
         [group, groups],
       );
       if (!safe.rows[0] || safe.rows[0].unsafe)
@@ -251,11 +390,17 @@ export class PostgresIngestionRepository {
       return result;
     });
   }
-  private async seal(kind: string, row: Row, value: unknown, extra = ''): Promise<Envelope> {
+  private async seal(
+    kind: string,
+    row: Row,
+    value: unknown,
+    extra = '',
+    maximumBytes = 16384,
+  ): Promise<Envelope> {
     const plain = Buffer.from(canonical(value));
     let key: Buffer | undefined;
     try {
-      if (plain.length > 16384)
+      if (plain.length > maximumBytes)
         throw new IngestionError(
           413,
           'ingestion_metadata_limit',
@@ -270,12 +415,18 @@ export class PostgresIngestionRepository {
       key?.fill(0);
     }
   }
-  private async open<T>(kind: string, row: Row, value: Envelope, extra = ''): Promise<T> {
+  private async open<T>(
+    kind: string,
+    row: Row,
+    value: Envelope,
+    extra = '',
+    maximumBytes = 16384,
+  ): Promise<T> {
     let key: Buffer | undefined, plain: Buffer | undefined;
     try {
       const bound = binding(kind, row, extra);
       key = await unwrapKey(this.kms, value.wrapped_key, bound);
-      plain = decrypt(key, value, bound);
+      plain = decrypt(key, value, bound, maximumBytes);
       return JSON.parse(plain.toString('utf8')) as T;
     } catch {
       throw new IngestionError(
@@ -442,23 +593,7 @@ export class PostgresIngestionRepository {
     });
   }
   private async active(c: PoolClient, r: Row) {
-    return (
-      !r.revoked_at &&
-      (
-        await c.query<{ ok: boolean }>(
-          'SELECT margin_ingestion.active_source($1,$2,$3,$4,$5,$6,$7) AS ok',
-          [
-            r.organization_id,
-            r.owner_id,
-            r.document_id,
-            r.version_id,
-            r.installation_id,
-            r.course_id,
-            r.registration_version,
-          ],
-        )
-      ).rows[0]?.ok === true
-    );
+    return activeSource(c, r);
   }
   async claimNext(): Promise<InspectionClaim | null> {
     this.require('inspector');
@@ -588,19 +723,21 @@ export class PostgresIngestionRepository {
           'The claimed immutable source receipt changed.',
         );
       const scanId = randomUUID(),
+        { pageGeometry, ...summary } = checked,
+        scanIdentity = {
+          id: scanId,
+          claim_id: claim.claimId,
+          attempt: j.attempt,
+          verdict: checked.verdict,
+        },
         e = await this.seal(
           'inspection',
           r,
-          { report: checked, fingerprint, receipt: object },
-          scanBinding({
-            id: scanId,
-            claim_id: claim.claimId,
-            attempt: j.attempt,
-            verdict: checked.verdict,
-          }),
+          { report: summary, fingerprint, receipt: object },
+          scanBinding(scanIdentity),
         );
       await c.query(
-        'INSERT INTO margin_ingestion.inspection_receipts(id,artifact_id,claim_id,attempt,verdict,ciphertext,nonce,tag,wrapped_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+        `INSERT INTO margin_ingestion.inspection_receipts(id,artifact_id,claim_id,attempt,verdict,ciphertext,nonce,tag,wrapped_key${pageGeometry ? ',has_geometry' : ''}) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9${pageGeometry ? ',true' : ''})`,
         [
           scanId,
           r.artifact_id,
@@ -613,6 +750,19 @@ export class PostgresIngestionRepository {
           e.wrapped_key,
         ],
       );
+      if (pageGeometry) {
+        const pages = await this.seal(
+          'page-geometry',
+          r,
+          pageGeometry,
+          geometryBinding(scanIdentity, object, checked),
+          GEOMETRY_MAX_BYTES,
+        );
+        await c.query(
+          'INSERT INTO margin_ingestion.page_geometry(scan_receipt_id,artifact_id,ciphertext,nonce,tag,wrapped_key) VALUES($1,$2,$3,$4,$5,$6)',
+          [scanId, r.artifact_id, pages.ciphertext, pages.nonce, pages.tag, pages.wrapped_key],
+        );
+      }
       await c.query(
         'UPDATE margin_ingestion.inspection_jobs SET status=$2,scan_receipt_id=$3,completed_at=clock_timestamp() WHERE artifact_id=$1',
         [r.artifact_id, checked.verdict, scanId],
@@ -662,7 +812,7 @@ export class PostgresIngestionRepository {
       );
     });
   }
-  private async ready(c: PoolClient, r: Row): Promise<ReadyManifest | null> {
+  private async readyRows(c: PoolClient, r: Row): Promise<ReadyRows | null> {
     if (!(await this.active(c, r))) return null;
     const j = (
       await c.query<Job>('SELECT * FROM margin_ingestion.inspection_jobs WHERE artifact_id=$1', [
@@ -682,7 +832,9 @@ export class PostgresIngestionRepository {
         ])
       ).rows[0];
     if (
+      !stored ||
       !scan ||
+      scan.artifact_id !== r.artifact_id ||
       scan.verdict !== 'ready' ||
       scan.claim_id !== j.claim_id ||
       scan.attempt !== j.attempt
@@ -692,6 +844,17 @@ export class PostgresIngestionRepository {
         'ingestion_integrity',
         'The inspection decision does not match its job.',
       );
+    const pages = await pageGeometryRow(c, r, scan);
+    if (scan.has_geometry && !pages)
+      throw new IngestionError(
+        503,
+        'ingestion_integrity',
+        'The inspected page geometry is unavailable.',
+      );
+    return { r, j, stored, scan, pages };
+  }
+  /** Key-provider waits happen only after the encrypted row capture has committed. */
+  private async decodeReady({ r, j, stored, scan, pages }: ReadyRows): Promise<ReadyManifest> {
     const expected = reservation(await this.open<PrivateReservation>('reservation', r, r)),
       object = receipt(await this.open<ArtifactReceipt>('storage', r, stored)),
       inspection = await this.open<{
@@ -699,7 +862,26 @@ export class PostgresIngestionRepository {
         receipt: ArtifactReceipt;
         fingerprint: string;
       }>('inspection', r, scan, scanBinding(scan)),
-      decision = report(inspection.report);
+      summary = report(inspection.report);
+    if (summary.pageGeometry !== undefined)
+      throw new IngestionError(
+        503,
+        'ingestion_integrity',
+        'Page geometry must use its authenticated inspection envelope.',
+      );
+    const pageGeometry = pages
+      ? geometry(
+          await this.open<SourcePageGeometry[]>(
+            'page-geometry',
+            r,
+            pages,
+            geometryBinding(scan, object, summary),
+            GEOMETRY_MAX_BYTES,
+          ),
+          summary.pageCount,
+        )
+      : undefined;
+    const decision = report({ ...summary, ...(pageGeometry ? { pageGeometry } : {}) });
     if (
       decision.verdict !== 'ready' ||
       decision.plaintextBytes !== expected.plaintextBytes ||
@@ -712,38 +894,46 @@ export class PostgresIngestionRepository {
         'ingestion_integrity',
         'The inspection does not authenticate this immutable object version.',
       );
+    const source: ReadyAssignmentSource = {
+      organizationId: r.organization_id,
+      documentId: r.document_id,
+      versionId: r.version_id,
+      ownerId: r.owner_id,
+      artifactId: r.artifact_id,
+      artifactVersion: object.objectVersionId,
+      sha256: decision.plaintextSha256,
+      scanReceiptId: scan.id,
+      inspectionStatus: 'ready',
+      encrypted: true,
+      pageCount: decision.pageCount,
+    };
     return {
       identity: identity(r),
       receipt: object,
-      stateToken: stateToken(r, j, stored, scan),
-      source: {
-        organizationId: r.organization_id,
-        documentId: r.document_id,
-        versionId: r.version_id,
-        ownerId: r.owner_id,
-        artifactId: r.artifact_id,
-        artifactVersion: object.objectVersionId,
-        sha256: decision.plaintextSha256,
-        scanReceiptId: scan.id,
-        inspectionStatus: 'ready',
-        encrypted: true,
-        pageCount: decision.pageCount,
-      },
+      stateToken: stateToken(r, j, stored, scan, source, pages),
+      source,
+      ...(pageGeometry ? { pageGeometry } : {}),
     };
   }
   async readyForTeacher(
     p: SessionPrincipal,
     ref: { documentId: string; versionId: string },
   ): Promise<ReadyManifest | null> {
-    return this.teacher(p, async (c) => {
+    const rows = await this.teacher(p, async (c) => {
       const r = (
         await c.query<Row>(
           'SELECT * FROM margin_ingestion.artifacts WHERE document_id=$1 AND version_id=$2',
           [id(ref.documentId), id(ref.versionId)],
         )
       ).rows[0];
-      return r ? this.ready(c, r) : null;
+      return r ? this.readyRows(c, r) : null;
     });
+    if (!rows) return null;
+    const value = await this.decodeReady(rows);
+    // Current teacher session and source authority are rechecked after all key I/O.
+    return (await this.teacher(p, (c) => recheckReadyManifest(c, value.source, value.stateToken)))
+      ? value
+      : null;
   }
   /** Only consume a token produced by authenticated readySnapshot; no remote I/O or key operation. */
   async recheckApproval(
@@ -754,39 +944,12 @@ export class PostgresIngestionRepository {
     digest(expectedStateToken);
     return this.tx(async (c) => {
       await c.query("SET LOCAL statement_timeout='750ms'");
-      for (const [k, v] of [
-        ['user_id', source.ownerId],
-        ['organization_id', source.organizationId],
-        ['document_id', source.documentId],
-        ['version_id', source.versionId],
-        ['artifact_id', source.artifactId],
-      ])
-        await ctx(c, k, v);
-      const r = await this.row(c, source.artifactId);
-      if (!r || !(await this.active(c, r))) return false;
-      const j = (
-        await c.query<Job>('SELECT * FROM margin_ingestion.inspection_jobs WHERE artifact_id=$1', [
-          r.artifact_id,
-        ])
-      ).rows[0];
-      if (j?.status !== 'ready' || j.scan_receipt_id !== source.scanReceiptId) return false;
-      const stored = (
-        await c.query<Envelope>(
-          'SELECT * FROM margin_ingestion.storage_receipts WHERE artifact_id=$1',
-          [r.artifact_id],
-        )
-      ).rows[0];
-      const scan = (
-        await c.query<ScanRow>('SELECT * FROM margin_ingestion.inspection_receipts WHERE id=$1', [
-          j.scan_receipt_id,
-        ])
-      ).rows[0];
-      return !!stored && !!scan && stateToken(r, j, stored, scan) === expectedStateToken;
+      return recheckReadyManifest(c, source, expectedStateToken);
     });
   }
   async readySnapshot(source: ReadyAssignmentSource): Promise<ReadyManifest | null> {
     this.require('reader');
-    return this.tx(async (c) => {
+    const rows = await this.tx(async (c) => {
       for (const [k, v] of [
         ['user_id', source.ownerId],
         ['organization_id', source.organizationId],
@@ -797,8 +960,11 @@ export class PostgresIngestionRepository {
         await ctx(c, k, v);
       const r = await this.row(c, source.artifactId);
       if (!r) return null;
-      const value = await this.ready(c, r);
-      return value && canonical(value.source) === canonical(source) ? value : null;
+      return this.readyRows(c, r);
     });
+    if (!rows) return null;
+    const value = await this.decodeReady(rows);
+    if (canonical(value.source) !== canonical(source)) return null;
+    return (await this.recheckApproval(value.source, value.stateToken)) ? value : null;
   }
 }

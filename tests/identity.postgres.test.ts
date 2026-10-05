@@ -12,6 +12,7 @@ import {
 } from '../apps/api/src/identity/index';
 import { tokenHash } from '../apps/api/src/identity/crypto';
 import { withTableOwnerMembership } from './helpers/owner-role';
+import { withAssignmentProvisionerMembership } from './helpers/provisioner-role';
 import { stopDisposablePostgres } from './helpers/postgres';
 
 // Actual SQL/RLS integration in a disposable Unix-socket-only cluster. Never touches a running DB.
@@ -292,6 +293,26 @@ describe.skipIf(!available)('identity PostgreSQL repository and enforced RLS', (
         new PostgresIdentityRepository({ host: 'db.example', ssl: { rejectUnauthorized: false } }),
     ).toThrow('TLS');
   });
+  it.each([true, false])(
+    'rejects assignment-provisioner membership with inheritance=%s',
+    async (inherit) => {
+      await withAssignmentProvisionerMembership(
+        admin,
+        { host: join(directory, 'socket'), port: 55489, database: 'postgres' },
+        'margin_identity_runtime',
+        inherit,
+        async (config) => {
+          const unsafe = new PostgresIdentityRepository(config);
+          try {
+            await expect(unsafe.findIdentity(identityA)).rejects.toThrow('provisioning role');
+          } finally {
+            await unsafe.close();
+          }
+        },
+      );
+      expect((await repository.findIdentity(identityA))?.userId).toBe(userA);
+    },
+  );
   it.each([true, false])('rejects table-owner membership with inheritance=%s', async (inherit) => {
     await withTableOwnerMembership(
       admin,

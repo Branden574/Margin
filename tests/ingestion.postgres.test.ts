@@ -1,5 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { withTableOwnerMembership } from './helpers/owner-role';
+import { withAssignmentProvisionerMembership } from './helpers/provisioner-role';
+import { recheckReadyManifest } from '../apps/api/src/ingestion/postgres';
+import { PostgresIdentityRepository } from '../apps/api/src/identity/postgres';
+import { PostgresLmsRepository } from '../apps/api/src/lms/postgres';
+import { SyncPool } from '../apps/api/src/sync/pool';
 import { stopDisposablePostgres } from './helpers/postgres';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -804,6 +809,31 @@ describe.skipIf(!available)(
         code: 'ingestion_integrity',
       });
     });
+    it('rejects assignment-provisioner membership for every ingestion purpose, including SET ROLE only', async () => {
+      for (const purpose of ['runtime', 'inspector', 'reader'] as const)
+        for (const inherit of [true, false])
+          await withAssignmentProvisionerMembership(
+            admin,
+            config(`ingestion_${purpose}_test`),
+            `margin_ingestion_${purpose}`,
+            inherit,
+            async (unsafeConfig) => {
+              const unsafe = new PostgresIngestionRepository(unsafeConfig, kms, purpose);
+              try {
+                if (purpose === 'runtime')
+                  await expect(unsafe.get(p, randomUUID())).rejects.toThrow('least-privilege');
+                else if (purpose === 'inspector')
+                  await expect(unsafe.claimNext()).rejects.toThrow('least-privilege');
+                else {
+                  const source = (await approved()).manifest.source;
+                  await expect(unsafe.readySnapshot(source)).rejects.toThrow('least-privilege');
+                }
+              } finally {
+                await unsafe.close();
+              }
+            },
+          );
+    });
     it('rejects inherited and SET-ROLE-only memberships in a database table owner role', async () => {
       for (const inherit of [true, false])
         await withTableOwnerMembership(
@@ -898,6 +928,338 @@ describe.skipIf(!available)(
         inspector.complete(claim, { ...goodReport(), pageCount: 2001 }),
       ).rejects.toMatchObject({ code: 'invalid_inspection' });
       expect((await runtime.get(p, s.reserved.identity.artifactId))?.status).toBe('quarantined');
+    });
+    describe('authenticated geometry after migration 006', () => {
+      let legacy: Awaited<ReturnType<typeof approved>>;
+      const pageGeometry = () => [{ index: 0, width: 612.125, height: 792.25 }];
+      async function withGeometry(pages = pageGeometry()) {
+        const source = await staged();
+        const claim = (await inspector.claimNext())!;
+        expect(claim.identity.artifactId).toBe(source.reserved.identity.artifactId);
+        const decision = { ...goodReport(), pageCount: pages.length, pageGeometry: pages };
+        const inspected = await inspector.complete(claim, decision);
+        const manifest = (await runtime.readyForTeacher(p, source.input))!;
+        return { ...source, claim, decision, inspected, manifest };
+      }
+      beforeAll(async () => {
+        legacy = await approved();
+        for (const name of ['004-assignments.sql', '006-assignment-work.sql'])
+          await admin.query(
+            readFileSync(new URL('../infra/migrations/' + name, import.meta.url), 'utf8'),
+          );
+      });
+      it('keeps pre-migration geometryless approvals readable without inventing dimensions', async () => {
+        const current = (await reader.readySnapshot(legacy.manifest.source))!;
+        expect(current.pageGeometry).toBeUndefined();
+        expect(current.stateToken).toBe(legacy.manifest.stateToken);
+        expect(await reader.recheckApproval(current.source, current.stateToken)).toBe(true);
+      });
+      it('encrypts a complete 2000-page geometry report separately while preserving full-result idempotency', async () => {
+        const pages = Array.from({ length: 2000 }, (_, index) => ({
+          index,
+          width: 612.123456789,
+          height: 792.987654321,
+        }));
+        const source = await withGeometry(pages);
+        expect(source.manifest.pageGeometry).toEqual(pages);
+        const raw = (
+          await admin.query(
+            'SELECT g.*,octet_length(r.ciphertext) AS report_bytes,r.has_geometry,row_to_json(g)::text AS encoded FROM margin_ingestion.page_geometry g JOIN margin_ingestion.inspection_receipts r ON r.id=g.scan_receipt_id WHERE g.scan_receipt_id=$1',
+            [source.inspected.id],
+          )
+        ).rows[0];
+        expect(raw.ciphertext.length).toBeGreaterThan(65536);
+        expect(raw.ciphertext.length).toBeLessThanOrEqual(262144);
+        expect(raw.report_bytes).toBeLessThan(16384);
+        expect(raw.has_geometry).toBe(true);
+        expect(raw.encoded).not.toContain('612.123456789');
+        expect(raw.encoded).not.toContain('width');
+        expect(await inspector.complete(source.claim, source.decision)).toMatchObject({
+          duplicate: true,
+          id: source.inspected.id,
+        });
+        const changed = structuredClone(source.decision);
+        changed.pageGeometry[1999].height += 1;
+        await expect(inspector.complete(source.claim, changed)).rejects.toMatchObject({
+          code: 'inspection_conflict',
+        });
+        expect((await reader.readySnapshot(source.manifest.source))?.pageGeometry).toEqual(pages);
+      });
+      it('rechecks exact source and geometry envelopes in the caller transaction without KMS calls', async () => {
+        const source = await withGeometry();
+        const client = await sqlReader.connect();
+        const keys = vi
+          .spyOn(kms, 'unwrapKey')
+          .mockRejectedValue(new Error('No KMS in the final transaction'));
+        try {
+          await client.query('BEGIN');
+          expect(
+            await recheckReadyManifest(client, source.manifest.source, source.manifest.stateToken),
+          ).toBe(true);
+          for (const changed of [
+            { ...source.manifest.source, artifactVersion: 'other-exact-version' },
+            { ...source.manifest.source, sha256: hash('other-content') },
+            { ...source.manifest.source, pageCount: 2 },
+          ])
+            expect(await recheckReadyManifest(client, changed, source.manifest.stateToken)).toBe(
+              false,
+            );
+          expect(keys).not.toHaveBeenCalled();
+          await client.query('ROLLBACK');
+        } finally {
+          keys.mockRestore();
+          client.release();
+        }
+        await admin.query(
+          'UPDATE margin_ingestion.page_geometry SET ciphertext=set_byte(ciphertext,0,get_byte(ciphertext,0)#1) WHERE scan_receipt_id=$1',
+          [source.inspected.id],
+        );
+        expect(
+          await reader.recheckApproval(source.manifest.source, source.manifest.stateToken),
+        ).toBe(false);
+        await expect(reader.readySnapshot(source.manifest.source)).rejects.toMatchObject({
+          code: 'ingestion_integrity',
+        });
+      });
+      it('keeps all readiness key waits outside transactions even beyond the database idle deadline', async () => {
+        const source = await withGeometry();
+        let calls = 0;
+        const slowKeys: KeyManagementProvider = {
+          wrapKey: (key, context) => kms.wrapKey(key, context),
+          unwrapKey: async (wrapped, context) => {
+            expect(
+              (
+                await admin.query(
+                  "SELECT 1 FROM pg_stat_activity WHERE usename='ingestion_reader_test' AND xact_start IS NOT NULL",
+                )
+              ).rowCount,
+            ).toBe(0);
+            calls++;
+            await new Promise((resolve) => setTimeout(resolve, 1300));
+            return kms.unwrapKey(wrapped, context);
+          },
+        };
+        const slow = new PostgresIngestionRepository(
+          config('ingestion_reader_test'),
+          slowKeys,
+          'reader',
+        );
+        try {
+          expect((await slow.readySnapshot(source.manifest.source))?.pageGeometry).toEqual(
+            pageGeometry(),
+          );
+          expect(calls).toBe(4);
+        } finally {
+          await slow.close();
+        }
+      }, 10000);
+      it('rechecks source and teacher authority after key I/O finishes', async () => {
+        const source = await withGeometry();
+        let revokeSource = true,
+          changed = false;
+        const racingKeys: KeyManagementProvider = {
+          wrapKey: (key, context) => kms.wrapKey(key, context),
+          unwrapKey: async (wrapped, context) => {
+            if (!changed) {
+              changed = true;
+              if (revokeSource) await inspector.revoke(source.reserved.identity.artifactId);
+              else
+                await admin.query(
+                  'UPDATE margin_identity.sessions SET revoked_at=now() WHERE id=$1',
+                  [p.sessionId],
+                );
+            }
+            return kms.unwrapKey(wrapped, context);
+          },
+        };
+        const reading = new PostgresIngestionRepository(
+          config('ingestion_reader_test'),
+          racingKeys,
+          'reader',
+        );
+        const teacherReading = new PostgresIngestionRepository(
+          config('ingestion_runtime_test'),
+          racingKeys,
+          'runtime',
+        );
+        try {
+          expect(await reading.readySnapshot(source.manifest.source)).toBeNull();
+          await admin.query(
+            'UPDATE margin_ingestion.artifacts SET revoked_at=NULL WHERE artifact_id=$1',
+            [source.reserved.identity.artifactId],
+          );
+          revokeSource = false;
+          changed = false;
+          await expect(teacherReading.readyForTeacher(p, source.input)).rejects.toMatchObject({
+            code: 'ingestion_revoked',
+          });
+        } finally {
+          await admin.query('UPDATE margin_identity.sessions SET revoked_at=NULL WHERE id=$1', [
+            p.sessionId,
+          ]);
+          await Promise.all([reading.close(), teacherReading.close()]);
+        }
+      });
+      it('rejects geometry substitution between receipts and missing or downgraded geometry evidence', async () => {
+        const first = await withGeometry();
+        const second = await withGeometry([{ index: 0, width: 400, height: 500 }]);
+        await admin.query(
+          'UPDATE margin_ingestion.page_geometry g SET ciphertext=o.ciphertext,nonce=o.nonce,tag=o.tag,wrapped_key=o.wrapped_key FROM margin_ingestion.page_geometry o WHERE g.scan_receipt_id=$1 AND o.scan_receipt_id=$2',
+          [first.inspected.id, second.inspected.id],
+        );
+        await expect(reader.readySnapshot(first.manifest.source)).rejects.toMatchObject({
+          code: 'ingestion_integrity',
+        });
+        expect(await reader.recheckApproval(first.manifest.source, first.manifest.stateToken)).toBe(
+          false,
+        );
+        await admin.query(
+          'UPDATE margin_ingestion.inspection_receipts SET has_geometry=false WHERE id=$1',
+          [second.inspected.id],
+        );
+        await expect(reader.readySnapshot(second.manifest.source)).rejects.toMatchObject({
+          code: 'ingestion_integrity',
+        });
+        expect(
+          await reader.recheckApproval(second.manifest.source, second.manifest.stateToken),
+        ).toBe(false);
+        await admin.query(
+          'UPDATE margin_ingestion.inspection_receipts SET has_geometry=true WHERE id=$1',
+          [second.inspected.id],
+        );
+        await admin.query('DELETE FROM margin_ingestion.page_geometry WHERE scan_receipt_id=$1', [
+          second.inspected.id,
+        ]);
+        await expect(reader.readySnapshot(second.manifest.source)).rejects.toMatchObject({
+          code: 'ingestion_integrity',
+        });
+        expect(
+          await reader.recheckApproval(second.manifest.source, second.manifest.stateToken),
+        ).toBe(false);
+      });
+      it('rolls back the inspection receipt and approval if geometry persistence fails, then retries atomically', async () => {
+        const source = await staged(),
+          claim = (await inspector.claimNext())!;
+        const decision = { ...goodReport(), pageGeometry: pageGeometry() };
+        await admin.query(
+          `CREATE FUNCTION margin_ingestion.synthetic_geometry_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic geometry commit failure'; END; $$; CREATE TRIGGER synthetic_geometry_failure BEFORE INSERT ON margin_ingestion.page_geometry FOR EACH ROW EXECUTE FUNCTION margin_ingestion.synthetic_geometry_failure()`,
+        );
+        try {
+          await expect(inspector.complete(claim, decision)).rejects.toThrow(
+            'synthetic geometry commit failure',
+          );
+          expect(
+            (
+              await admin.query(
+                'SELECT 1 FROM margin_ingestion.inspection_receipts WHERE artifact_id=$1',
+                [source.reserved.identity.artifactId],
+              )
+            ).rowCount,
+          ).toBe(0);
+          expect((await runtime.get(p, source.reserved.identity.artifactId))?.status).toBe(
+            'quarantined',
+          );
+        } finally {
+          await admin.query(
+            'DROP TRIGGER synthetic_geometry_failure ON margin_ingestion.page_geometry; DROP FUNCTION margin_ingestion.synthetic_geometry_failure()',
+          );
+        }
+        expect(await inspector.complete(claim, decision)).toMatchObject({
+          status: 'ready',
+          duplicate: false,
+        });
+        expect((await runtime.readyForTeacher(p, source.input))?.pageGeometry).toEqual(
+          pageGeometry(),
+        );
+      });
+      it('rejects work-receipt owner credentials across identity, LMS, sync and ingestion runtimes', async () => {
+        for (const inherit of [true, false]) {
+          for (const purpose of ['identity', 'lms', 'sync', 'ingestion'] as const) {
+            await withTableOwnerMembership(
+              admin,
+              config('postgres'),
+              'margin_work.receipts',
+              `margin_${purpose}_runtime`,
+              inherit,
+              async (unsafeConfig) => {
+                if (purpose === 'identity') {
+                  const unsafe = new PostgresIdentityRepository(unsafeConfig);
+                  try {
+                    await expect(unsafe.findIdentity(hash('synthetic-identity'))).rejects.toThrow(
+                      'table owner',
+                    );
+                  } finally {
+                    await unsafe.close();
+                  }
+                } else if (purpose === 'lms') {
+                  const unsafe = new PostgresLmsRepository(unsafeConfig, Buffer.alloc(32, 79));
+                  try {
+                    await expect(unsafe.findById(installation)).rejects.toThrow('must not');
+                  } finally {
+                    await unsafe.close();
+                  }
+                } else if (purpose === 'sync') {
+                  const unsafe = new SyncPool(unsafeConfig, 'runtime');
+                  try {
+                    await expect(unsafe.transaction(undefined, async () => true)).rejects.toThrow(
+                      'dedicated',
+                    );
+                  } finally {
+                    await unsafe.close();
+                  }
+                } else {
+                  const unsafe = new PostgresIngestionRepository(unsafeConfig, kms, 'runtime');
+                  try {
+                    await expect(unsafe.get(p, randomUUID())).rejects.toThrow('least-privilege');
+                  } finally {
+                    await unsafe.close();
+                  }
+                }
+              },
+            );
+          }
+        }
+      });
+      it('enforces scoped geometry reads and denies runtime or inspector geometry rewrites', async () => {
+        const source = await withGeometry();
+        expect(
+          (await sqlRuntime.query('SELECT * FROM margin_ingestion.page_geometry')).rowCount,
+        ).toBe(0);
+        expect(
+          (await sqlReader.query('SELECT * FROM margin_ingestion.page_geometry')).rowCount,
+        ).toBe(0);
+        expect(await runtime.readyForTeacher(peerP, source.input)).toBeNull();
+        await expect(
+          sqlRuntime.query('DELETE FROM margin_ingestion.page_geometry'),
+        ).rejects.toMatchObject({ code: '42501' });
+        await expect(
+          sqlWorker.query(
+            'UPDATE margin_ingestion.page_geometry SET artifact_id=$1 WHERE scan_receipt_id=$2',
+            [randomUUID(), source.inspected.id],
+          ),
+        ).rejects.toMatchObject({ code: '42501' });
+        await inspector.revoke(source.reserved.identity.artifactId);
+        expect(
+          await reader.recheckApproval(source.manifest.source, source.manifest.stateToken),
+        ).toBe(false);
+      });
+      it('leaves malformed or incomplete geometry quarantined instead of fabricating page sizes', async () => {
+        const source = await staged(),
+          claim = (await inspector.claimNext())!;
+        for (const pages of [
+          [],
+          [{ index: 1, width: 612, height: 792 }],
+          [{ index: 0, width: Infinity, height: 792 }],
+          [{ index: 0, width: 0, height: 792 }],
+        ])
+          await expect(
+            inspector.complete(claim, { ...goodReport(), pageGeometry: pages }),
+          ).rejects.toMatchObject({ code: 'invalid_geometry' });
+        expect((await runtime.get(p, source.reserved.identity.artifactId))?.status).toBe(
+          'quarantined',
+        );
+        expect(await runtime.readyForTeacher(p, source.input)).toBeNull();
+      });
     });
   },
 );

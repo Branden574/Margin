@@ -8,6 +8,7 @@ import { Pool, type PoolConfig } from 'pg';
 import { LocalKeyProvider, type KeyManagementProvider } from '../apps/api/src/encryption';
 import type { SessionPrincipal, IdentityRole } from '../apps/api/src/identity/types';
 import { withTableOwnerMembership } from './helpers/owner-role';
+import { withAssignmentProvisionerMembership } from './helpers/provisioner-role';
 import { stopDisposablePostgres } from './helpers/postgres';
 import {
   PostgresSyncProvisioner,
@@ -536,6 +537,31 @@ describe.skipIf(!available)('durable encrypted PostgreSQL document sync', () => 
       await privileged.close();
     }
   });
+  it.each([true, false])(
+    'rejects assignment-provisioner membership with inheritance=%s',
+    async (inherit) => {
+      const doc = await document();
+      await withAssignmentProvisionerMembership(
+        admin,
+        config,
+        'margin_sync_runtime',
+        inherit,
+        async (database) => {
+          const unsafe = new PostgresSyncService({ database, keyManagementProvider: keys });
+          try {
+            await expect(unsafe.describeDocument(owner, doc.documentId)).rejects.toThrow(
+              'dedicated',
+            );
+          } finally {
+            await unsafe.close();
+          }
+        },
+      );
+      expect((await service.describeDocument(owner, doc.documentId)).documentId).toBe(
+        doc.documentId,
+      );
+    },
+  );
   it.each([true, false])('rejects table-owner membership with inheritance=%s', async (inherit) => {
     const doc = await document();
     await withTableOwnerMembership(

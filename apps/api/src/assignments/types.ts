@@ -76,7 +76,7 @@ export interface StudentWorkReservation {
   userId: string;
   documentId: string;
   versionId: string;
-  status: 'pending';
+  status: 'pending' | 'provisioned';
   duplicate: boolean;
 }
 export interface DeepLinkSelection {

@@ -1,5 +1,39 @@
 import type { ArtifactReceipt } from '../cloud/types.js';
-import { IngestionError, type SourceReservationInput, type InspectionReport } from './types.js';
+import {
+  IngestionError,
+  type SourceReservationInput,
+  type InspectionReport,
+  type SourcePageGeometry,
+} from './types.js';
+export const GEOMETRY_MAX_BYTES = 262144;
+export function geometry(value: SourcePageGeometry[], count: number): SourcePageGeometry[] {
+  if (!Array.isArray(value) || value.length !== count || count < 1 || count > 2000)
+    throw new IngestionError(
+      400,
+      'invalid_geometry',
+      'Complete bounded inspected page geometry is required.',
+    );
+  const pages = Array.from(value, (page, index) => {
+    if (
+      !page ||
+      page.index !== index ||
+      ![page.width, page.height].every((n) => Number.isFinite(n) && n > 0 && n <= 100000)
+    )
+      throw new IngestionError(
+        400,
+        'invalid_geometry',
+        'Invalid inspected page dimensions or order.',
+      );
+    return { index, width: page.width, height: page.height };
+  });
+  if (Buffer.byteLength(JSON.stringify(pages)) > GEOMETRY_MAX_BYTES - 8192)
+    throw new IngestionError(
+      413,
+      'geometry_limit',
+      'Inspected geometry exceeds its encrypted metadata limit.',
+    );
+  return pages;
+}
 export const id = (v: unknown): string => {
   if (typeof v !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(v))
     throw new IngestionError(400, 'invalid_ingestion', 'A canonical identifier is required.');
@@ -90,5 +124,8 @@ export function report(v: InspectionReport): InspectionReport {
     definitionsVersion: identifiers[2],
     pageCount: v.pageCount,
     reason: v.reason,
+    ...(v.pageGeometry !== undefined
+      ? { pageGeometry: geometry(v.pageGeometry, v.pageCount) }
+      : {}),
   };
 }

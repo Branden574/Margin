@@ -21,6 +21,7 @@ import { createIdentityHandler } from '../apps/api/src/identity/http';
 import { PostgresIdentityRepository } from '../apps/api/src/identity/postgres';
 import { createApi } from '../apps/api/src/server';
 import { withTableOwnerMembership } from './helpers/owner-role';
+import { withAssignmentProvisionerMembership } from './helpers/provisioner-role';
 import { stopDisposablePostgres } from './helpers/postgres';
 
 const available = ['initdb', 'pg_ctl', 'psql'].every((tool) => {
@@ -702,6 +703,26 @@ describe.skipIf(!available)(
         await forbidden.close();
       }
     });
+    it.each([true, false])(
+      'rejects assignment-provisioner membership with inheritance=%s',
+      async (inherit) => {
+        await withAssignmentProvisionerMembership(
+          admin,
+          { host: socket, port: 55491, database: 'postgres' },
+          'margin_lms_runtime',
+          inherit,
+          async (config) => {
+            const unsafe = new PostgresLmsRepository(config, lookupKey);
+            try {
+              await expect(unsafe.findById(installA)).rejects.toThrow('must not');
+            } finally {
+              await unsafe.close();
+            }
+          },
+        );
+        expect((await repository.findById(installA))?.id).toBe(installA);
+      },
+    );
     it.each([true, false])(
       'rejects table-owner membership with inheritance=%s',
       async (inherit) => {

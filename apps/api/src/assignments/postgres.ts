@@ -116,7 +116,7 @@ export class PostgresAssignmentRepository implements AssignmentRepository {
       await client.query("SET LOCAL lock_timeout='2s'");
       await client.query("SET LOCAL idle_in_transaction_session_timeout='5s'");
       const privileges = await client.query<{ unsafe: boolean }>(
-        "SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,'margin_assignments_runtime','MEMBER') OR pg_has_role(current_user,'margin_identity_runtime','MEMBER') OR pg_has_role(current_user,'margin_identity_provisioner','MEMBER') OR pg_has_role(current_user,'margin_sync_provisioner','MEMBER') OR pg_has_role(current_user,'margin_lms_provisioner','MEMBER') OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_assignments','margin_lms','margin_identity','margin_sync') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user",
+        "SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,'margin_assignments_runtime','MEMBER') OR pg_has_role(current_user,'margin_identity_runtime','MEMBER') OR pg_has_role(current_user,'margin_identity_provisioner','MEMBER') OR pg_has_role(current_user,'margin_sync_provisioner','MEMBER') OR pg_has_role(current_user,'margin_lms_provisioner','MEMBER') OR EXISTS(SELECT 1 FROM pg_roles rp WHERE rp.rolname='margin_assignment_provisioner' AND pg_has_role(current_user,rp.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_assignments','margin_lms','margin_identity','margin_sync','margin_ingestion','margin_work') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user",
       );
       if (!privileges.rows[0] || privileges.rows[0].unsafe)
         throw new Error(
@@ -593,7 +593,7 @@ export class PostgresAssignmentRepository implements AssignmentRepository {
           userId: existing.user_id,
           documentId: existing.document_id,
           versionId: existing.version_id,
-          status: 'pending',
+          status: existing.status,
           duplicate: true,
         };
       const id = randomUUID(),

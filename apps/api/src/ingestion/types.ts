@@ -36,7 +36,15 @@ export interface InspectionReport {
   engineVersion: string;
   definitionsVersion: string;
   pageCount: number;
+  /** Optional only for legacy approvals. Provisioning requires authenticated geometry for every page. */
+  pageGeometry?: SourcePageGeometry[];
   reason: 'clean' | 'malware' | 'unsupported' | 'content_mismatch' | 'invalid_document';
+}
+export interface SourcePageGeometry {
+  index: number;
+  /** Effective PDF viewport dimensions at scale 1, including intrinsic rotation and user units. */
+  width: number;
+  height: number;
 }
 export interface InspectionReceipt {
   id: string;
@@ -59,7 +67,13 @@ export interface SourceScanner {
   ): Promise<
     Pick<
       InspectionReport,
-      'verdict' | 'engine' | 'engineVersion' | 'definitionsVersion' | 'pageCount' | 'reason'
+      | 'verdict'
+      | 'engine'
+      | 'engineVersion'
+      | 'definitionsVersion'
+      | 'pageCount'
+      | 'pageGeometry'
+      | 'reason'
     >
   >;
 }
