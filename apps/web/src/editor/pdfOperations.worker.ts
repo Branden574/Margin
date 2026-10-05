@@ -11,7 +11,9 @@ import type { PageAction } from './model';
 import { addOcrTextLayer } from './ocrPdfExport';
 import ocrFontUrl from '../assets/fonts/NotoSans-Regular.ttf?url';
 import type { Annotation, OcrPageRecord } from '@margin/core';
-type Request =
+import { inspectPageCrop, applyPageCrop } from './crop';
+import type { CropRequest } from './cropTypes';
+export type PdfOperationRequest =
   | { operation: 'transform'; blob: Blob; action: PageAction; index: number }
   | {
       operation: 'export';
@@ -24,10 +26,20 @@ type Request =
     }
   | { operation: 'merge'; blob: Blob; incoming: Blob }
   | { operation: 'inspect-form'; blob: Blob }
-  | { operation: 'apply-form'; blob: Blob; changes: PdfFormChange[] };
-self.onmessage = async (event: MessageEvent<Request>) => {
+  | { operation: 'apply-form'; blob: Blob; changes: PdfFormChange[] }
+  | { operation: 'inspect-crop'; blob: Blob; index: number }
+  | { operation: 'apply-crop'; blob: Blob; index: number; request: CropRequest };
+self.onmessage = async (event: MessageEvent<PdfOperationRequest>) => {
   try {
     const data = event.data;
+    if (data.operation === 'inspect-crop') {
+      self.postMessage({ crop: await inspectPageCrop(data.blob, data.index) });
+      return;
+    }
+    if (data.operation === 'apply-crop') {
+      self.postMessage({ crop: await applyPageCrop(data.blob, data.index, data.request) });
+      return;
+    }
     if (data.operation === 'transform') {
       self.postMessage({ blob: await transformPage(data.blob, data.action, data.index) });
       return;

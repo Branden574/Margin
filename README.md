@@ -59,7 +59,7 @@ Signed Canvas launches require explicitly provisioned installation, identity, co
 | Library         | Search, recent files, folders, starred documents, list/grid, sorting, copy, rename, move, Trash/restore and permanent deletion                                         |
 | Reader          | Worker-rendered PDF, bounded thumbnails, zoom/navigation/search, local-voice playback controls, focus/ruler/tints and reflowed text; [reading limits](docs/READING.md) |
 | Annotations     | Pen, highlight, text, comments, shapes/arrows/stamps, visual signatures, eraser, selection, bounded undo/redo and local autosave                                       |
-| PDF pages       | Rotate, duplicate, insert blank, move, delete, merge and extract; form PDFs allow rotation/insertion while other structural changes are guarded                        |
+| PDF pages       | Rotate, crop/reset, duplicate, insert blank, move, delete, merge and extract; supported form PDFs retain their fields during cropping; [crop limits](docs/CROP.md)     |
 | PDF forms       | Fill supported existing text/checkbox/radio/choice fields with validation, grouped undo/redo and encrypted local saving; [limits](docs/FORMS.md)                       |
 | Exports         | Annotated PDF and complete comment appendix inside an authenticated encrypted `.margin` package; encrypted original and metadata-index exports                         |
 | Local classroom | Assignment drafts, instructions, class/due date, student submission state and teacher feedback/return                                                                  |

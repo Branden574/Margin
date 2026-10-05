@@ -616,12 +616,22 @@ export async function replaceDocumentWithAnnotations(
   blob: Blob,
   pageCount: number,
   annotations: Annotation[],
+  expectedContentRevision?: string,
+  signal?: AbortSignal,
 ): Promise<DocumentRecord> {
   return commit(
     async (tx) => {
       const previous = await tx.get<DocumentRecord>('documents', documentId);
       if (!previous)
         throw new Error('This document no longer exists. The page changes were not saved.');
+      if (
+        expectedContentRevision !== undefined &&
+        (!revisionPattern.test(expectedContentRevision) ||
+          previous.contentRevision !== expectedContentRevision)
+      )
+        throw new Error(
+          'This PDF changed while preparing the page edit. Reopen it and try again. The page changes were not saved.',
+        );
       const operations = (await tx.list<AnnotationOperation>('annotations'))
         .map((row) => row.value)
         .filter((operation) => operation.documentId === documentId);
@@ -660,6 +670,7 @@ export async function replaceDocumentWithAnnotations(
       return record;
     },
     { entity: 'document', id: documentId },
+    { signal },
   );
 }
 export async function isWorkspaceSeeded(): Promise<boolean> {

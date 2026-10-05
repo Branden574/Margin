@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openDB } from 'idb';
-import type { AnnotationOperation, DocumentRecord, OcrPageRecord } from '@margin/core';
+import type { Annotation, AnnotationOperation, DocumentRecord, OcrPageRecord } from '@margin/core';
 import {
   createVault,
   listVaultRecords,
@@ -21,6 +21,7 @@ import {
   getDocumentForOcr,
   getPageOcr,
   getOcrForExport,
+  loadAnnotations,
   OCR_MAX_TEXT_CHARACTERS,
   OCR_MAX_WORDS,
   OCR_MAX_RECORD_BYTES,
@@ -131,6 +132,153 @@ afterEach(async () => {
 });
 
 describe('encrypted OCR bound to local PDF content revisions', () => {
+  const annotation: Annotation = {
+    id: 'crop-annotation',
+    pageIndex: 0,
+    type: 'pen',
+    x: 12,
+    y: 14,
+    points: [
+      { x: 12, y: 14 },
+      { x: 20, y: 22 },
+    ],
+    color: '#123456',
+    strokeWidth: 2,
+    opacity: 1,
+    createdAt: 1,
+    author: 'Synthetic',
+  };
+  async function addAnnotation(documentId: string, value: Annotation = annotation) {
+    await appendAnnotationOperation({
+      id: crypto.randomUUID(),
+      documentId,
+      timestamp: Date.now(),
+      kind: 'put',
+      annotationId: value.id,
+      annotation: value,
+    });
+  }
+  it('refuses stale page-byte replacement before changing annotations or encrypted OCR', async () => {
+    const value = await fixture();
+    await addAnnotation(value.record.id);
+    const original = await rawRecords();
+    await expect(
+      replaceDocumentWithAnnotations(
+        value.record.id,
+        new Blob(['stale crop']),
+        2,
+        [],
+        crypto.randomUUID(),
+      ),
+    ).rejects.toThrow('changed');
+    expect(await rawRecords()).toEqual(original);
+    expect(await (await getDocumentBlob(value.record.id))!.text()).toBe('old PDF');
+    expect(await loadAnnotations(value.record.id)).toEqual([annotation]);
+    expect(await getPageOcr(value.record.id, value.record.contentRevision, 0)).toEqual(value.ocr);
+  });
+  it('commits matching revision with negative annotation positions and invalidates old OCR atomically', async () => {
+    const value = await fixture();
+    await addAnnotation(value.record.id);
+    const shifted = {
+      ...annotation,
+      x: -18,
+      y: -26,
+      points: [
+        { x: -18, y: -26 },
+        { x: -10, y: -18 },
+      ],
+    };
+    const saved = await replaceDocumentWithAnnotations(
+      value.record.id,
+      new Blob(['cropped PDF']),
+      2,
+      [shifted],
+      value.record.contentRevision,
+    );
+    expect(saved.contentRevision).not.toBe(value.record.contentRevision);
+    expect(await (await getDocumentBlob(value.record.id))!.text()).toBe('cropped PDF');
+    expect(await loadAnnotations(value.record.id)).toEqual([shifted]);
+    expect(await getPageOcr(value.record.id, value.record.contentRevision, 0)).toBeUndefined();
+    expect(await listVaultRecords('ocr')).toEqual([]);
+  });
+  it('rechecks a crop revision inside transaction retry after another tab commits newer bytes', async () => {
+    const value = await fixture();
+    await addAnnotation(value.record.id);
+    const oldRows = await rawRecords();
+    await putDocumentBlob(value.record.id, new Blob(['other tab PDF']));
+    const fresh = (await getDocument(value.record.id))!;
+    const newerOcr = ocr(fresh.contentRevision!, fresh.id);
+    await savePageOcr(newerOcr);
+    const newerAnnotation = { ...annotation, x: 66 };
+    await addAnnotation(fresh.id, newerAnnotation);
+    const newRows = await rawRecords();
+    await externalCommit(oldRows);
+    const gate = pauseEncryption();
+    const pending = replaceDocumentWithAnnotations(
+      value.record.id,
+      new Blob(['late crop']),
+      2,
+      [],
+      value.record.contentRevision,
+    );
+    const rejected = expect(pending).rejects.toThrow('changed');
+    await gate.entered;
+    try {
+      await externalCommit(newRows);
+    } finally {
+      gate.release();
+    }
+    await rejected;
+    gate.spy.mockRestore();
+    expect((await getDocument(value.record.id))!.contentRevision).toBe(fresh.contentRevision);
+    expect(await (await getDocumentBlob(value.record.id))!.text()).toBe('other tab PDF');
+    expect(await loadAnnotations(value.record.id)).toEqual([newerAnnotation]);
+    expect(await getPageOcr(value.record.id, fresh.contentRevision!, 0)).toEqual(newerOcr);
+    expect(await rawRecords()).toEqual(newRows);
+  });
+  it.each(['before', 'encryption', 'commit'] as const)(
+    'cancels page replacement %s without changing bytes, annotations or OCR',
+    async (stage) => {
+      const value = await fixture();
+      await addAnnotation(value.record.id);
+      const original = await rawRecords(),
+        controller = new AbortController();
+      const gate = stage === 'encryption' ? pauseEncryption() : undefined;
+      if (stage === 'before') controller.abort();
+      if (stage === 'commit') {
+        const put = IDBObjectStore.prototype.put;
+        vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+          this: IDBObjectStore,
+          row,
+          key,
+        ) {
+          const request = key === undefined ? put.call(this, row) : put.call(this, row, key);
+          if (this.name === 'records' && row.store === 'blobs') controller.abort();
+          return request;
+        });
+      }
+      const pending = replaceDocumentWithAnnotations(
+        value.record.id,
+        new Blob(['cancelled crop']),
+        2,
+        [],
+        value.record.contentRevision,
+        controller.signal,
+      );
+      const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+      if (gate) {
+        await gate.entered;
+        controller.abort();
+        gate.release();
+      }
+      await rejected;
+      vi.restoreAllMocks();
+      expect(await rawRecords()).toEqual(original);
+      expect(await (await getDocumentBlob(value.record.id))!.text()).toBe('old PDF');
+      expect(await loadAnnotations(value.record.id)).toEqual([annotation]);
+      expect(await getPageOcr(value.record.id, value.record.contentRevision, 0)).toEqual(value.ocr);
+    },
+  );
   it('round-trips exact text/UTF-16 offsets and encrypts text, geometry, index and identity', async () => {
     const value = await fixture();
     expect(await getPageOcr(value.record.id, value.record.contentRevision, 0)).toEqual(value.ocr);

@@ -4,7 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import { stopDisposablePostgres } from './helpers/postgres';
 import { withTableOwnerMembership } from './helpers/owner-role';
 import { withAssignmentProvisionerMembership } from './helpers/provisioner-role';
@@ -55,6 +55,20 @@ const storage: ArtifactReader = {
     return { bytes: Buffer.from(body), metadata };
   },
 };
+/** Only static fixture seeds share a commit; runtime operations retain their real transactions. */
+async function seedTransaction(run: (client: PoolClient) => Promise<void>) {
+  const client = await admin.connect();
+  try {
+    await client.query('BEGIN');
+    await run(client);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 async function fixture(geometry = true) {
   const org = randomUUID(),
     teacher = randomUUID(),
@@ -64,73 +78,60 @@ async function fixture(geometry = true) {
     course = randomUUID(),
     documentId = randomUUID(),
     versionId = randomUUID();
-  await admin.query('INSERT INTO margin_identity.organizations(id) VALUES($1)', [org]);
-  await admin.query(
-    "INSERT INTO margin_lms.installations(id,organization_id,issuer,client_id,deployment_id,version,enabled,configuration) VALUES($1,$2,'https://synthetic.canvas.test',$3,$3,1,true,'{}')",
-    [installation, org, randomUUID()],
-  );
-  await admin.query(
-    'INSERT INTO margin_lms.courses(installation_id,organization_id,external_digest,course_id) VALUES($1,$2,$3,$4)',
-    [installation, org, hash(course), course],
-  );
   const principals: SessionPrincipal[] = [];
-  for (const [user, role] of [
-    [teacher, 'teacher'],
-    [student, 'student'],
-    [peer, 'student'],
-  ] as const) {
-    await admin.query('INSERT INTO margin_identity.users(id,identity_key) VALUES($1,$2)', [
-      user,
-      hash(user),
-    ]);
-    await admin.query(
-      'INSERT INTO margin_identity.memberships(organization_id,user_id,role) VALUES($1,$2,$3)',
-      [org, user, role],
+  await seedTransaction(async (c) => {
+    await c.query('INSERT INTO margin_identity.organizations(id) VALUES($1)', [org]);
+    await c.query(
+      "INSERT INTO margin_lms.installations(id,organization_id,issuer,client_id,deployment_id,version,enabled,configuration) VALUES($1,$2,'https://synthetic.canvas.test',$3,$3,1,true,'{}')",
+      [installation, org, randomUUID()],
     );
-    await admin.query(
-      'INSERT INTO margin_lms.user_links(installation_id,organization_id,subject_digest,user_id) VALUES($1,$2,$3,$4)',
-      [installation, org, hash(user), user],
+    await c.query(
+      'INSERT INTO margin_lms.courses(installation_id,organization_id,external_digest,course_id) VALUES($1,$2,$3,$4)',
+      [installation, org, hash(course), course],
     );
-    await admin.query(
-      'INSERT INTO margin_lms.enrollments(installation_id,organization_id,course_id,user_id,role) VALUES($1,$2,$3,$4,$5)',
-      [installation, org, course, user, role],
-    );
-    const now = Date.now(),
-      p: SessionPrincipal = {
-        sessionId: randomUUID(),
-        organizationId: org,
-        userId: user,
-        role,
-        authenticationMethod: 'lti',
-        mfa: false,
-        createdAt: now,
-        lastSeenAt: now,
-        expiresAt: now + 3600000,
-      };
-    await admin.query(
-      "INSERT INTO margin_identity.sessions(id,session_hash,user_id,organization_id,mfa,authentication_method,created_at,expires_at,idle_expires_at,last_seen_at) VALUES($1,$2,$3,$4,false,'lti',$5,$6,$6,$5)",
-      [p.sessionId, hash(randomUUID()), user, org, new Date(now), new Date(p.expiresAt)],
-    );
-    await admin.query(
-      'INSERT INTO margin_lms.session_bindings(session_id,installation_id,registration_version,organization_id,user_id,course_id,subject_digest,course_digest,role) VALUES($1,$2,1,$3,$4,$5,$6,$7,$8)',
-      [p.sessionId, installation, org, user, course, hash(user), hash(course), role],
-    );
-    principals.push(p);
-  }
-  const [teacherP, studentP, peerP] = principals;
-  const enrollment = (p: SessionPrincipal): VerifiedLmsEnrollment => ({
-    installationId: installation,
-    registrationVersion: 1,
-    organizationId: org,
-    userId: p.userId,
-    courseId: course,
-    role: p.role as 'teacher' | 'student',
-    subjectDigest: hash(p.userId),
-    courseDigest: hash(course),
-  });
-  const c = await admin.connect();
-  try {
-    await c.query('BEGIN');
+    for (const [user, role] of [
+      [teacher, 'teacher'],
+      [student, 'student'],
+      [peer, 'student'],
+    ] as const) {
+      await c.query('INSERT INTO margin_identity.users(id,identity_key) VALUES($1,$2)', [
+        user,
+        hash(user),
+      ]);
+      await c.query(
+        'INSERT INTO margin_identity.memberships(organization_id,user_id,role) VALUES($1,$2,$3)',
+        [org, user, role],
+      );
+      await c.query(
+        'INSERT INTO margin_lms.user_links(installation_id,organization_id,subject_digest,user_id) VALUES($1,$2,$3,$4)',
+        [installation, org, hash(user), user],
+      );
+      await c.query(
+        'INSERT INTO margin_lms.enrollments(installation_id,organization_id,course_id,user_id,role) VALUES($1,$2,$3,$4,$5)',
+        [installation, org, course, user, role],
+      );
+      const now = Date.now(),
+        p: SessionPrincipal = {
+          sessionId: randomUUID(),
+          organizationId: org,
+          userId: user,
+          role,
+          authenticationMethod: 'lti',
+          mfa: false,
+          createdAt: now,
+          lastSeenAt: now,
+          expiresAt: now + 3600000,
+        };
+      await c.query(
+        "INSERT INTO margin_identity.sessions(id,session_hash,user_id,organization_id,mfa,authentication_method,created_at,expires_at,idle_expires_at,last_seen_at) VALUES($1,$2,$3,$4,false,'lti',$5,$6,$6,$5)",
+        [p.sessionId, hash(randomUUID()), user, org, new Date(now), new Date(p.expiresAt)],
+      );
+      await c.query(
+        'INSERT INTO margin_lms.session_bindings(session_id,installation_id,registration_version,organization_id,user_id,course_id,subject_digest,course_digest,role) VALUES($1,$2,1,$3,$4,$5,$6,$7,$8)',
+        [p.sessionId, installation, org, user, course, hash(user), hash(course), role],
+      );
+      principals.push(p);
+    }
     await c.query(
       "INSERT INTO margin_sync.documents(organization_id,id,owner_id,current_version_id,audience) VALUES($1,$2,$3,$4,'teachers')",
       [org, documentId, teacher, versionId],
@@ -143,10 +144,18 @@ async function fixture(geometry = true) {
       "INSERT INTO margin_sync.grants(organization_id,document_id,user_id,permission) VALUES($1,$2,$3,'owner')",
       [org, documentId, teacher],
     );
-    await c.query('COMMIT');
-  } finally {
-    c.release();
-  }
+  });
+  const [teacherP, studentP, peerP] = principals;
+  const enrollment = (p: SessionPrincipal): VerifiedLmsEnrollment => ({
+    installationId: installation,
+    registrationVersion: 1,
+    organizationId: org,
+    userId: p.userId,
+    courseId: course,
+    role: p.role as 'teacher' | 'student',
+    subjectDigest: hash(p.userId),
+    courseDigest: hash(course),
+  });
   const source = await runtime.reserve(teacherP, {
     requestId: randomUUID(),
     documentId,
@@ -203,19 +212,21 @@ async function fixture(geometry = true) {
     },
     manifest.source,
   );
-  await admin.query(
-    'UPDATE margin_assignments.assignments SET selected_at=clock_timestamp() WHERE id=$1',
-    [assignment.id],
-  );
-  await admin.query(
-    'INSERT INTO margin_assignments.resource_links(installation_id,resource_digest,organization_id,course_id,assignment_id) VALUES($1,$2,$3,$4,$5)',
-    [installation, hash(assignment.id), org, course, assignment.id],
-  );
-  for (const p of [studentP, peerP])
-    await admin.query(
-      'INSERT INTO margin_assignments.launch_bindings(session_id,installation_id,resource_digest,assignment_id,user_id) VALUES($1,$2,$3,$4,$5)',
-      [p.sessionId, installation, hash(assignment.id), assignment.id, p.userId],
+  await seedTransaction(async (c) => {
+    await c.query(
+      'UPDATE margin_assignments.assignments SET selected_at=clock_timestamp() WHERE id=$1',
+      [assignment.id],
     );
+    await c.query(
+      'INSERT INTO margin_assignments.resource_links(installation_id,resource_digest,organization_id,course_id,assignment_id) VALUES($1,$2,$3,$4,$5)',
+      [installation, hash(assignment.id), org, course, assignment.id],
+    );
+    for (const p of [studentP, peerP])
+      await c.query(
+        'INSERT INTO margin_assignments.launch_bindings(session_id,installation_id,resource_digest,assignment_id,user_id) VALUES($1,$2,$3,$4,$5)',
+        [p.sessionId, installation, hash(assignment.id), assignment.id, p.userId],
+      );
+  });
   const reservation = await assignments.reserveStudentWork(studentP, enrollment(studentP));
   return {
     org,
@@ -340,6 +351,7 @@ describe.skipIf(!available)(
       );
     });
     afterAll(async () => {
+      const errors: unknown[] = [];
       const settled = await Promise.allSettled([
         admin?.end(),
         sqlRuntime?.end(),
@@ -351,13 +363,23 @@ describe.skipIf(!available)(
         assignments?.close(),
         worker?.close(),
       ]);
+      for (const result of settled) if (result.status === 'rejected') errors.push(result.reason);
+      let stopped = !started;
       try {
         if (started) await stopDisposablePostgres(join(dir, 'data'));
-        const failed = settled.find((r) => r.status === 'rejected');
-        if (failed?.status === 'rejected') throw failed.reason;
-      } finally {
-        if (dir) rmSync(dir, { recursive: true, force: true });
+        stopped = true;
+      } catch (error) {
+        errors.push(error);
       }
+      // Keep diagnostics/data if shutdown is unconfirmed; never delete a running fixture.
+      if (stopped && dir) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length) throw new AggregateError(errors, 'PostgreSQL fixture cleanup failed.');
     });
     it('pins verified launch provenance; atomically provisions independent pages/key/owner grant and encrypted shared-source receipt', async () => {
       const f = await fixture();

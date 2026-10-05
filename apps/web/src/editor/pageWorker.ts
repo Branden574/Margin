@@ -1,4 +1,6 @@
 import type { PdfFormChange, PdfFormInspection } from './formTypes';
+import type { CropPageInfo, CropRequest, CropResult } from './cropTypes';
+import type { PdfOperationRequest } from './pdfOperations.worker';
 import type { PageAction } from './model';
 import { removeNativeOcrOverlap } from './ocrExportNative';
 import { PermissionFlag } from 'pdfjs-dist';
@@ -7,8 +9,8 @@ import type { PDFDocumentProxy } from 'pdfjs-dist';
 import type { ExportPageView } from './pdf';
 /** A short-lived worker keeps parsing, edits and PDF encoding off the UI thread. */
 function runWorker<T>(
-  message: unknown,
-  property: 'blob' | 'form' = 'blob',
+  message: PdfOperationRequest,
+  property: 'blob' | 'form' | 'crop' = 'blob',
   signal?: AbortSignal,
 ): Promise<T> {
   if (signal?.aborted) return Promise.reject(signal.reason);
@@ -16,42 +18,88 @@ function runWorker<T>(
     const worker = new Worker(new URL('./pdfOperations.worker.ts', import.meta.url), {
       type: 'module',
     });
+    let settled = false;
     const finish = () => {
+      if (settled) return false;
+      settled = true;
       clearTimeout(timeout);
       signal?.removeEventListener('abort', abort);
+      worker.onmessage = null;
+      worker.onerror = null;
+      worker.onmessageerror = null;
       worker.terminate();
+      return true;
     };
     const abort = () => {
-      finish();
-      reject(signal?.reason ?? new DOMException('Export cancelled.', 'AbortError'));
+      if (!finish()) return;
+      reject(signal?.reason ?? new DOMException('Document operation cancelled.', 'AbortError'));
     };
     signal?.addEventListener('abort', abort, { once: true });
     const timeout = setTimeout(() => {
-      finish();
+      if (!finish()) return;
       reject(
         new Error('The document operation exceeded 60 seconds. Your original PDF is unchanged.'),
       );
     }, 60_000);
     worker.onmessage = (
-      event: MessageEvent<{ blob?: Blob; form?: PdfFormInspection; error?: string }>,
+      event: MessageEvent<{
+        blob?: Blob;
+        form?: PdfFormInspection;
+        crop?: CropPageInfo | CropResult;
+        error?: string;
+      }>,
     ) => {
-      finish();
-      if (event.data[property]) resolve(event.data as T);
-      else reject(new Error(event.data.error ?? 'The document worker did not return a result.'));
+      if (!finish()) return;
+      if (event.data?.[property]) resolve(event.data as T);
+      else reject(new Error(event.data?.error ?? 'The document worker did not return a result.'));
     };
     worker.onerror = (event) => {
-      finish();
+      if (!finish()) return;
       reject(
         new Error(event.message || 'The document worker stopped. Your original file is unchanged.'),
+      );
+    };
+    worker.onmessageerror = () => {
+      if (!finish()) return;
+      reject(
+        new Error(
+          'The document worker returned an unreadable response. Your original PDF is unchanged.',
+        ),
       );
     };
     try {
       worker.postMessage(message);
     } catch (error) {
-      finish();
-      reject(error);
+      if (finish()) reject(error);
     }
   });
+}
+export async function inspectPageCropInWorker(
+  blob: Blob,
+  index: number,
+  signal?: AbortSignal,
+): Promise<CropPageInfo> {
+  return (
+    await runWorker<{ crop: CropPageInfo }>(
+      { operation: 'inspect-crop', blob, index },
+      'crop',
+      signal,
+    )
+  ).crop;
+}
+export async function applyPageCropInWorker(
+  blob: Blob,
+  index: number,
+  request: CropRequest,
+  signal?: AbortSignal,
+): Promise<CropResult> {
+  return (
+    await runWorker<{ crop: CropResult }>(
+      { operation: 'apply-crop', blob, index, request },
+      'crop',
+      signal,
+    )
+  ).crop;
 }
 export async function inspectPdfFormInWorker(blob: Blob): Promise<PdfFormInspection> {
   return (await runWorker<{ form: PdfFormInspection }>({ operation: 'inspect-form', blob }, 'form'))

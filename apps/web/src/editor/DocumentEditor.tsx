@@ -19,6 +19,7 @@ import {
   Circle,
   Command,
   Copy,
+  Crop,
   Download,
   Eraser,
   FilePlus2,
@@ -57,6 +58,9 @@ import { usePdf } from './usePdf';
 import { PdfCanvas } from './PdfCanvas';
 import { AnnotationGraphic } from './AnnotationLayer';
 import { FormsDialog } from './FormsDialog';
+import { CropDialog } from './CropDialog';
+import type { CropPageInfo, CropRequest } from './cropTypes';
+import { PermissionFlag } from 'pdfjs-dist';
 import { ReadingPanel, ReadingPageOverlay, defaultReadingAppearance } from './ReadingPanel';
 import { usePageText } from './usePageText';
 import { resolvePageText } from './resolvedPageText';
@@ -82,6 +86,8 @@ import {
   mergePdfInWorker,
   inspectPdfFormInWorker,
   applyPdfFormInWorker,
+  inspectPageCropInWorker,
+  applyPageCropInWorker,
 } from './pageWorker';
 import { useDocumentLock } from './useDocumentLock';
 import { createVaultGuard, encryptExport, onBeforeVaultLock, onVaultLock } from '../lib/vault';
@@ -163,6 +169,16 @@ export default function DocumentEditor({
   const [formInspection, setFormInspection] = useState<PdfFormInspection | null>(null),
     [formDirty, setFormDirty] = useState(false),
     [formError, setFormError] = useState('');
+  const [cropInspection, setCropInspection] = useState<{
+      info: CropPageInfo;
+      revision: string;
+    } | null>(null),
+    [cropDirty, setCropDirty] = useState(false),
+    [cropError, setCropError] = useState('');
+  const cropAbort = useRef<AbortController | null>(null);
+  const cropOpener = useRef<HTMLButtonElement>(null);
+  const cropWasOpen = useRef(false);
+  useEffect(() => () => cropAbort.current?.abort(), []);
   const [sidebar, setSidebar] = useState(true),
     [panel, setPanel] = useState<'comments' | 'search' | 'text' | null>(null),
     [pageMenu, setPageMenu] = useState(false),
@@ -211,8 +227,8 @@ export default function DocumentEditor({
     commandDialog = useRef<HTMLDialogElement>(null),
     mergeInput = useRef<HTMLInputElement>(null);
   const transition = useRef<Promise<void> | null>(null),
-    transitionState = useRef({ busy, editing, signatureOpen, formDirty });
-  transitionState.current = { busy, editing, signatureOpen, formDirty };
+    transitionState = useRef({ busy, editing, signatureOpen, formDirty, cropDirty });
+  transitionState.current = { busy, editing, signatureOpen, formDirty, cropDirty };
   const currentPageAnnotations = annotations.filter((a) => a.pageIndex === pageIndex);
   const pageCount = pdf?.numPages ?? record.pageCount;
   const ready =
@@ -228,6 +244,13 @@ export default function DocumentEditor({
   );
   const editorIdentity = useRef({ pdf, pageIndex, contentRevision, ready, ocrRecord: ocr.record });
   editorIdentity.current = { pdf, pageIndex, contentRevision, ready, ocrRecord: ocr.record };
+  useEffect(() => {
+    if (cropInspection) cropWasOpen.current = true;
+    else if (cropWasOpen.current && ready) {
+      cropWasOpen.current = false;
+      cropOpener.current?.focus();
+    }
+  }, [cropInspection, ready]);
   useEffect(() => {
     setSelectingOcr(false);
     setOcrSelection(null);
@@ -271,8 +294,12 @@ export default function DocumentEditor({
     const state = transitionState.current;
     const refusal = state.busy
       ? 'Wait for the current PDF operation to finish before leaving or locking.'
-      : draft.current || state.editing?.text.trim() || state.signatureOpen || state.formDirty
-        ? 'Save or cancel the pending annotation or form changes before leaving or locking.'
+      : draft.current ||
+          state.editing?.text.trim() ||
+          state.signatureOpen ||
+          state.formDirty ||
+          state.cropDirty
+        ? 'Save or cancel the pending annotation, form, or crop changes before leaving or locking.'
         : '';
     if (refusal) {
       setError(refusal);
@@ -295,7 +322,14 @@ export default function DocumentEditor({
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
       const state = transitionState.current;
-      if (state.signatureOpen || state.formDirty || state.editing?.text.trim() || draft.current) {
+      if (
+        state.busy ||
+        state.signatureOpen ||
+        state.formDirty ||
+        state.cropDirty ||
+        state.editing?.text.trim() ||
+        draft.current
+      ) {
         event.preventDefault();
         event.returnValue = '';
       }
@@ -754,6 +788,170 @@ export default function DocumentEditor({
       setBusy('');
     }
   }
+  async function cropOperation<T>(
+    run: (signal: AbortSignal, ensureCurrent: () => void) => Promise<T>,
+    awaitSaveOutcome = false,
+  ): Promise<T> {
+    const guard = createVaultGuard();
+    const controller = new AbortController();
+    cropAbort.current = controller;
+    const removeLockListener = onVaultLock(() => controller.abort());
+    const timeout = setTimeout(
+      () => controller.abort(new Error('The crop operation exceeded 90 seconds. Try again.')),
+      90_000,
+    );
+    const ensureCurrent = () => {
+      guard();
+      controller.signal.throwIfAborted();
+      if (
+        editorIdentity.current.pdf !== pdf ||
+        editorIdentity.current.pageIndex !== pageIndex ||
+        editorIdentity.current.contentRevision !== contentRevision
+      )
+        throw new Error(
+          'The document changed while cropping. Reopen the crop editor and try again.',
+        );
+    };
+    let rejectAbort!: (reason: unknown) => void;
+    const interrupted = new Promise<never>((_, reject) => {
+      rejectAbort = reject;
+    });
+    const abort = () => rejectAbort(controller.signal.reason);
+    controller.signal.addEventListener('abort', abort, { once: true });
+    const work = run(controller.signal, ensureCurrent);
+    try {
+      return await Promise.race([work, interrupted]);
+    } catch (reason) {
+      // Cancellation must not unlock editing while an atomic save is still settling.
+      if (awaitSaveOutcome) await work.catch(() => undefined);
+      throw reason;
+    } finally {
+      clearTimeout(timeout);
+      removeLockListener();
+      controller.signal.removeEventListener('abort', abort);
+      if (cropAbort.current === controller) cropAbort.current = null;
+    }
+  }
+  async function openCrop() {
+    if (!pdf || !ready || transition.current || cropAbort.current) return;
+    setPageMenu(false);
+    setBusy('Reading page dimensions');
+    setError('');
+    setCropError('');
+    try {
+      const info = await cropOperation(async (signal, ensureCurrent) => {
+        await flush();
+        ensureCurrent();
+        const permissions = await pdf.getPermissions();
+        ensureCurrent();
+        if (permissions !== null && !permissions.has(PermissionFlag.MODIFY_CONTENTS))
+          throw new Error('This PDF does not allow changing its page dimensions.');
+        const result = await inspectPageCropInWorker(workingBlob, pageIndex, signal);
+        ensureCurrent();
+        return result;
+      });
+      setCropInspection({ info, revision: contentRevision });
+    } catch (reason) {
+      setError(`Could not crop this page: ${errorMessage(reason)}`);
+    } finally {
+      setBusy('');
+    }
+  }
+  async function saveCrop(request: CropRequest) {
+    if (!ready || !cropInspection || transition.current || cropAbort.current) return;
+    setBusy('Saving page crop');
+    setCropError('');
+    let savingStarted = false;
+    let guard: (() => void) | undefined;
+    try {
+      guard = createVaultGuard();
+      await cropOperation(async (signal, ensureCurrent) => {
+        if (
+          cropInspection.revision !== contentRevision ||
+          cropInspection.info.pageIndex !== pageIndex
+        )
+          throw new Error('The document changed. Reopen the crop editor and try again.');
+        await flush();
+        ensureCurrent();
+        const result = await applyPageCropInWorker(workingBlob, pageIndex, request, signal);
+        ensureCurrent();
+        if (result.changed) {
+          const beforeAnnotations = current.current;
+          const nextAnnotations = beforeAnnotations.map((annotation) =>
+            annotation.pageIndex === pageIndex
+              ? movedAnnotation(annotation, result.annotationOffset.x, result.annotationOffset.y)
+              : annotation,
+          );
+          savingStarted = true;
+          const saved = await replaceDocumentWithAnnotations(
+            record.id,
+            result.blob,
+            pageCount,
+            nextAnnotations,
+            contentRevision,
+            signal,
+          );
+          ensureCurrent();
+          syncTimestamp(saved.updatedAt);
+          setContentRevision(saved.contentRevision!);
+          pushHistory(
+            { annotations: beforeAnnotations, blob: workingBlob, pageIndex, pageCount },
+            { annotations: nextAnnotations, blob: result.blob, pageIndex, pageCount },
+          );
+          replace(nextAnnotations, false);
+          setWorkingBlob(result.blob);
+          setSelected(null);
+          setCropInspection(null);
+          setCropDirty(false);
+          await onDocumentChange({ blob: result.blob, document: saved });
+        } else {
+          setCropInspection(null);
+          setCropDirty(false);
+        }
+        setNotice(
+          request.kind === 'reset'
+            ? 'Full page restored and saved.'
+            : 'Page crop saved on this device.',
+        );
+      }, true);
+    } catch (reason) {
+      if (!savingStarted) setCropError(errorMessage(reason));
+      else {
+        // An interruption at the commit boundary has an uncertain outcome. Read the
+        // durable state before allowing another edit; never replay stale crop history.
+        setLockInitialized(false);
+        setCropInspection(null);
+        setCropDirty(false);
+        setHistory([]);
+        setFuture([]);
+        setSelected(null);
+        try {
+          if (!guard) throw reason;
+          guard();
+          const fresh = await getDocumentForOcr(record.id);
+          guard();
+          if (!fresh) throw new Error('This document is no longer available.');
+          await reload();
+          guard();
+          syncTimestamp(fresh.record.updatedAt);
+          setContentRevision(fresh.record.contentRevision);
+          setWorkingBlob(fresh.blob);
+          await onDocumentChange({ blob: fresh.blob, document: fresh.record });
+          guard();
+          setLockInitialized(true);
+          setError(
+            `Crop saving was interrupted. The last saved version has been reopened; check its page dimensions before trying again. ${errorMessage(reason)}`,
+          );
+        } catch {
+          setError(
+            'Crop saving was interrupted and its saved state could not be checked. Return to the workspace and reopen this document before editing.',
+          );
+        }
+      }
+    } finally {
+      setBusy('');
+    }
+  }
   async function editPage(action: PageAction) {
     if (!pdf || !ready || transition.current) return;
     setPageMenu(false);
@@ -1045,6 +1243,7 @@ export default function DocumentEditor({
     { label: 'Export encrypted file', detail: '.margin', run: () => void exportPdf() },
     { label: 'Add a blank page', detail: 'Pages', run: () => void editPage('insert') },
     { label: 'Rotate current page', detail: 'Pages', run: () => void editPage('rotate') },
+    { label: 'Crop current page', detail: 'Pages', run: () => void openCrop() },
     { label: 'Find in document', detail: 'Search', run: () => setPanel('search') },
     { label: 'Read current page aloud', detail: 'Accessibility', run: readAloud },
     { label: 'Fit page to width', detail: 'View', run: fitPage },
@@ -1491,6 +1690,7 @@ export default function DocumentEditor({
             </span>
             <div className="editor-menu-wrap">
               <button
+                ref={cropOpener}
                 className="editor-page-options"
                 onClick={() => setPageMenu(!pageMenu)}
                 disabled={!ready}
@@ -1500,6 +1700,10 @@ export default function DocumentEditor({
               </button>
               {pageMenu ? (
                 <div className="editor-dropdown editor-page-dropdown">
+                  <button onClick={() => void openCrop()}>
+                    <Crop size={15} />
+                    Crop page
+                  </button>
                   <button onClick={() => void editPage('rotate')}>
                     <RotateCw size={15} />
                     Rotate clockwise
@@ -1933,6 +2137,23 @@ export default function DocumentEditor({
           {notice}
         </div>
       ) : null}
+      {cropInspection && pdf && (
+        <CropDialog
+          pdf={pdf}
+          info={cropInspection.info}
+          annotations={currentPageAnnotations}
+          busy={!!busy}
+          error={cropError}
+          onDirtyChange={setCropDirty}
+          onApply={saveCrop}
+          onClose={() => {
+            if (busy || cropAbort.current) return;
+            setCropInspection(null);
+            setCropDirty(false);
+            setCropError('');
+          }}
+        />
+      )}
       {formInspection && (
         <FormsDialog
           inspection={formInspection}
