@@ -133,3 +133,9 @@ The first attempt exposed a real asset-serving defect: Vite set HTTP `Content-En
 - Rotating the PDF removed saved OCR from the reading view. Undo restored PDF bytes/annotations but conservatively required recognition again. Re-recognized page 1 and left it available with saved highlights.
 
 Screenshot: `.local/manual-checks/ocr-recognized-highlight.png`. This establishes the tested local workflow; it does not establish OCR accuracy for handwriting, tables/equations, other languages, searchable-text PDF export, physical-device performance or hosted scale. Offline production-browser checks are tracked separately from this development-preview walkthrough.
+
+## Searchable export preparation — October 5, 2026
+
+Used the existing synthetic OCR document in the actual trusted in-app browser, with the export source held steady. **Export encrypted file** completed and displayed its prepared-download link while the saved recognized text and highlights remained visible. No application export error appeared. Both a download event wait and the visible link's supported download action timed out without a delivered file. Accordingly, neither file delivery nor reimport is counted as manually passed in this browser. The automated Chromium round trip is separate evidence.
+
+Screenshot: `.local/manual-checks/searchable-export-prepared.png`. The local HTTPS API health check also passed with normal certificate validation. Local code tests verify actual PDF.js text extraction, exact rendered-pixel preservation, Unicode and crop/rotation geometry, native-text overlap, permission denial, revision-bound collection and worker cancellation. These are code-level checks, not substitutes for the unresolved manual download.

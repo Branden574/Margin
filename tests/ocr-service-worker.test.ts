@@ -125,6 +125,41 @@ describe('on-demand OCR service worker cache', () => {
     expect(await storage.has(OCR_CACHE)).toBe(false);
     expect(sw.context.skipWaiting).toHaveBeenCalledOnce();
   });
+  it('precaches a hashed TTF discovered through a lazy worker without downloading the OCR pack', async () => {
+    const fontPath = '/assets/NotoSans-Regular-AbCd1234.ttf';
+    const font = Uint8Array.from([0, 1, 0, 0, 83, 89, 78, 84, 72]);
+    const responses = new Map<string, string | Uint8Array>([
+      ['/', '<script src="/assets/main-EfGh5678.js"></script>'],
+      [
+        '/assets/main-EfGh5678.js',
+        'new Worker(new URL("./pdfOperations-IjKl9012.js", import.meta.url))',
+      ],
+      [
+        '/assets/pdfOperations-IjKl9012.js',
+        'const font="./NotoSans-Regular-AbCd1234.ttf"; const fallback="./unbundled.ttf"',
+      ],
+      [fontPath, font],
+    ]);
+    const fetcher = vi.fn(async (url: string | Request) => {
+      const path = new URL(typeof url === 'string' ? url : url.url, OCR_TEST_ORIGIN).pathname;
+      const body = responses.get(path);
+      if (!body) throw new Error(`Unexpected public asset request: ${path}`);
+      return new Response(body);
+    });
+    const sw = serviceWorker(fetcher);
+    await sw.dispatch('install', {});
+    expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+      ...responses.keys(),
+    ]);
+    expect(await storage.has(OCR_CACHE)).toBe(false);
+    const offlineFetch = vi.fn(async () => {
+      throw new Error('Offline: no network');
+    });
+    const offline = serviceWorker(offlineFetch);
+    const cached = await offline.asset(fontPath);
+    expect(new Uint8Array(await cached!.arrayBuffer())).toEqual(font);
+    expect(offlineFetch).not.toHaveBeenCalled();
+  });
   it('prepares a complete verified pack, preserves worker CSP, and serves it across offline SW restarts', async () => {
     const sw = serviceWorker();
     const prepare = sw.message('MARGIN_OCR_PREPARE');

@@ -21,6 +21,13 @@ export class MemoryPublicCache {
 }
 export class MemoryPublicCaches {
   readonly stores = new Map<string, MemoryPublicCache>();
+  async match(request: RequestInfo | URL) {
+    for (const cache of this.stores.values()) {
+      const response = await cache.match(request);
+      if (response) return response;
+    }
+    return undefined;
+  }
   async has(name: string) {
     return this.stores.has(name);
   }

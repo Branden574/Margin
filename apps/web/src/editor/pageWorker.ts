@@ -1,18 +1,31 @@
 import type { PdfFormChange, PdfFormInspection } from './formTypes';
 import type { PageAction } from './model';
-import type { Annotation } from '@margin/core';
+import { removeNativeOcrOverlap } from './ocrExportNative';
+import { PermissionFlag } from 'pdfjs-dist';
+import type { Annotation, OcrPageRecord } from '@margin/core';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import type { ExportPageView } from './pdf';
 /** A short-lived worker keeps parsing, edits and PDF encoding off the UI thread. */
-function runWorker<T>(message: unknown, property: 'blob' | 'form' = 'blob'): Promise<T> {
+function runWorker<T>(
+  message: unknown,
+  property: 'blob' | 'form' = 'blob',
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./pdfOperations.worker.ts', import.meta.url), {
       type: 'module',
     });
     const finish = () => {
       clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
       worker.terminate();
     };
+    const abort = () => {
+      finish();
+      reject(signal?.reason ?? new DOMException('Export cancelled.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', abort, { once: true });
     const timeout = setTimeout(() => {
       finish();
       reject(
@@ -55,27 +68,71 @@ export async function exportPdfInWorker(
   annotations: Annotation[],
   pdf: PDFDocumentProxy,
   extractIndex?: number,
+  ocrRecords: readonly OcrPageRecord[] = [],
+  signal?: AbortSignal,
 ) {
-  const items =
-    extractIndex === undefined
-      ? annotations
-      : annotations.filter((a) => a.pageIndex === extractIndex);
-  const views: ExportPageView[] = [];
-  for (const index of new Set(items.map((a) => a.pageIndex))) {
-    const page = await pdf.getPage(index + 1);
-    views.push({ pageIndex: index, transform: page.getViewport({ scale: 1 }).transform });
+  signal?.throwIfAborted();
+  let rejectAbort!: (error: unknown) => void;
+  const interrupted = new Promise<never>((_, reject) => {
+    rejectAbort = reject;
+  });
+  const abort = () =>
+    rejectAbort(signal?.reason ?? new DOMException('Export cancelled.', 'AbortError'));
+  signal?.addEventListener('abort', abort, { once: true });
+  const work = async () => {
+    signal?.throwIfAborted();
+    const ocr: OcrPageRecord[] = [];
+    if (ocrRecords.length) {
+      const permissions = await pdf.getPermissions();
+      signal?.throwIfAborted();
+      if (
+        permissions !== null &&
+        (!permissions.has(PermissionFlag.COPY) || !permissions.has(PermissionFlag.MODIFY_CONTENTS))
+      )
+        throw new Error(
+          'This PDF does not allow copying and modifying its text. Searchable export is unavailable.',
+        );
+      for (const record of ocrRecords) {
+        if (extractIndex !== undefined && record.pageIndex !== extractIndex)
+          throw new Error('The recognized text does not match the selected export page.');
+        const filtered = await removeNativeOcrOverlap(pdf, record, signal);
+        if (filtered) ocr.push(filtered);
+      }
+    }
+    const items =
+      extractIndex === undefined
+        ? annotations
+        : annotations.filter((a) => a.pageIndex === extractIndex);
+    const views: ExportPageView[] = [];
+    for (const index of new Set(items.map((a) => a.pageIndex))) {
+      signal?.throwIfAborted();
+      const page = await pdf.getPage(index + 1);
+      signal?.throwIfAborted();
+      views.push({ pageIndex: index, transform: page.getViewport({ scale: 1 }).transform });
+    }
+    return (
+      await runWorker<{ blob: Blob }>(
+        {
+          operation: 'export',
+          ocr,
+          blob,
+          annotations: items,
+          views,
+          extractIndex,
+          originalPageCount: pdf.numPages,
+        },
+        'blob',
+        signal,
+      )
+    ).blob;
+  };
+  try {
+    return await Promise.race([work(), interrupted]);
+  } finally {
+    signal?.removeEventListener('abort', abort);
   }
-  return (
-    await runWorker<{ blob: Blob }>({
-      operation: 'export',
-      blob,
-      annotations: items,
-      views,
-      extractIndex,
-      originalPageCount: pdf.numPages,
-    })
-  ).blob;
 }
+
 export async function mergePdfInWorker(blob: Blob, incoming: Blob) {
   const result = await runWorker<{ blob: Blob; pageCount: number }>({
     operation: 'merge',

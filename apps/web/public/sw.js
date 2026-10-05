@@ -5,7 +5,8 @@ importScripts('/ocr/tesseract-7.0.0-eng-1/ocr-runtime.js');
 const CACHE = 'margin-shell-v4';
 const OCR = self.MarginOcrAssets;
 let ocrPreparation = null;
-const ASSET = /["'(]((?:\/?assets\/|\.{1,2}\/)[^"'()\s]+\.(?:m?js|css|woff2?|png|jpe?g|webp|svg))/g;
+const ASSET =
+  /["'(]((?:\/?assets\/|\.{1,2}\/)[^"'()\s]+\.(?:m?js|css|woff2?|ttf|png|jpe?g|webp|svg))/g;
 function discoverAssets(source, base) {
   return [...source.matchAll(ASSET)]
     .map(
@@ -19,7 +20,7 @@ function discoverAssets(source, base) {
       return (
         url.origin === self.location.origin &&
         url.pathname.includes('/assets/') &&
-        /-[A-Za-z0-9_-]{6,}\.(?:m?js|css|woff2?|png|jpe?g|webp|svg)$/.test(url.pathname)
+        /-[A-Za-z0-9_-]{6,}\.(?:m?js|css|woff2?|ttf|png|jpe?g|webp|svg)$/.test(url.pathname)
       );
     });
 }

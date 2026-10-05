@@ -20,6 +20,7 @@ import {
   getDocumentBlob,
   getDocumentForOcr,
   getPageOcr,
+  getOcrForExport,
   OCR_MAX_TEXT_CHARACTERS,
   OCR_MAX_WORDS,
   OCR_MAX_RECORD_BYTES,
@@ -485,5 +486,99 @@ describe('encrypted OCR bound to local PDF content revisions', () => {
     const result = (await pending)!;
     expect(result.record.contentRevision).toBe(current.contentRevision);
     expect(await result.blob.text()).toBe('other tab PDF');
+  });
+});
+
+describe('revision-consistent searchable export collection', () => {
+  it('collects only indexed pages for this document in page order and supports one-page export', async () => {
+    const value = await fixture();
+    await savePageOcr(ocr(value.record.contentRevision, value.record.id, 1));
+    await fixture('unrelated');
+    expect(
+      (await getOcrForExport(value.record.id, value.record.contentRevision)).map(
+        (p) => p.pageIndex,
+      ),
+    ).toEqual([0, 1]);
+    expect(
+      (await getOcrForExport(value.record.id, value.record.contentRevision, 1)).map(
+        (p) => p.pageIndex,
+      ),
+    ).toEqual([1]);
+    await expect(getOcrForExport(value.record.id, value.record.contentRevision, 2)).rejects.toThrow(
+      'unavailable',
+    );
+  });
+  it('rejects stale revisions, missing indexed results and mismatched records instead of silently losing OCR', async () => {
+    const value = await fixture();
+    await expect(getOcrForExport(value.record.id, crypto.randomUUID())).rejects.toThrow('changed');
+    const key = JSON.stringify([value.record.id, value.record.contentRevision, 0]);
+    await vaultTransaction(async (tx) => {
+      tx.put('ocr', key, { ...value.ocr, pageIndex: 1 });
+    });
+    await expect(getOcrForExport(value.record.id, value.record.contentRevision)).rejects.toThrow(
+      'does not match',
+    );
+    await vaultTransaction(async (tx) => {
+      tx.delete('ocr', key);
+    });
+    await expect(getOcrForExport(value.record.id, value.record.contentRevision)).rejects.toThrow(
+      'missing',
+    );
+  });
+  it('requires an unlocked vault and respects cancellation', async () => {
+    const value = await fixture();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      getOcrForExport(value.record.id, value.record.contentRevision, undefined, controller.signal),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    await lockVault();
+    await expect(getOcrForExport(value.record.id, value.record.contentRevision)).rejects.toThrow(
+      'locked',
+    );
+  });
+  it('rejects a stale export snapshot when another tab changes the PDF during OCR decryption', async () => {
+    const value = await fixture(),
+      oldRows = await rawRecords();
+    await putDocumentBlob(value.record.id, new Blob(['other tab PDF']));
+    const newRows = await rawRecords();
+    await externalCommit(oldRows);
+    const entered = deferred(),
+      release = deferred();
+    const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+    let held = false;
+    vi.spyOn(crypto.subtle, 'decrypt').mockImplementation(async (algorithm, key, data) => {
+      const aad = new TextDecoder().decode((algorithm as AesGcmParams).additionalData);
+      if (!held && aad.includes('"ocr"')) {
+        held = true;
+        entered.resolve();
+        await release.promise;
+      }
+      return decrypt(algorithm, key, data);
+    });
+    const pending = getOcrForExport(value.record.id, value.record.contentRevision);
+    const rejection = expect(pending).rejects.toThrow('changed');
+    await entered.promise;
+    await externalCommit(newRows);
+    release.resolve();
+    await rejection;
+  });
+
+  it('caps aggregate pages before decrypting page records while allowing a selected page', async () => {
+    const value = await fixture();
+    await patchDocument(value.record.id, { pageCount: 102 });
+    await vaultTransaction(async (tx) => {
+      tx.put('settings', `ocr-pages:${JSON.stringify(value.record.id)}`, {
+        schema: 1,
+        contentRevision: value.record.contentRevision,
+        pages: Array.from({ length: 101 }, (_, i) => i),
+      });
+    });
+    await expect(getOcrForExport(value.record.id, value.record.contentRevision)).rejects.toThrow(
+      'limits',
+    );
+    expect(await getOcrForExport(value.record.id, value.record.contentRevision, 0)).toEqual([
+      value.ocr,
+    ]);
   });
 });

@@ -16,6 +16,11 @@ import {
   vaultTransaction,
   type VaultTransaction,
 } from './vault';
+import {
+  OCR_EXPORT_MAX_PAGES,
+  OCR_EXPORT_MAX_TEXT,
+  OCR_EXPORT_MAX_WORDS,
+} from '../editor/ocrExportLimits';
 
 export const DEFAULT_PREFERENCES: Preferences = {
   name: 'Alex Morgan',
@@ -296,6 +301,76 @@ export async function getPageOcr(
   guard();
   return result;
 }
+/** Read only this PDF's indexed OCR in one revision-consistent encrypted transaction. */
+export async function getOcrForExport(
+  documentId: string,
+  contentRevision: string,
+  pageIndex?: number,
+  signal?: AbortSignal,
+): Promise<OcrPageRecord[]> {
+  const guard = createVaultGuard();
+  const result = await vaultTransaction(
+    async (tx) => {
+      const document = await tx.get<DocumentRecord>('documents', documentId);
+      if (
+        !document ||
+        document.mimeType !== 'application/pdf' ||
+        !revisionPattern.test(contentRevision) ||
+        document.contentRevision !== contentRevision ||
+        !Number.isSafeInteger(document.pageCount) ||
+        document.pageCount < 1 ||
+        (pageIndex !== undefined &&
+          (!validPageIndex(pageIndex) || pageIndex >= document.pageCount)) ||
+        !(await tx.has('blobs', documentId))
+      )
+        throw new Error('This PDF changed or is unavailable. Reopen it before exporting.');
+      const index = await tx.get<OcrIndex>('settings', ocrIndexKey(documentId));
+      if (!index) return [];
+      checkedOcrIndex(index);
+      if (
+        index.contentRevision !== contentRevision ||
+        index.pages.some((page) => page >= document.pageCount)
+      )
+        throw new Error('The encrypted OCR index does not match this PDF.');
+      const pages = index.pages
+        .filter((page) => pageIndex === undefined || page === pageIndex)
+        .sort((a, b) => a - b);
+      const limit = () =>
+        new Error('This export exceeds the searchable text limits. Export a single page instead.');
+      if (pages.length > OCR_EXPORT_MAX_PAGES) throw limit();
+      const records: OcrPageRecord[] = [];
+      let words = 0,
+        characters = 0;
+      for (const page of pages) {
+        signal?.throwIfAborted();
+        const stored = await tx.get<OcrPageRecord>(
+          'ocr',
+          ocrKey(documentId, contentRevision, page),
+        );
+        if (!stored)
+          throw new Error(
+            'A saved OCR page is missing. Recognize that page again before exporting.',
+          );
+        const record = checkedPageOcr(stored);
+        if (
+          record.documentId !== documentId ||
+          record.contentRevision !== contentRevision ||
+          record.pageIndex !== page
+        )
+          throw new Error('The encrypted OCR result does not match this PDF page.');
+        words += record.words.length;
+        characters += record.text.length;
+        if (words > OCR_EXPORT_MAX_WORDS || characters > OCR_EXPORT_MAX_TEXT) throw limit();
+        records.push(record);
+      }
+      return records;
+    },
+    { signal },
+  );
+  guard();
+  return result;
+}
+
 export async function savePageOcr(
   value: OcrPageRecord,
   options: { signal?: AbortSignal } = {},

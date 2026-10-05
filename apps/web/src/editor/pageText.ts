@@ -28,6 +28,8 @@ export async function readPageText(
     signal?: AbortSignal;
     /** Search can release page render objects. PDF.js defers cleanup while rendering is active. */
     cleanup?: boolean;
+    /** Export inspects native geometry within the same bounded, cancellable stream. */
+    onTextChunk?: (content: TextContent) => void;
   } = {},
 ): Promise<PageTextResult> {
   if (!Number.isSafeInteger(pageIndex) || pageIndex < 0 || pageIndex >= pdf.numPages)
@@ -159,6 +161,7 @@ export async function readPageText(
             );
           parts.push(item.str, separator);
         }
+        options.onTextChunk?.(chunk.value);
         // A ready stream can otherwise starve timers/AbortSignal delivery through microtasks.
         if (chunks % 32 === 0) {
           await new Promise((resolve) => setTimeout(resolve, 0));

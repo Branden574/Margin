@@ -185,6 +185,17 @@ try {
   assert.equal(cachedPack.modelEncoding, null);
   assert.deepEqual(cachedPack.modelMagic, [0x1f, 0x8b]);
 
+  const exportFonts = await page.evaluate(async () =>
+    (await (await caches.open('margin-shell-v4')).keys())
+      .map((request) => new URL(request.url).pathname)
+      .filter((path) => /\/NotoSans-Regular-[A-Za-z0-9_-]+\.ttf$/.test(path)),
+  );
+  assert.equal(
+    exportFonts.length,
+    1,
+    'The bundled searchable-export font must already be precached.',
+  );
+
   // Reload destroys the first OCR worker. Page three has never been recognized: both
   // fresh worker initialization and real recognition must now work from the public cache.
   await context.setOffline(true);
@@ -212,6 +223,56 @@ try {
     { timeout: 100_000 },
   );
   assert.deepEqual(await encryptedRecords(), { count: 2, encrypted: true });
+  // This first export runs with the network disabled and the preview's real CSP.
+  // Its PDF worker must fetch the emitted Unicode font from the shell cache.
+  const pendingDownload = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export encrypted file', exact: true }).click();
+  const download = await pendingDownload;
+  try {
+    const path = await download.path();
+    assert(path, 'The browser must actually deliver the encrypted searchable export.');
+    assert.match(download.suggestedFilename(), /\.margin$/);
+    const encrypted = await readFile(path);
+    assert.equal(encrypted.subarray(0, 8).toString(), 'MARGIN1\n');
+    assert.equal(encrypted.includes(Buffer.from('silver moon')), false);
+    await page.getByRole('button', { name: 'Back to workspace', exact: true }).click();
+    await page
+      .locator('.sidebar')
+      .getByRole('button', { name: 'My documents', exact: true })
+      .click();
+    await page.getByLabel('Choose documents to upload', { exact: true }).setInputFiles({
+      name: download.suggestedFilename(),
+      mimeType: 'application/vnd.margin.encrypted',
+      buffer: encrypted,
+    });
+    await page
+      .getByRole('button', { name: 'Synthetic offline OCR — annotated PDF document', exact: true })
+      .click();
+    await page.getByRole('button', { name: 'Read aloud', exact: true }).click();
+    for (const number of [1, 3]) {
+      await page
+        .getByRole('spinbutton', { name: 'Current page', exact: true })
+        .fill(String(number));
+      await expect(
+        page.getByRole('region', { name: `Page ${number} text`, exact: true }),
+      ).toContainText(/silver moon/i);
+      await expect(page.getByRole('heading', { name: 'Page text', exact: true })).toBeVisible();
+      await expect(page.getByRole('heading', { name: 'Recognized text', exact: true })).toHaveCount(
+        0,
+      );
+    }
+    await page.getByRole('button', { name: 'Find in document', exact: true }).click();
+    await page.getByLabel('Search document text', { exact: true }).fill('silver moon');
+    await page.getByRole('button', { name: 'Find', exact: true }).click();
+    await expect(page.getByText('2 matching pages', { exact: true })).toBeVisible();
+    assert.deepEqual(
+      await encryptedRecords(),
+      { count: 2, encrypted: true },
+      'Reimport must use native PDF text without creating OCR companions.',
+    );
+  } finally {
+    await download.delete();
+  }
   assert.deepEqual(
     externalRequests,
     [],
@@ -229,6 +290,8 @@ try {
         ocrRecognizedPages: 2,
         cachedOcrAssets: cachedPack.assets,
         encryptedOcrRecords: 2,
+        offlineSearchableExport: true,
+        nativeReimportPages: 2,
         verified: [
           'on-demand public pack download',
           'byte lengths and SHA-256 for every cached public asset',
@@ -236,6 +299,8 @@ try {
           'encrypted OCR recovery after offline reload',
           'fresh offline worker recognizes a previously unrecognized rotated crop',
           'blank page leaves no OCR record',
+          'offline encrypted searchable export uses the precached font under production CSP',
+          'offline UI reimport exposes native PDF text on two pages without OCR companions',
           'no external requests or browser errors',
         ],
       },

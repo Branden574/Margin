@@ -46,7 +46,12 @@ import {
   X,
 } from 'lucide-react';
 import type { Annotation, AnnotationTool, DocumentRecord, Point } from '@margin/core';
-import { getDocumentForOcr, replaceDocumentWithAnnotations } from '../lib/storage';
+import {
+  getDocument,
+  getDocumentForOcr,
+  getOcrForExport,
+  replaceDocumentWithAnnotations,
+} from '../lib/storage';
 import { useAnnotations } from './useAnnotations';
 import { usePdf } from './usePdf';
 import { PdfCanvas } from './PdfCanvas';
@@ -79,7 +84,7 @@ import {
   applyPdfFormInWorker,
 } from './pageWorker';
 import { useDocumentLock } from './useDocumentLock';
-import { encryptExport, onBeforeVaultLock } from '../lib/vault';
+import { createVaultGuard, encryptExport, onBeforeVaultLock, onVaultLock } from '../lib/vault';
 import './editor.css';
 
 interface Props {
@@ -176,6 +181,8 @@ export default function DocumentEditor({
   const [busy, setBusy] = useState(''),
     [notice, setNotice] = useState(''),
     [error, setError] = useState('');
+  const exportAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => exportAbort.current?.abort(), []);
   const [exportLink, setExportLink] = useState<{ url: string; name: string } | null>(null);
   useEffect(() => {
     return () => {
@@ -796,17 +803,47 @@ export default function DocumentEditor({
     }
   }
   async function exportPdf(extract = false) {
-    if (!pdf || !ready || transition.current) return;
+    if (!pdf || !ready || transition.current || exportAbort.current) return;
+    const controller = new AbortController();
+    exportAbort.current = controller;
+    const removeLockListener = onVaultLock(() => controller.abort());
+    const timeout = setTimeout(
+      () =>
+        controller.abort(new Error('Export exceeded 120 seconds. Try exporting a single page.')),
+      120_000,
+    );
+    setExportLink(null);
     setBusy('Preparing PDF');
     setError('');
     try {
+      const guard = createVaultGuard();
+      const ensureCurrent = () => {
+        guard();
+        controller.signal.throwIfAborted();
+        if (
+          editorIdentity.current.pdf !== pdf ||
+          editorIdentity.current.contentRevision !== contentRevision
+        )
+          throw new Error('The PDF changed while preparing this export. Try again.');
+      };
       await flush();
+      ensureCurrent();
+      const ocrRecords = await getOcrForExport(
+        record.id,
+        contentRevision,
+        extract ? pageIndex : undefined,
+        controller.signal,
+      );
+      ensureCurrent();
       const output = await exportPdfInWorker(
         workingBlob,
         current.current,
         pdf,
         extract ? pageIndex : undefined,
+        ocrRecords,
+        controller.signal,
       );
+      ensureCurrent();
       const encrypted = await encryptExport(output, {
         name:
           record.name.replace(/\.pdf$/i, '') +
@@ -814,6 +851,10 @@ export default function DocumentEditor({
           '.pdf',
         mimeType: 'application/pdf',
       });
+      const fresh = await getDocument(record.id);
+      ensureCurrent();
+      if (!fresh || fresh.contentRevision !== contentRevision)
+        throw new Error('The PDF changed while preparing this export. Reopen it and try again.');
       const name = `margin-document-${new Date().toISOString().replace(/[:.]/g, '-')}.margin`;
       setExportLink({ url: URL.createObjectURL(encrypted), name });
       downloadBlob(encrypted, name);
@@ -821,6 +862,9 @@ export default function DocumentEditor({
     } catch (e) {
       setError(`Export could not finish: ${errorMessage(e)}`);
     } finally {
+      clearTimeout(timeout);
+      removeLockListener();
+      if (exportAbort.current === controller) exportAbort.current = null;
       setBusy('');
     }
   }
