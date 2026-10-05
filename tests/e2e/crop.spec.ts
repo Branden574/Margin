@@ -204,8 +204,31 @@ test('crop validates margins, confirms dirty discard, and exposes accessible con
     dialog.getByRole('button', { name: 'Apply crop', exact: true }),
     dialog.getByRole('button', { name: 'Cancel', exact: true }),
   ]) {
-    await control.scrollIntoViewIfNeeded();
-    await expect(control).toBeInViewport({ ratio: 1 });
+    await control.evaluate((element) =>
+      element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }),
+    );
+    // Chromium can round an edge-aligned input's intersection to 0.9984. Check
+    // the actual scroll-port bounds within one CSS pixel, then prove clickability.
+    await expect
+      .poll(() =>
+        control.evaluate((element) => {
+          const host = element.closest('dialog')!;
+          const clip = host.getBoundingClientRect();
+          const rect = element.getBoundingClientRect();
+          const left = clip.left + host.clientLeft;
+          const top = clip.top + host.clientTop;
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.left >= Math.max(0, left) - 1 &&
+            rect.right <= Math.min(innerWidth, left + host.clientWidth) + 1 &&
+            rect.top >= Math.max(0, top) - 1 &&
+            rect.bottom <= Math.min(innerHeight, top + host.clientHeight) + 1
+          );
+        }),
+      )
+      .toBe(true);
+    await control.click({ trial: true });
   }
   expect((await accessibility()).violations).toEqual([]);
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
