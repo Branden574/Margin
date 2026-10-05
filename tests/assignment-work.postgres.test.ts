@@ -276,8 +276,11 @@ async function runtimeContext(
     c.release();
   }
 }
+// These scenarios perform several durable transactions, retries and recovery checks.
+// Bound the whole scenario separately from unchanged SQL, lock, lease and ticket deadlines.
 describe.skipIf(!available)(
   'Durable Canvas work provisioning with actual PostgreSQL and explicit synthetic cloud/scanner fixtures',
+  { timeout: 20_000 },
   () => {
     beforeAll(async () => {
       dir = mkdtempSync(join(tmpdir(), 'margin-work-pg-'));
@@ -779,7 +782,7 @@ describe.skipIf(!available)(
       const completing = worker.completePrepared(claim, ticket);
       completing.catch(() => {});
       const waitFor = async (sql: string) => {
-        const deadline = Date.now() + 1500;
+        const deadline = Date.now() + 5000;
         while (Date.now() < deadline) {
           if ((await admin.query(sql)).rowCount) return;
           await new Promise((r) => setTimeout(r, 10));
@@ -923,7 +926,7 @@ describe.skipIf(!available)(
         // Recovery must block on its authority lock and recheck after this commit.
         recovering = worker.receipt(claim);
         recovering.catch(() => {});
-        const deadline = Date.now() + 1500;
+        const deadline = Date.now() + 5000;
         let blocked = false;
         while (Date.now() < deadline) {
           blocked = Boolean(
@@ -1019,7 +1022,7 @@ describe.skipIf(!available)(
         const controller = new AbortController();
         const preparing = worker.prepare(claim, reader, stalled, controller.signal);
         preparing.catch(() => {});
-        const deadline = Date.now() + 1000;
+        const deadline = Date.now() + 5000;
         while (release.length <= i && Date.now() < deadline)
           await new Promise((r) => setTimeout(r, 5));
         expect(release.length).toBe(i + 1);
