@@ -43,6 +43,16 @@ Operations retain canonical request comparison for operation-ID retries, annotat
 
 Annotation requests check current database source approval but do not download the original PDF or call Canvas per edit. An object-storage outage prevents source delivery while leaving already-saved annotations recoverable, provided their current authorization and database approval remain valid. This is not an implemented browser offline bridge or realtime transport.
 
+## Browser transport client
+
+`apps/web/src/lib/assignment-work` exports `createAssignmentWorkClient()`. The client provides `currentSession`, `manifest`, `reserve`, `source`, `append`, `catchUp`, and permanent `invalidate`/`dispose`. It is not yet wired into a browser route or the local vault. Construct a new client for a new verified launch; do not reuse a disposed binding or derive authority from local preferences.
+
+The default client accepts only the current HTTPS origin. It refuses redirects, uses same-origin credentials and no-store requests, and retains CSRF only in memory. Manifest and source reads verify the server session before and after retrieval; edit requests use the captured CSRF token and the server's fresh authentication. Validated responses pin session, assignment, work, document, version, page and actor identities. Binary and JSON streams have bounded sizes and one deadline covering headers, body, authentication checks and manifest queue waiting. Cancelling a read does not replace or discard an existing valid session binding; changed identities and authorization failures invalidate it.
+
+Manifest reads are serialized without blocking append or catch-up. They retain newer verified cursors and distinguish an older snapshot that preceded reservation from an actual binding regression. Operations are validated and copied before asynchronous dispatch. A cancelled or failed response after dispatch can leave the save outcome uncertain; the error retains its operation identifier, including an HTTP `work_request_cancelled` response that may occur after commit. The caller must preserve that exact operation for retry. The client performs no automatic retries, persistence, local-vault adoption, submission or grade delivery.
+
+The 74 deterministic transport tests cover malformed and oversized responses, redirects, policy checks, session replacement, concurrent snapshots/edits, cancellation and late-body disposal, uncertain commit followed by duplicate retry, and cursor/revision/page validation. These use injected synthetic fetch responses; they do not establish an integrated editor workflow or live Canvas interoperability.
+
 ## Verification and remaining gates
 
 `tests/assignment-work-runtime.postgres.test.ts` uses disposable PostgreSQL with migrations 001–007, local test keys, a synthetic storage provider and explicitly synthetic scan reports. It exercises provisioning-to-source-to-edit/catch-up, private receipts/keys, exact content checks, idempotency/conflicts/deletion, tool/delivery policy, current/fresh/expired launches, tenant/peer/role isolation, receipt/geometry/key tampering, authority revocation during remote work and lock waits, and transactional outbox rollback. Existing provisioning, sync and mixed-role suites cover their preserved contracts.
