@@ -236,7 +236,7 @@ test('browser Back refuses an unfinished annotation and succeeds after saving it
     'Keep this draft when Back is pressed',
   );
   await expect(page.getByRole('dialog')).toContainText(
-    'Save or cancel the pending annotation or form changes before leaving or locking.',
+    'Save or cancel the pending annotation, form, or crop changes before leaving or locking.',
   );
   await page.getByRole('button', { name: 'Save text', exact: true }).click();
   await page.goBack();

@@ -53,7 +53,7 @@
   stroke-dasharray: 6 3;
 }
 .crop-preview figcaption {
-  color: var(--ed-muted);
+  color: var(--ed-ink);
   font-size: 12px;
   line-height: 1.6;
   text-align: center;
@@ -122,7 +122,7 @@
   font-size: 12px;
 }
 .crop-dimensions span {
-  color: var(--ed-muted);
+  color: var(--ed-ink);
 }
 .crop-dimensions strong {
   font-weight: 500;
