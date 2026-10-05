@@ -253,8 +253,9 @@ export function Settings({ preferences, onSave, documents, token, onToken, onHel
               </button>
             </div>
             <p className="field-note">
-              Google Drive, Classroom, Microsoft 365, OCR, and multi-user collaboration require
-              configured services and are not connected in this local build.
+              Google Drive, Classroom, Microsoft 365, and multi-user collaboration are not connected
+              in this local build. Printed-English page recognition is available locally in the
+              editor.
             </p>
           </div>
         </section>
