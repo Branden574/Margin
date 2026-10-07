@@ -27,6 +27,19 @@ async function count(dashboard: Locator, label: string, amount: number) {
   ).toHaveText(String(amount));
 }
 async function accessible(page: Page) {
+  // Sample the resting UI, not transient text blended by the page entrance fade.
+  await page.locator('.library-page').evaluate(async (root) => {
+    await Promise.all(
+      root
+        .getAnimations({ subtree: true })
+        .filter(
+          (animation) =>
+            animation.playState === 'running' &&
+            Number.isFinite(animation.effect?.getComputedTiming().iterations),
+        )
+        .map((animation) => animation.finished.catch(() => undefined)),
+    );
+  });
   const result = await new AxeBuilder({ page })
     .include('.role-home')
     .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])

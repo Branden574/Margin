@@ -51,6 +51,7 @@ async function formFixture(xfa = false) {
   return Buffer.from(await pdf.save({ updateFieldAppearances: false }));
 }
 async function importAndOpen(page: Page, name: string, buffer: Buffer) {
+  await page.locator('.sidebar').getByRole('button', { name: 'My documents', exact: true }).click();
   await page.getByRole('button', { name: 'Upload document', exact: true }).click();
   await page.getByLabel('Choose documents to upload').setInputFiles({
     name: `${name}.pdf`,
