@@ -91,7 +91,6 @@ export class PostgresLmsRepository
   constructor(options: PoolConfig, lookupKey: Uint8Array) {
     if (lookupKey.byteLength !== 32)
       throw new Error('LMS lookup HMAC key must contain 32 random bytes.');
-    this.lookupKey = Buffer.from(lookupKey);
     const testSocket =
       process.env.NODE_ENV === 'test' && options.host?.startsWith('/') && !options.connectionString;
     if (
@@ -108,19 +107,28 @@ export class PostgresLmsRepository
       throw new Error(
         'Configure verified LMS PostgreSQL TLS separately, not through URL overrides.',
       );
-    this.pool = new Pool({
-      ...options,
-      max: 8,
-      connectionTimeoutMillis: 5000,
-      idleTimeoutMillis: 30000,
-      query_timeout: 6000,
-      statement_timeout: 5000,
-      idle_in_transaction_session_timeout: 5000,
-    });
+    this.lookupKey = Buffer.from(lookupKey);
+    try {
+      this.pool = new Pool({
+        ...options,
+        max: 8,
+        connectionTimeoutMillis: 5000,
+        idleTimeoutMillis: 30000,
+        query_timeout: 6000,
+        statement_timeout: 5000,
+        idle_in_transaction_session_timeout: 5000,
+      });
+    } catch (error) {
+      this.lookupKey.fill(0);
+      throw error;
+    }
   }
   async close() {
-    await this.pool.end();
-    this.lookupKey.fill(0);
+    try {
+      await this.pool.end();
+    } finally {
+      this.lookupKey.fill(0);
+    }
   }
   private async transaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();

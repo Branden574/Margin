@@ -120,6 +120,9 @@ button {
   width: 235px;
   flex-shrink: 0;
   height: 100vh;
+  height: 100dvh;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
   position: fixed;
   top: 0;
   left: 0;
@@ -129,6 +132,9 @@ button {
   display: flex;
   flex-direction: column;
   z-index: 30;
+}
+.sidebar > * {
+  flex-shrink: 0;
 }
 .brand-row {
   padding: 0 12px 31px;

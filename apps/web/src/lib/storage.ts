@@ -65,6 +65,16 @@ function notify(change: DataChange) {
     /* The encrypted transaction already committed. */
   }
 }
+/** Assignment repository transactions publish only after durable encrypted commit. */
+export function notifyAssignmentChange(documentId: string) {
+  notify({ entity: 'document', id: documentId });
+}
+async function assertUnboundDocument(tx: VaultTransaction, documentId: string) {
+  if (await tx.has('assignment-bindings', documentId))
+    throw new Error(
+      'This assignment copy must use its verified assignment persistence path. Ordinary PDF edits, annotation writes, and deletion are unavailable.',
+    );
+}
 export function subscribeToDataChanges(listener: (change: DataChange) => void): () => void {
   getChannel();
   const handle = (event: Event) => listener((event as CustomEvent<DataChange>).detail);
@@ -147,6 +157,7 @@ async function replacePdfBytes(
   record: DocumentRecord,
   blob: Blob,
 ): Promise<DocumentRecord> {
+  await assertUnboundDocument(tx, record.id);
   const next = { ...record, size: blob.size, contentRevision: crypto.randomUUID() };
   await clearDocumentOcr(tx, record.id);
   tx.put('documents', record.id, next);
@@ -409,6 +420,7 @@ export async function savePageOcr(
 export async function saveDocument(record: DocumentRecord): Promise<void> {
   await commit(
     async (tx) => {
+      await assertUnboundDocument(tx, record.id);
       const current = await tx.get<DocumentRecord>('documents', record.id);
       // Metadata callers cannot revive an earlier byte revision from a stale snapshot.
       tx.put('documents', record.id, { ...record, contentRevision: current?.contentRevision });
@@ -427,6 +439,7 @@ export async function patchDocument(
 ): Promise<DocumentRecord> {
   return commit(
     async (tx) => {
+      if (patch.pageCount !== undefined) await assertUnboundDocument(tx, id);
       const current = await tx.get<DocumentRecord>('documents', id);
       if (!current) throw new Error('This document no longer exists. Your changes were not saved.');
       const next: DocumentRecord = {
@@ -476,6 +489,7 @@ export async function saveDocumentWithBlob(
 export async function deleteDocument(id: string): Promise<void> {
   await commit(
     async (tx) => {
+      await assertUnboundDocument(tx, id);
       tx.delete('documents', id);
       tx.delete('blobs', id);
       await clearDocumentOcr(tx, id);
@@ -578,6 +592,8 @@ export function replayAnnotationOperations(operations: AnnotationOperation[]): A
   );
 }
 export async function loadAnnotations(documentId: string): Promise<Annotation[]> {
+  if (await readVaultRecord('assignment-bindings', documentId))
+    throw new Error('Open this assignment through its verified assignment snapshot.');
   return replayAnnotationOperations(await listAnnotationOperations(documentId));
 }
 export async function appendAnnotationOperation(operation: AnnotationOperation): Promise<void> {
@@ -595,6 +611,7 @@ export async function appendAnnotationOperation(operation: AnnotationOperation):
     throw new Error('The annotation does not match its operation.');
   await commit(
     async (tx) => {
+      await assertUnboundDocument(tx, operation.documentId);
       const document = await tx.get<DocumentRecord>('documents', operation.documentId);
       if (!document)
         throw new Error('This document no longer exists. Your annotation was not saved.');

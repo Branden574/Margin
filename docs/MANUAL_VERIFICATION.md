@@ -103,6 +103,14 @@ Additional checks passed:
 
 Local screenshot evidence: `.local/manual-checks/form-values-recovered.jpg` and `.local/manual-checks/form-multiline-fixed.jpg`. The saved supported form remains open in the app. This is a checked local form workflow, not a claim of form authoring, XFA support, legal completion, third-party PDF-reader interoperability or Canvas submission. Actual encrypted download delivery in this in-app browser remains unresolved; the existing automated decrypted-export regression is separate evidence.
 
+## Sidebar and vault recovery walkthrough — October 7, 2026
+
+Restarted the stopped local web/API servers and loaded the existing HTTPS in-app tab with ordinary certificate verification. Unlocked the existing vault using the user's authorized local passphrase; all 16 library documents were visible. Starred the synthetic OCR fixture, reloaded, unlocked and confirmed the star persisted; restored its original unstarred state.
+
+At the actual 615×724 viewport, the sidebar was 724 pixels tall but its content extended to 998 pixels with `overflow-y: visible`. Settings, Help and Lock workspace could not be reached. The sidebar now uses viewport-relative height, vertical scrolling and non-shrinking children. After loading the updated styles, scrolling exposed all lower controls and clicking **Lock workspace** reached the locked screen. A second authorized unlock restored the library and the unstarred fixture. The workspace was left open.
+
+Screenshot: `.local/manual-checks/sidebar-scroll-oct7.png`. This verifies the observed narrow-window overflow and save/reload/lock workflow; the new Canvas assignment repository has no student interface yet and was not manually exercised here. A stale Vite websocket connection required one full reload to receive the styles; no unsaved editor draft was present.
+
 ## Reading controls walkthrough — October 2, 2026
 
 Used the existing normally trusted HTTPS in-app tab with a synthetic three-page PDF: text, a deliberately blank page, then different text. Imported it as `d6f259ca-69fc-423d-a23a-84f5ea2fb1bc`. No real student content or remote speech service was used.

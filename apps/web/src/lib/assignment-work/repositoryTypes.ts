@@ -1,0 +1,67 @@
+import type { Annotation, AnnotationOperation, DocumentRecord } from '@margin/core';
+import type { AppendOperation, AppendReceipt, WorkManifest } from './types';
+
+export const MAX_OUTBOX_OPERATIONS = 1_000;
+export const MAX_OUTBOX_BYTES = 8 * 1024 * 1024;
+export const MAX_BASELINE_ANNOTATIONS = 20_000;
+export const MAX_BASELINE_BYTES = 32 * 1024 * 1024;
+export interface AssignmentIdentity {
+  origin: string;
+  organizationId: string;
+  userId: string;
+  assignmentId: string;
+  workId: string;
+  documentId: string;
+  versionId: string;
+}
+export interface AssignmentBinding {
+  schema: 1;
+  localDocumentId: string;
+  contentRevision: string;
+  sourceSha256: string;
+  identity: AssignmentIdentity;
+  manifest: WorkManifest;
+  createdSessionId: string;
+  appliedCursor: number;
+  observedCursor: number;
+  nextSequence: number;
+  queue: string[];
+  queueBytes: number;
+  baselineIds: string[];
+  baselineBytes: number;
+  hydrated: boolean;
+}
+export interface AssignmentOutboxEntry {
+  schema: 1;
+  localDocumentId: string;
+  sequence: number;
+  local: AnnotationOperation;
+  operation: AppendOperation;
+  bytes: number;
+  status: 'queued' | 'sending' | 'uncertain' | 'acknowledged' | 'conflict';
+  receipt?: AppendReceipt;
+  conflictCode?: string;
+  dispatchedCursor?: number;
+}
+export interface AssignmentBaseline {
+  annotationId: string;
+  pageId: string;
+  revision: number;
+  cursor: number;
+  annotation: Annotation | null;
+}
+export interface AssignmentSnapshot {
+  document: DocumentRecord;
+  binding: AssignmentBinding;
+  annotations: Annotation[];
+  pending: { operationId: string; annotationId: string; status: AssignmentOutboxEntry['status'] }[];
+}
+export class AssignmentRepositoryError extends Error {
+  readonly name = 'AssignmentRepositoryError';
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}

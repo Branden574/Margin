@@ -8,6 +8,10 @@ export type VaultStore =
   | 'blobs'
   | 'folders'
   | 'annotations'
+  | 'assignment-bindings'
+  | 'assignment-baseline'
+  | 'assignment-outbox'
+  | 'assignment-receipts'
   | 'ocr'
   | 'assignments'
   | 'uploads'
@@ -587,14 +591,19 @@ export interface VaultTransaction {
 /** Encrypt before opening IDB write transactions. A revision comparison retries conflicting cross-tab writes. */
 export function vaultTransaction<T>(
   body: (transaction: VaultTransaction) => Promise<T>,
-  options: { signal?: AbortSignal } = {},
+  options: {
+    signal?: AbortSignal;
+    /** Synchronous lifecycle assertion; no I/O or mutations. */ guard?: () => void;
+  } = {},
 ): Promise<T> {
   const requestedSession = requireSession();
   const signal = options.signal;
+  const guard = options.guard;
   const assertActive = () => {
     assertSession(requestedSession);
     if (signal?.aborted)
       throw new DOMException('This vault operation was cancelled.', 'AbortError');
+    guard?.();
   };
   const run = async () => {
     for (let attempt = 0; attempt < 8; attempt++) {
@@ -654,15 +663,19 @@ export function vaultTransaction<T>(
       for (const write of writes.values()) {
         assertActive();
         const address = await storageKey(requestedSession, write.store, write.key);
+        assertActive();
         if (write.deleted) {
           prepared.push({ storageKey: address });
           continue;
         }
+        const packed = await pack(write.key, write.value);
+        assertActive();
         const ciphertext = await encrypt(
           requestedSession.key,
-          await pack(write.key, write.value),
+          packed,
           aad(snapshot.vaultId, write.store, address),
         );
+        assertActive();
         prepared.push({
           storageKey: address,
           record: {
@@ -687,10 +700,12 @@ export function vaultTransaction<T>(
       try {
         assertActive();
         const latest = await tx.objectStore('public').get('vault');
+        assertActive();
         if (!latest || latest.vaultId !== snapshot.vaultId)
           throw new Error('The vault identity changed while saving.');
         if (latest.revision !== snapshot.revision) {
           await tx.done;
+          assertActive();
           continue;
         }
         assertActive();
@@ -698,9 +713,14 @@ export function vaultTransaction<T>(
           assertActive();
           if (change.record) await tx.objectStore('records').put(change.record);
           else await tx.objectStore('records').delete(change.storageKey);
+          assertActive();
         }
-        if (prepared.length)
+        if (prepared.length) {
+          assertActive();
           await tx.objectStore('public').put({ ...latest, revision: latest.revision + 1 });
+          assertActive();
+        }
+        assertActive();
         await tx.done;
         assertActive();
         return result;

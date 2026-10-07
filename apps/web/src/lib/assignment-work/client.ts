@@ -1,4 +1,5 @@
 import * as decode from './decode';
+import { createVaultGuard } from '../vault';
 import { RequestScope, Transport } from './transport';
 import {
   AssignmentWorkClientError,
@@ -24,6 +25,10 @@ export interface ClientDependencies {
   timeoutMs?: number;
 }
 export interface AssignmentWorkClient {
+  /** Ephemeral provenance for local persistence; never itself grants server authority. */
+  verifiedSnapshot(
+    options?: RequestOptions & { includeSource?: boolean },
+  ): Promise<VerifiedAssignmentSnapshot>;
   currentSession(options?: RequestOptions): Promise<StudentSession>;
   manifest(options?: RequestOptions): Promise<WorkManifest>;
   reserve(options?: RequestOptions): Promise<StudentWorkReservation>;
@@ -36,6 +41,28 @@ export interface AssignmentWorkClient {
   /** Permanently clear this binding and abort active calls. Construct a new client after a new launch. */
   invalidate(): void;
   dispose(): void;
+}
+declare const verifiedSnapshotBrand: unique symbol;
+export interface VerifiedAssignmentSnapshot {
+  readonly [verifiedSnapshotBrand]: true;
+}
+export interface VerifiedAssignmentData {
+  origin: string;
+  session: StudentSession;
+  manifest: WorkManifest;
+  source?: Blob;
+}
+const snapshots = new WeakMap<object, { data: VerifiedAssignmentData; check: () => void }>();
+/** Rechecks issuer lifetime/expiry. Structural objects and persisted tokens are rejected. */
+export function readVerifiedSnapshot(snapshot: VerifiedAssignmentSnapshot): VerifiedAssignmentData {
+  const record = snapshots.get(snapshot);
+  if (!record)
+    throw new AssignmentWorkClientError(
+      'verification_required',
+      'Refresh the verified Canvas assignment first.',
+    );
+  record.check();
+  return structuredClone(record.data);
 }
 const error = (code: string, message: string) => new AssignmentWorkClientError(code, message);
 const clone = <T>(value: T): T => structuredClone(value);
@@ -55,6 +82,7 @@ const publicSession = (s: StudentSession & { csrfToken: string }): StudentSessio
 
 class Client implements AssignmentWorkClient {
   private readonly transport: Transport;
+  private readonly origin: string;
   private readonly now: () => number;
   private readonly timeout: number;
   private readonly active = new Set<RequestScope>();
@@ -94,6 +122,7 @@ class Client implements AssignmentWorkClient {
       origin.origin,
       dependencies.fetch ?? globalThis.fetch.bind(globalThis),
     );
+    this.origin = origin.origin;
     this.now = dependencies.now ?? Date.now;
     this.timeout = dependencies.timeoutMs ?? REQUEST_TIMEOUT_MS;
     if (
@@ -213,6 +242,29 @@ class Client implements AssignmentWorkClient {
   }
   currentSession(options: RequestOptions = {}) {
     return this.run(options, (scope) => this.verify(scope));
+  }
+  async verifiedSnapshot(options: RequestOptions & { includeSource?: boolean } = {}) {
+    const vaultGuard = createVaultGuard();
+    return this.run(options, async (scope) => {
+      const manifest = await scope.wait(this.manifest({ signal: scope.controller.signal }));
+      const source = options.includeSource
+        ? await scope.wait(this.source({ signal: scope.controller.signal }))
+        : undefined;
+      scope.check();
+      vaultGuard();
+      const session = publicSession(this.bound());
+      const expires = Math.min(session.expiresAt, this.now() + 60_000);
+      const token = Object.freeze({}) as VerifiedAssignmentSnapshot;
+      snapshots.set(token, {
+        data: { origin: this.origin, session, manifest, ...(source ? { source } : {}) },
+        check: () => {
+          vaultGuard();
+          if (identity(this.bound()) !== identity(session) || this.now() >= expires)
+            throw error('verification_required', 'Refresh the verified Canvas assignment first.');
+        },
+      });
+      return token;
+    });
   }
   private accept(
     next: WorkManifest,
