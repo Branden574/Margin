@@ -152,8 +152,11 @@ test('mobile navigation and settings remain operable without horizontal overflow
   await page.goto('/');
   await unlockWorkspace(page);
   await expect(page.getByRole('heading', { name: /Ready for your next lesson/ })).toBeVisible();
+  await expect(page.locator('.sidebar')).toBeHidden();
   await page.getByRole('button', { name: 'Open navigation' }).click();
+  await expect(page.locator('.sidebar')).toBeVisible();
   await navigate(page, 'Settings');
+  await expect(page.locator('.sidebar')).toBeHidden();
   await expect(page.getByRole('heading', { name: 'Workspace settings' })).toBeVisible();
   await page.getByRole('textbox', { name: 'Display name' }).fill('Mobile learner');
   await page.getByRole('button', { name: 'Save name' }).click();

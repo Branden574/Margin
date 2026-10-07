@@ -2295,9 +2295,13 @@ kbd {
     transform: translateX(-100%);
     transition: transform 0.2s;
     width: 235px;
+    visibility: hidden;
+    pointer-events: none;
   }
   .sidebar.mobile-open {
     transform: translateX(0);
+    visibility: visible;
+    pointer-events: auto;
   }
   .sidebar-scrim.visible {
     display: block;
