@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Plus,
   GraduationCap,
@@ -15,17 +15,47 @@ interface Props {
   assignments: Assignment[];
   documents: DocumentRecord[];
   role: Preferences['role'];
+  request?: { id?: string; create?: boolean; key: number };
+  onRequestHandled?: () => void;
+  boundCopyIds?: ReadonlySet<string>;
   onSave: (a: Assignment) => Promise<void>;
   onOpen: (d: DocumentRecord) => void;
 }
-export function Assignments({ assignments, documents, role, onSave, onOpen }: Props) {
+export function Assignments({
+  assignments,
+  documents,
+  role,
+  request,
+  onRequestHandled,
+  boundCopyIds,
+  onSave,
+  onOpen,
+}: Props) {
   const [creating, setCreating] = useState(false);
   const [detail, setDetail] = useState<Assignment | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [filter, setFilter] = useState('all');
   const usable = documents.filter((d) => !d.trashed);
-  const visible = assignments.filter((a) => filter === 'all' || a.status === filter);
+  const selectable = usable.filter((d) => !boundCopyIds?.has(d.id));
+  const accessible = assignments.filter((a) => role === 'teacher' || a.status !== 'draft');
+  const visible = accessible.filter((a) => filter === 'all' || a.status === filter);
+  useEffect(() => {
+    setCreating(false);
+    setDetail(null);
+    setFilter('all');
+  }, [role]);
+  useEffect(() => {
+    if (!request?.key) return;
+    if (request.create && role === 'teacher') setCreating(true);
+    else if (request.id)
+      setDetail(
+        assignments.find(
+          (a) => a.id === request.id && (role === 'teacher' || a.status !== 'draft'),
+        ) ?? null,
+      );
+    onRequestHandled?.();
+  }, [request, role, assignments, onRequestHandled]);
   async function save(a: Assignment) {
     setBusy(true);
     setError('');
@@ -41,6 +71,7 @@ export function Assignments({ assignments, documents, role, onSave, onOpen }: Pr
   }
   function create(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (role !== 'teacher') return;
     const form = new FormData(e.currentTarget);
     void save({
       id: crypto.randomUUID(),
@@ -82,10 +113,13 @@ export function Assignments({ assignments, documents, role, onSave, onOpen }: Pr
         </span>
       </div>
       <div className="file-tabs assignment-tabs">
-        {['all', 'draft', 'assigned', 'submitted', 'returned'].map((f) => (
+        {(role === 'teacher'
+          ? ['all', 'draft', 'assigned', 'submitted', 'returned']
+          : ['all', 'assigned', 'submitted', 'returned']
+        ).map((f) => (
           <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}>
             {f === 'all' ? 'All assignments' : f.charAt(0).toUpperCase() + f.slice(1)}{' '}
-            <span>{assignments.filter((a) => f === 'all' || a.status === f).length}</span>
+            <span>{accessible.filter((a) => f === 'all' || a.status === f).length}</span>
           </button>
         ))}
       </div>
@@ -123,7 +157,9 @@ export function Assignments({ assignments, documents, role, onSave, onOpen }: Pr
           </span>
           <h3>
             {filter === 'all'
-              ? 'Good lessons start with a blank page.'
+              ? role === 'teacher'
+                ? 'Good lessons start with a blank page.'
+                : 'No assigned work yet.'
               : 'No ' + filter + ' assignments yet.'}
           </h3>
           <p>
@@ -162,7 +198,7 @@ export function Assignments({ assignments, documents, role, onSave, onOpen }: Pr
                 <option value="" disabled>
                   Choose a document
                 </option>
-                {usable.map((d) => (
+                {selectable.map((d) => (
                   <option value={d.id} key={d.id}>
                     {d.name}
                   </option>
@@ -198,7 +234,7 @@ export function Assignments({ assignments, documents, role, onSave, onOpen }: Pr
               <button type="button" className="button secondary" onClick={() => setCreating(false)}>
                 Cancel
               </button>
-              <button className="button primary" disabled={busy || !usable.length}>
+              <button className="button primary" disabled={busy || !selectable.length}>
                 {busy ? 'Saving…' : 'Save draft'}
               </button>
             </div>

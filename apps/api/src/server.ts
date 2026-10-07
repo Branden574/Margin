@@ -11,7 +11,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { EncryptedStore, LocalKeyProvider, type KeyManagementProvider } from './encryption.js';
 import { createIdentityHandler } from './identity/http.js';
-import type { IdentityService } from './identity/service.js';
+import type { AuthenticatedRequest, IdentityService } from './identity/service.js';
 import { IdentityError } from './identity/types.js';
 import type { SessionPrincipal } from './identity/types.js';
 import { handleDocumentSync, type DocumentSyncService } from './sync-routes.js';
@@ -24,6 +24,7 @@ import {
 } from './assignment-routes.js';
 import type { AssignmentWorkService } from './assignments/work/types.js';
 import { AssignmentError } from './assignments/types.js';
+import { handleCanvasAssignmentReturn, isCanvasAssignmentReturnPath } from './assignment-return.js';
 
 const MIB = 1024 * 1024;
 export interface LocalIdentity {
@@ -426,11 +427,13 @@ export function createApi(options: ApiOptions) {
       }
       let identity: { tenantId: string; userId: string };
       let principal: SessionPrincipal | undefined;
+      let authenticated: AuthenticatedRequest | undefined;
+      const assignmentReturn = isCanvasAssignmentReturnPath(path);
       if (options.identityService) {
-        const authenticated = await options.identityService.authenticateRequest(req);
+        authenticated = await options.identityService.authenticateRequest(req);
         principal = authenticated.principal;
         if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? '')) {
-          options.identityService.verifyCsrf(req, authenticated);
+          if (!assignmentReturn) options.identityService.verifyCsrf(req, authenticated);
           if (['viewer', 'support'].includes(authenticated.principal.role))
             throw new ApiError(
               403,
@@ -463,6 +466,21 @@ export function createApi(options: ApiOptions) {
       limit(`user:${identity.tenantId}:${identity.userId}`, options.requestsPerMinute ?? 1200);
       if (path === '/api/assignments' || path.startsWith('/api/assignments/')) {
         routeName = '/api/assignments/:action';
+        if (
+          assignmentReturn &&
+          options.assignmentService &&
+          options.identityService &&
+          authenticated
+        ) {
+          await handleCanvasAssignmentReturn(
+            req,
+            res,
+            options.assignmentService,
+            options.identityService,
+            authenticated,
+          );
+          return;
+        }
         if (
           options.assignmentWorkService &&
           principal &&

@@ -2,12 +2,14 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type PoolConfig } from 'pg';
 import type { SessionPrincipal } from '../identity/types.js';
 import type { ArtifactIdentity, ArtifactReceipt } from '../cloud/types.js';
-import type { ReadyAssignmentSource } from '../assignments/types.js';
+import type { AssignmentSourceCandidate, ReadyAssignmentSource } from '../assignments/types.js';
 import type { KeyManagementProvider, WrappedDataKey } from '../encryption.js';
 import { encrypt, decrypt, newWrappedKey, unwrapKey, type Ciphertext } from '../sync/encryption.js';
 import { canonical } from '../sync/validation.js';
 import {
   IngestionError,
+  SOURCE_CATALOG_PAGE_SIZE,
+  type SourceCatalogPosition,
   type SourceReservationInput,
   type SourceReservation,
   type InspectionClaim,
@@ -855,7 +857,11 @@ export class PostgresIngestionRepository {
     return { r, j, stored, scan, pages };
   }
   /** Key-provider waits happen only after the encrypted row capture has committed. */
-  private async decodeReady({ r, j, stored, scan, pages }: ReadyRows): Promise<ReadyManifest> {
+  private async decodeReady({ r, j, stored, scan, pages }: ReadyRows): Promise<{
+    manifest: ReadyManifest;
+    name: string;
+    bytes: number;
+  }> {
     const expected = reservation(await this.open<PrivateReservation>('reservation', r, r)),
       object = receipt(await this.open<ArtifactReceipt>('storage', r, stored)),
       inspection = await this.open<{
@@ -908,13 +914,14 @@ export class PostgresIngestionRepository {
       encrypted: true,
       pageCount: decision.pageCount,
     };
-    return {
+    const manifest: ReadyManifest = {
       identity: identity(r),
       receipt: object,
       stateToken: stateToken(r, j, stored, scan, source, pages),
       source,
       ...(pageGeometry ? { pageGeometry } : {}),
     };
+    return { manifest, name: expected.metadata.name, bytes: expected.plaintextBytes };
   }
   async readyForTeacher(
     p: SessionPrincipal,
@@ -930,11 +937,109 @@ export class PostgresIngestionRepository {
       return r ? this.readyRows(c, r) : null;
     });
     if (!rows) return null;
-    const value = await this.decodeReady(rows);
+    const { manifest: value } = await this.decodeReady(rows);
     // Current teacher session and source authority are rechecked after all key I/O.
     return (await this.teacher(p, (c) => recheckReadyManifest(c, value.source, value.stateToken)))
       ? value
       : null;
+  }
+  /** Bounded discovery under the existing forced-RLS teacher scope. Never reads PDF objects.
+   * Capture encrypted rows, commit, authenticate metadata outside the transaction, then
+   * recheck current authority and every exact envelope before releasing candidate names.
+   */
+  async inspectedCatalogPage(
+    principal: SessionPrincipal,
+    after?: SourceCatalogPosition,
+    signal?: AbortSignal,
+  ): Promise<{ sources: AssignmentSourceCandidate[]; nextPosition: SourceCatalogPosition | null }> {
+    const p = { ...principal };
+    const position = after
+      ? { documentId: id(after.documentId), versionId: id(after.versionId) }
+      : null;
+    const check = () => {
+      if (signal?.aborted)
+        throw new IngestionError(
+          409,
+          'source_catalog_cancelled',
+          'Source discovery was interrupted.',
+        );
+    };
+    check();
+    const captured = await this.teacher(p, async (c, b) => {
+      check();
+      const rows = (
+        await c.query<Row>(
+          `SELECT a.* FROM margin_ingestion.artifacts a
+         JOIN margin_ingestion.inspection_jobs j ON j.artifact_id=a.artifact_id AND j.status='ready'
+         JOIN margin_ingestion.inspection_receipts s ON s.id=j.scan_receipt_id AND s.artifact_id=a.artifact_id AND s.verdict='ready' AND s.has_geometry
+         WHERE a.organization_id=$1 AND a.owner_id=$2 AND a.installation_id=$3 AND a.course_id=$4 AND a.revoked_at IS NULL
+         AND ($5::uuid IS NULL OR (a.document_id,a.version_id)>($5::uuid,$6::uuid))
+         ORDER BY a.document_id,a.version_id LIMIT $7`,
+          [
+            p.organizationId,
+            p.userId,
+            b.installation_id,
+            b.course_id,
+            position?.documentId ?? null,
+            position?.versionId ?? null,
+            SOURCE_CATALOG_PAGE_SIZE + 1,
+          ],
+        )
+      ).rows;
+      check();
+      const ready: ReadyRows[] = [];
+      for (const row of rows.slice(0, SOURCE_CATALOG_PAGE_SIZE)) {
+        check();
+        const value = await this.readyRows(c, row);
+        if (!value || !value.pages)
+          throw new IngestionError(
+            409,
+            'source_catalog_changed',
+            'Source inspection changed. Refresh the list.',
+          );
+        ready.push(value);
+      }
+      return { ready, hasMore: rows.length > SOURCE_CATALOG_PAGE_SIZE };
+    });
+    const decoded: Awaited<ReturnType<PostgresIngestionRepository['decodeReady']>>[] = [];
+    for (const rows of captured.ready) {
+      check();
+      decoded.push(await this.decodeReady(rows));
+    }
+    check();
+    await this.teacher(p, async (c) => {
+      for (const { manifest } of decoded) {
+        check();
+        if (
+          !manifest.pageGeometry ||
+          !(await recheckReadyManifest(c, manifest.source, manifest.stateToken))
+        )
+          throw new IngestionError(
+            409,
+            'source_catalog_changed',
+            'Source inspection changed. Refresh the list.',
+          );
+      }
+      check();
+    });
+    check();
+    const sources: AssignmentSourceCandidate[] = decoded.map(({ manifest, name, bytes }) => ({
+      documentId: manifest.source.documentId,
+      versionId: manifest.source.versionId,
+      name,
+      bytes,
+      pageCount: manifest.source.pageCount,
+      inspection: 'approved',
+      availability: 'not-checked',
+    }));
+    const last = sources.at(-1);
+    return {
+      sources,
+      nextPosition:
+        captured.hasMore && last
+          ? { documentId: last.documentId, versionId: last.versionId }
+          : null,
+    };
   }
   /** Only consume a token produced by authenticated readySnapshot; no remote I/O or key operation. */
   async recheckApproval(
@@ -964,7 +1069,7 @@ export class PostgresIngestionRepository {
       return this.readyRows(c, r);
     });
     if (!rows) return null;
-    const value = await this.decodeReady(rows);
+    const { manifest: value } = await this.decodeReady(rows);
     if (canonical(value.source) !== canonical(source)) return null;
     return (await this.recheckApproval(value.source, value.stateToken)) ? value : null;
   }

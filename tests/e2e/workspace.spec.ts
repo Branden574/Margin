@@ -26,6 +26,7 @@ test('creates a blank document, renames it, restores it from Trash and retains i
   page,
 }) => {
   await ready(page);
+  await navigate(page, 'My documents');
   await page.getByRole('button', { name: 'Blank document', exact: true }).click();
   await page.getByRole('textbox', { name: 'Document name' }).fill('Field journal');
   await page.getByRole('button', { name: 'Create document', exact: true }).click();
@@ -150,7 +151,7 @@ test('mobile navigation and settings remain operable without horizontal overflow
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
   await unlockWorkspace(page);
-  await expect(page.getByRole('heading', { name: /Welcome back/ })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /Ready for your next lesson/ })).toBeVisible();
   await page.getByRole('button', { name: 'Open navigation' }).click();
   await navigate(page, 'Settings');
   await expect(page.getByRole('heading', { name: 'Workspace settings' })).toBeVisible();
@@ -158,7 +159,9 @@ test('mobile navigation and settings remain operable without horizontal overflow
   await page.getByRole('button', { name: 'Save name' }).click();
   await page.getByRole('button', { name: 'Open navigation' }).click();
   await navigate(page, 'Home');
-  await expect(page.getByRole('heading', { name: 'Welcome back, Mobile.' })).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'Ready for your next lesson, Mobile?' }),
+  ).toBeVisible();
   const viewportWidth = await page.evaluate(() => ({
     total: document.documentElement.scrollWidth,
     visible: innerWidth,
@@ -171,8 +174,8 @@ test('a malformed URL fragment recovers to a usable workspace', async ({ page })
   page.on('pageerror', (error) => failures.push(error.message));
   await page.goto('/#%E0%A4%A');
   await unlockWorkspace(page);
-  await expect(page.getByRole('heading', { name: /Welcome back/ })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Upload document', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /Ready for your next lesson/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create assignment', exact: true })).toBeVisible();
   expect(failures).toEqual([]);
 });
 

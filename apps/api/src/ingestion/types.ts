@@ -5,6 +5,12 @@ import type {
   ReadArtifact,
 } from '../cloud/types.js';
 export type IngestionStatus = 'pending' | 'quarantined' | 'ready' | 'rejected';
+export const SOURCE_CATALOG_PAGE_SIZE = 5;
+export const SOURCE_CATALOG_TIMEOUT_MS = 25_000;
+export interface SourceCatalogPosition {
+  documentId: string;
+  versionId: string;
+}
 export interface SourceReservationInput {
   requestId: string;
   documentId: string;

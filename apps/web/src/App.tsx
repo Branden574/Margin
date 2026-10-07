@@ -63,6 +63,12 @@ export default function App() {
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [folders, setFolders] = useState<FolderRecord[]>([]);
   const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [boundCopyIds, setBoundCopyIds] = useState<ReadonlySet<string>>(new Set());
+  const [assignmentRequest, setAssignmentRequest] = useState<{
+    id?: string;
+    create?: boolean;
+    key: number;
+  }>({ key: 0 });
   const [preferences, setPreferences] = useState(defaults);
   const [loading, setLoading] = useState(true);
   const [fatal, setFatal] = useState('');
@@ -86,15 +92,17 @@ export default function App() {
   const refreshGeneration = useRef(0);
   const refresh = useCallback(async () => {
     const request = ++refreshGeneration.current;
-    const [d, f, a, p, u] = await Promise.all([
+    const [d, f, a, p, u, bound] = await Promise.all([
       db.listDocuments(),
       db.listFolders(),
       db.listAssignments(),
       db.getPreferences(),
       db.listUploadRecords(),
+      db.listAssignmentCopyIds(),
     ]);
     if (request !== refreshGeneration.current) return;
     setDocuments(d);
+    setBoundCopyIds(new Set(bound));
     setFolders(f);
     setAssignments(a);
     setPreferences(p);
@@ -608,6 +616,9 @@ export default function App() {
                   assignments={assignments}
                   documents={documents}
                   role={preferences.role}
+                  request={assignmentRequest}
+                  onRequestHandled={() => setAssignmentRequest({ key: 0 })}
+                  boundCopyIds={boundCopyIds}
                   onSave={async (a) => {
                     await db.saveAssignment(a);
                     await refresh();
@@ -630,6 +641,17 @@ export default function App() {
                   folders={folders}
                   search={search}
                   name={preferences.name}
+                  role={preferences.role}
+                  assignments={assignments}
+                  boundCopyIds={boundCopyIds}
+                  onCreateAssignment={() => {
+                    setAssignmentRequest((v) => ({ key: v.key + 1, create: true }));
+                    navigate('assignments');
+                  }}
+                  onAssignment={(id) => {
+                    setAssignmentRequest((v) => ({ key: v.key + 1, id }));
+                    navigate('assignments');
+                  }}
                   onOpen={open}
                   onUpload={() => show({ type: 'upload' })}
                   onNew={() => show({ type: 'new' })}

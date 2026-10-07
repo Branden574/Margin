@@ -38,6 +38,16 @@ For the initial Canvas resource binding, `prepareAvailability(source)` performs 
 
 This conservative implementation reads/decrypts the complete source to establish availability on each lookup. It is bounded but potentially expensive. It is not a cache, an S3 HEAD-only existence check, a proof of future availability, or a demonstrated design for 100,000 concurrent users. Production may introduce a carefully reviewed version-pinned availability verifier with equivalent security guarantees and revocation semantics, followed by real load measurements.
 
+## Inspected-source discovery
+
+`IngestionAssignmentSourceCatalog(runtime)` supplies the optional `AssignmentSourceCatalog` contract using the existing ingestion runtime credential. Its `list(principal, after?, {signal}?)` method returns at most five candidates owned by the current verified teacher in the current course. The browser-facing fields are `documentId`, `versionId`, `name`, `pageCount`, `bytes`, `inspection: 'approved'` and **`availability: 'not-checked'`**, plus a nullable `nextCursor` for the page. Storage identifiers, hashes, object receipts, scan details and owner/tenant identities are withheld.
+
+Discovery authenticates the encrypted reservation, exact storage receipt, terminal inspection and scan-bound page geometry; pending, quarantined, rejected, revoked and legacy geometryless sources are excluded. It captures bounded encrypted rows in one short transaction, performs key-provider work after that transaction commits, then rechecks current session/course/owner authority and the exact authenticated envelope state before releasing names. It performs no object read. An authenticated database approval is a candidate for assignment creation, not evidence that the PDF remains accessible; `AssignmentService.create()` still performs the existing exact-object verification.
+
+Pagination is ordered by immutable document/version IDs. The base64url cursor is only a position, never a scope or authorization capability, and is limited to 128 characters. Every page independently derives scope from the current session. Catalog calls have a 25-second deadline and two concurrent slots per instance; a timed-out underlying call retains its slot until it settles. Existing SQL/key-provider bounds remain in force. Missing configuration and failed authentication return errors rather than a fabricated empty catalog. No new migration, scanner, upload bridge or cloud configuration is installed by this feature.
+
+`tests/assignment-source-catalog.test.ts`, `.http.test.ts` and `.postgres.test.ts` cover the deadline/admission boundary, authenticated HTTPS query/output contract, actual forced-RLS teacher/peer/course/tenant separation, encrypted metadata, keyset pagination, legacy/unsafe exclusions, ciphertext tampering and revocation during key-provider waits. The disposable fixtures use explicitly synthetic receipts and inspection results; they establish no live scanner, S3 or Canvas readiness.
+
 ## Database and credential boundaries
 
 Apply `infra/migrations/005-ingestion.sql` with the migration owner after migrations 001–003. It creates no users, documents, credentials or ready records. It can coexist with assignment migration 004. Use distinct service logins inheriting exactly one ingestion group:

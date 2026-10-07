@@ -12,6 +12,7 @@ export type VaultStore =
   | 'assignment-baseline'
   | 'assignment-outbox'
   | 'assignment-receipts'
+  | 'author-drafts'
   | 'ocr'
   | 'assignments'
   | 'uploads'

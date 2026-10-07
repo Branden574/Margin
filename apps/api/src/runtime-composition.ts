@@ -13,6 +13,7 @@ import {
   AssignmentService,
   PostgresAssignmentRepository,
   type AssignmentSourceGateway,
+  type AssignmentSourceCatalog,
 } from './assignments/index.js';
 import { PostgresAssignmentWorkService } from './assignments/work/index.js';
 import type { KeyManagementProvider } from './encryption.js';
@@ -30,6 +31,8 @@ export interface CanvasRuntimeDependencies {
   keys: KeyManagementProvider;
   artifacts: ArtifactReader;
   sources: AssignmentSourceGateway;
+  /** Optional metadata-only inspected-source discovery. Absence leaves the catalog unavailable. */
+  sourceCatalog?: AssignmentSourceCatalog;
   signer: AssignmentDeepLinkSigner;
   /** Synthetic transport remains restricted by createIdentityService to NODE_ENV=test. */
   oidcTests?: OidcTestOptions;
@@ -84,7 +87,8 @@ export async function createCanvasRuntime(
     return copied;
   };
   try {
-    const { keys, artifacts, sources, signer, resolveLmsKey, oidcTests } = dependencies;
+    const { keys, artifacts, sources, sourceCatalog, signer, resolveLmsKey, oidcTests } =
+      dependencies;
     if (
       !keys?.wrapKey ||
       !keys.unwrapKey ||
@@ -131,6 +135,7 @@ export async function createCanvasRuntime(
       authorizer: lmsRepository,
       installations: lmsRepository,
       sources,
+      sourceCatalog,
       signer,
       resourceHmacKey: resourceKey,
     });

@@ -175,3 +175,27 @@ Used the normally trusted in-app HTTPS tab and the existing local vault. A tempo
 - Stopped the synthetic service and restored the normal development API. Left the existing library unlocked at `/#home`; its 17 documents include the synthetic coursework copy. No real student content was used.
 
 Evidence: `.local/manual-checks/canvas-student-synced-oct7.png` and `.local/manual-checks/canvas-library-guidance-oct7.png`. Receipt loss, revoked-session recovery and stale cross-tab draft discard have automated regressions but were not manually reproduced in this walkthrough. Browser download delivery, physical-device behavior, live Canvas submission/grades and hosted performance remain separate open checks.
+
+## Distinct local teacher and student dashboards — October 7, 2026
+
+Used the existing normally trusted HTTPS in-app browser and local encrypted workspace. The teacher Home now has a teaching queue, draft/review/ready counts, class groups and a Create assignment shortcut. The student Home has an upcoming-work/feedback queue, to-do/feedback/submitted counts and subjects. These are local presentation preferences; changing the preference does not grant server permissions or connect a school.
+
+- Created **Synthetic role-view QA — teacher draft** from the teacher Home shortcut using the existing synthetic reading document. The required date prevented an incomplete submission; entering October 14 allowed the encrypted draft to save. Its teacher Home count became one and its queue entry appeared. The Canvas-bound document was absent from the source dropdown.
+- Changed Workspace view to Student. The draft and its teacher-only class were absent from Home and Assignments. The existing returned synthetic assignment appeared with a feedback count of one. Its Home shortcut opened the right assignment and showed the previously saved teacher feedback. No Create assignment action or Draft filter appeared.
+- Restored Teacher. Navigating back to Assignments did not replay the consumed create/details shortcut or reopen a stale modal. The synthetic draft remains available for further local verification.
+- The saved **Synthetic Canvas coursework** remained in the library with **Canvas-linked · open from Canvas** guidance and disabled bulk-selection checkbox, and was absent from the Home recent-document shortcuts. Its encrypted contents were retained.
+
+Screenshots: `.local/manual-checks/teacher-dashboard-oct7.png` and `.local/manual-checks/student-dashboard-oct7.png`. This checks the observed local dashboard paths, not live Canvas enrollment, account authorization, roster counts or remote assignment delivery. New remote browser regressions cover reload, queue order, accessibility and generic bound-document actions separately.
+
+## Teacher assignment setup and interrupted-create recovery — October 7, 2026
+
+Used `/canvas/author` in the normally trusted in-app HTTPS browser with the existing encrypted vault. A temporary loopback HTTPS wrapper used `tests/fixtures/canvas-author-service.ts`, six synthetic source metadata rows and a synthetic teacher selection. It deliberately returned an error after retaining the first created assignment. This exercised the real browser UI, transport and encrypted draft store; it did not exercise live Canvas authentication, the real catalog database or actual source inspection.
+
+- Navigated to source page two, chose **Synthetic worksheet 6.pdf**, entered a title and instructions, and disabled Draw. Returning to page one retained the selected source summary and all details.
+- Waited for **Draft saved on this device**, reloaded and unlocked. Source, title, instructions and tool policy returned unchanged.
+- **Create assignment** encountered the deliberate interrupted response. The screen displayed the failure and **Confirm your saved request**; editing and cancellation stayed disabled while **Confirm saved assignment** was available.
+- Reloaded and unlocked again. The pending request remained frozen with the original details. Confirming reached **Ready for Canvas review** and enabled **Return to Canvas**. Exact request identity and absence of duplicate records are checked by separate fixture assertions; browser appearance alone does not prove those database properties.
+- Explicitly chose **Return to Canvas**. A top-level native form navigation reached the synthetic receiver, which displayed **Synthetic Canvas selection received** and **This fixture is not a real Canvas publication.** No remote school received content.
+- Stopped the fixture, restored the ordinary development API, and returned to the unlocked teacher Home. Encrypted draft records and local documents were retained.
+
+Screenshots: `.local/manual-checks/canvas-author-draft-oct7.png`, `.local/manual-checks/canvas-author-retry-oct7.png` and `.local/manual-checks/canvas-author-confirmed-oct7.png`. Real Canvas publication, cancellation delivery, multi-tab timing, physical devices and production capacity remain separate checks. Persisted prepared requests are deliberately immutable even after a definite rejection in one tab: another tab may already have committed the same request.

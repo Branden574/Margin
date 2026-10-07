@@ -9,7 +9,8 @@ import {
 export type CanvasAssignmentService = Pick<
   AssignmentService,
   'create' | 'currentSelection' | 'currentAssignment' | 'completeDeepLink' | 'reserveStudentWork'
->;
+> &
+  Partial<Pick<AssignmentService, 'listSources'>>;
 
 /** Source receipts and infrastructure identities are never part of the editor's assignment view. */
 function publicAssignment(record: AssignmentRecord | null) {
@@ -123,12 +124,29 @@ export async function handleCanvasAssignments(
   if ((req.url?.length ?? 0) > 8192)
     throw new AssignmentError(414, 'request_too_large', 'The assignment request is too large.');
   const url = new URL(req.url ?? '/', 'https://localhost');
-  if (url.search)
+  const catalog = url.pathname === '/api/assignments/sources';
+  if (url.search && !catalog)
     throw new AssignmentError(
       400,
       'invalid_query',
       'Assignment routes do not accept query parameters.',
     );
+  let after: string | undefined;
+  if (catalog) {
+    for (const [key, value] of url.searchParams) {
+      if (
+        key !== 'after' ||
+        url.searchParams.getAll(key).length !== 1 ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(value)
+      )
+        throw new AssignmentError(
+          400,
+          'invalid_source_cursor',
+          'Use only the source cursor returned by discovery.',
+        );
+      after = value;
+    }
+  }
   const response = (status: number, value: unknown) => {
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(value));
@@ -136,7 +154,8 @@ export async function handleCanvasAssignments(
   const complete = /^\/api\/assignments\/selections\/([a-f0-9-]{36})\/complete$/i.exec(
     url.pathname,
   );
-  const get = ['/api/assignments/selection', '/api/assignments/current'].includes(url.pathname);
+  const get =
+    catalog || ['/api/assignments/selection', '/api/assignments/current'].includes(url.pathname);
   const post =
     ['/api/assignments', '/api/assignments/work'].includes(url.pathname) || Boolean(complete);
   if (!get && !post)
@@ -160,7 +179,52 @@ export async function handleCanvasAssignments(
         'body_not_allowed',
         'Assignment reads do not accept request bodies.',
       );
-    if (url.pathname === '/api/assignments/selection')
+    if (catalog) {
+      if (principal.role !== 'teacher')
+        throw new AssignmentError(
+          403,
+          'teacher_required',
+          'Source discovery requires a verified teacher course session.',
+        );
+      if (!service.listSources)
+        throw new AssignmentError(
+          503,
+          'source_catalog_unconfigured',
+          'Inspected source discovery is not configured.',
+        );
+      const controller = new AbortController();
+      const aborted = () => controller.abort();
+      req.once('aborted', aborted);
+      res.once('close', aborted);
+      const timeout = setTimeout(aborted, 30_000);
+      try {
+        const page = await service.listSources(principal, after, { signal: controller.signal });
+        if (controller.signal.aborted || res.destroyed)
+          throw new AssignmentError(
+            409,
+            'source_catalog_cancelled',
+            'Source discovery was interrupted.',
+          );
+        // Deliberate allowlist: injected service implementation fields cannot leak
+        // storage receipts, artifact identity, hashes or infrastructure URLs.
+        response(200, {
+          sources: page.sources.map((source) => ({
+            documentId: source.documentId,
+            versionId: source.versionId,
+            name: source.name,
+            pageCount: source.pageCount,
+            bytes: source.bytes,
+            inspection: source.inspection,
+            availability: source.availability,
+          })),
+          nextCursor: page.nextCursor,
+        });
+      } finally {
+        clearTimeout(timeout);
+        req.removeListener('aborted', aborted);
+        res.removeListener('close', aborted);
+      }
+    } else if (url.pathname === '/api/assignments/selection')
       response(200, { selection: await service.currentSelection(principal) });
     else
       response(200, { assignment: publicAssignment(await service.currentAssignment(principal)) });

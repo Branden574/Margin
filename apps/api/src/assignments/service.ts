@@ -9,6 +9,7 @@ import {
   type AssignmentRecord,
   type AssignmentRepository,
   type AssignmentSourceGateway,
+  type AssignmentSourceCatalog,
   type DeepLinkSelection,
   type VerifiedAssignmentLaunch,
 } from './types.js';
@@ -17,6 +18,7 @@ export interface AssignmentServiceOptions {
   authorizer: AssignmentAuthorizer;
   installations: InstallationRepository;
   sources?: AssignmentSourceGateway;
+  sourceCatalog?: AssignmentSourceCatalog;
   signer?: AssignmentDeepLinkSigner;
   /** Independent 32-byte server key; not the session, vault or LMS subject lookup key. */
   resourceHmacKey: Uint8Array;
@@ -57,6 +59,44 @@ export class AssignmentService {
         'source_unavailable',
         'The assignment source is unavailable or no longer approved. Contact your teacher.',
       );
+  }
+  /** Catalog metadata is advisory. create() still authenticates actual source-object availability. */
+  async listSources(
+    principal: SessionPrincipal,
+    after?: string,
+    options: { signal?: AbortSignal } = {},
+  ) {
+    const p = { ...principal },
+      enrollment = await this.course(p, 'teacher');
+    if (!this.options.sourceCatalog)
+      throw new AssignmentError(
+        503,
+        'source_catalog_unconfigured',
+        'Inspected source discovery is not configured.',
+      );
+    const page = await this.options.sourceCatalog.list(p, after, options);
+    const current = await this.course(p, 'teacher');
+    if (
+      current.installationId !== enrollment.installationId ||
+      current.registrationVersion !== enrollment.registrationVersion ||
+      current.organizationId !== enrollment.organizationId ||
+      current.userId !== enrollment.userId ||
+      current.courseId !== enrollment.courseId ||
+      current.subjectDigest !== enrollment.subjectDigest ||
+      current.courseDigest !== enrollment.courseDigest
+    )
+      throw new AssignmentError(
+        403,
+        'course_access_changed',
+        'Course access changed. Launch again from Canvas.',
+      );
+    if (options.signal?.aborted)
+      throw new AssignmentError(
+        409,
+        'source_catalog_cancelled',
+        'Source discovery was interrupted.',
+      );
+    return page;
   }
   async create(principal: SessionPrincipal, value: unknown): Promise<AssignmentRecord> {
     const enrollment = await this.course(principal, 'teacher'),

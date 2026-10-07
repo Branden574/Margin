@@ -17,7 +17,8 @@ import {
   ArrowRight,
   Trash2,
 } from 'lucide-react';
-import type { DocumentRecord, FolderRecord } from '@margin/core';
+import type { Assignment, DocumentRecord, FolderRecord, Preferences } from '@margin/core';
+import { RoleHome } from './RoleHome';
 import type { Page } from './Sidebar';
 import { DocumentCover } from './DocumentCover';
 import { fileSize, relativeDate } from '../lib/format';
@@ -36,6 +37,11 @@ interface Props {
   folders: FolderRecord[];
   search: string;
   name: string;
+  role: Preferences['role'];
+  assignments: Assignment[];
+  boundCopyIds: ReadonlySet<string>;
+  onCreateAssignment: () => void;
+  onAssignment: (id: string) => void;
   onOpen: (doc: DocumentRecord) => void;
   onUpload: () => void;
   onNew: () => void;
@@ -51,6 +57,11 @@ export function Library({
   folders,
   search,
   name,
+  role,
+  assignments,
+  boundCopyIds,
+  onCreateAssignment,
+  onAssignment,
   onOpen,
   onUpload,
   onNew,
@@ -84,7 +95,10 @@ export function Library({
           (filter === 'mine' ? d.source !== 'sample' : d.source === 'sample')),
     )
     .sort((a, b) => (sort === 'recent' ? b.updatedAt - a.updatedAt : a.name.localeCompare(b.name)));
-  const recent = visible.slice(0, 4);
+  const recent = visible
+    .filter((d) => !boundCopyIds.has(d.id))
+    .slice(0, role === 'teacher' ? 4 : 2);
+  const selectable = visible.filter((d) => !boundCopyIds.has(d.id));
   const titles: Partial<Record<Page, string>> = {
     home: `Welcome back, ${name.split(' ')[0]}.`,
     documents: 'My documents',
@@ -117,19 +131,24 @@ export function Library({
   }
   const docMenu = (doc: DocumentRecord) => (
     <div className="document-menu" role="menu">
-      {(page === 'trash'
+      {(boundCopyIds.has(doc.id)
         ? [
-            ['restore', 'Restore document'],
-            ['delete', 'Delete permanently'],
-          ]
-        : [
             ['rename', 'Rename'],
             ['move', 'Move to folder'],
-            ['duplicate', 'Make a copy'],
-            ['download', 'Export encrypted original'],
-            ['sync', 'Upload encrypted copy'],
-            ['trash', 'Move to trash'],
           ]
+        : page === 'trash'
+          ? [
+              ['restore', 'Restore document'],
+              ['delete', 'Delete permanently'],
+            ]
+          : [
+              ['rename', 'Rename'],
+              ['move', 'Move to folder'],
+              ['duplicate', 'Make a copy'],
+              ['download', 'Export encrypted original'],
+              ['sync', 'Upload encrypted copy'],
+              ['trash', 'Move to trash'],
+            ]
       ).map(([key, label]) => (
         <button
           key={key}
@@ -148,25 +167,37 @@ export function Library({
   );
   return (
     <div className="library-page" onClick={() => menu && setMenu(null)}>
-      <div className="page-heading">
-        <div>
-          {isHome && <div className="eyebrow">YOUR SPACE TO LEARN</div>}
-          <h1>{title}</h1>
-          <p>{desc}</p>
-        </div>
-        {page !== 'trash' && (
-          <div className="heading-actions">
-            <button className="button secondary" onClick={onNew}>
-              <Plus size={16} />
-              Blank document
-            </button>
-            <button className="button primary" onClick={onUpload}>
-              <Upload size={16} />
-              Upload document
-            </button>
+      {isHome ? (
+        <RoleHome
+          role={role}
+          name={name}
+          assignments={assignments}
+          onAssignment={onAssignment}
+          onCreate={onCreateAssignment}
+          onAssignments={() => onNavigate('assignments')}
+          onDocuments={() => onNavigate('documents')}
+        />
+      ) : (
+        <div className="page-heading">
+          <div>
+            {isHome && <div className="eyebrow">YOUR SPACE TO LEARN</div>}
+            <h1>{title}</h1>
+            <p>{desc}</p>
           </div>
-        )}
-      </div>
+          {page !== 'trash' && (
+            <div className="heading-actions">
+              <button className="button secondary" onClick={onNew}>
+                <Plus size={16} />
+                Blank document
+              </button>
+              <button className="button primary" onClick={onUpload}>
+                <Upload size={16} />
+                Upload document
+              </button>
+            </div>
+          )}
+        </div>
+      )}
       {isHome && (
         <>
           <section className="recent-section" aria-label="Recent documents">
@@ -312,7 +343,7 @@ export function Library({
               className="text-button"
               onClick={() => {
                 visible
-                  .filter((d) => selected.has(d.id))
+                  .filter((d) => selected.has(d.id) && !boundCopyIds.has(d.id))
                   .forEach((d) => onAction(page === 'trash' ? 'restore' : 'trash', d));
                 setSelected(new Set());
               }}
@@ -382,9 +413,13 @@ export function Library({
                     {menu === doc.id && docMenu(doc)}
                   </div>
                   <p>
-                    {isTemplate
-                      ? 'Make your own copy'
-                      : `${doc.pageCount} pages · ${relativeDate(doc.updatedAt)}`}
+                    {isTemplate ? (
+                      'Make your own copy'
+                    ) : boundCopyIds.has(doc.id) ? (
+                      <span className="canvas-copy-label">Canvas-linked · open from Canvas</span>
+                    ) : (
+                      `${doc.pageCount} pages · ${relativeDate(doc.updatedAt)}`
+                    )}
                   </p>
                 </div>
               </article>
@@ -399,10 +434,10 @@ export function Library({
                     <input
                       type="checkbox"
                       aria-label="Select all documents"
-                      checked={visible.length > 0 && visible.every((d) => selected.has(d.id))}
+                      checked={selectable.length > 0 && selectable.every((d) => selected.has(d.id))}
                       onChange={(e) =>
                         setSelected(
-                          e.target.checked ? new Set(visible.map((d) => d.id)) : new Set(),
+                          e.target.checked ? new Set(selectable.map((d) => d.id)) : new Set(),
                         )
                       }
                     />
@@ -423,6 +458,7 @@ export function Library({
                       <input
                         type="checkbox"
                         aria-label={`Select ${doc.name}`}
+                        disabled={boundCopyIds.has(doc.id)}
                         checked={selected.has(doc.id)}
                         onChange={() => toggle(doc.id)}
                       />
@@ -435,7 +471,13 @@ export function Library({
                         <span>
                           {doc.name}
                           <small>
-                            PDF document{' '}
+                            {boundCopyIds.has(doc.id) ? (
+                              <span className="canvas-copy-label">
+                                Canvas-linked · open from Canvas
+                              </span>
+                            ) : (
+                              'PDF document'
+                            )}{' '}
                             {doc.source === 'sample' && <span className="sample-tag">SAMPLE</span>}
                           </small>
                         </span>

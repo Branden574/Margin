@@ -69,6 +69,12 @@ function notify(change: DataChange) {
 export function notifyAssignmentChange(documentId: string) {
   notify({ entity: 'document', id: documentId });
 }
+/** Authenticated local navigation hints, not authorization to open a Canvas assignment. */
+export async function listAssignmentCopyIds(): Promise<string[]> {
+  return (await listVaultRecords<{ localDocumentId: string }>('assignment-bindings'))
+    .filter((row) => row.key === row.value.localDocumentId)
+    .map((row) => row.key);
+}
 /** Navigation hint only; current Canvas launch verification remains required. */
 export async function isAssignmentCopy(documentId: string): Promise<boolean> {
   return (await readVaultRecord('assignment-bindings', documentId)) !== undefined;

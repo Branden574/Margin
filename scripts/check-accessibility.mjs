@@ -46,7 +46,7 @@ try {
   await page.getByLabel('Workspace passphrase', { exact: true }).fill('test-only-a11y-passphrase');
   await page.getByLabel('Confirm passphrase', { exact: true }).fill('test-only-a11y-passphrase');
   await page.getByRole('button', { name: 'Create private workspace', exact: true }).click();
-  await page.getByRole('heading', { name: 'Welcome back, Alex.' }).waitFor();
+  await page.getByRole('heading', { name: 'Ready for your next lesson, Alex?' }).waitFor();
   for (const theme of ['Light', 'Dark', 'High contrast']) {
     await page.locator('.sidebar').getByRole('button', { name: 'Settings', exact: true }).click();
     await page.getByRole('button', { name: theme, exact: true }).click();
@@ -71,7 +71,7 @@ try {
       await check(`vault-after-${theme}`);
       await page.locator('input[name=passphrase]').fill('test-only-a11y-passphrase');
       await page.getByRole('button', { name: 'Unlock workspace', exact: true }).click();
-      await page.getByRole('heading', { name: 'Welcome back, Alex.' }).waitFor();
+      await page.getByRole('heading', { name: 'Ready for your next lesson, Alex?' }).waitFor();
     }
   }
 } finally {

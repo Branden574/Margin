@@ -43,7 +43,7 @@ try {
   await page.locator('input[name=passphrase]').fill(passphrase);
   await page.locator('input[name=confirm]').fill(passphrase);
   await page.getByRole('button', { name: 'Create private workspace' }).click();
-  await page.getByRole('heading', { name: 'Welcome back, Alex.' }).waitFor();
+  await page.getByRole('heading', { name: 'Ready for your next lesson, Alex?' }).waitFor();
   await page.evaluate(async () => {
     await Promise.race([
       navigator.serviceWorker.ready,
@@ -111,6 +111,7 @@ try {
   assert.equal(await page.locator('.editor-error').count(), 0);
   await page.screenshot({ path: '/tmp/margin-offline-encrypted-editor.png', fullPage: true });
   await page.getByRole('button', { name: 'Back to workspace', exact: true }).click();
+  await page.locator('.sidebar').getByRole('button', { name: 'My documents', exact: true }).click();
   await page.getByRole('button', { name: 'Blank document', exact: true }).click();
   await page
     .getByRole('textbox', { name: 'Document name', exact: true })

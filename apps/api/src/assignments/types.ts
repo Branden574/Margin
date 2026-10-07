@@ -53,6 +53,27 @@ export interface AssignmentSourceGateway {
   /** Object I/O occurs here, outside assignment transactions. Returned one-use check is short-lived and DB-only. */
   prepareAvailability(source: ReadyAssignmentSource): Promise<PreparedAssignmentSourceCheck | null>;
 }
+/** Discovery only. A current inspected database record is not proof that its object is available. */
+export interface AssignmentSourceCandidate {
+  documentId: string;
+  versionId: string;
+  name: string;
+  pageCount: number;
+  bytes: number;
+  inspection: 'approved';
+  availability: 'not-checked';
+}
+export interface AssignmentSourceCatalogPage {
+  sources: AssignmentSourceCandidate[];
+  nextCursor: string | null;
+}
+export interface AssignmentSourceCatalog {
+  list(
+    principal: SessionPrincipal,
+    after?: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<AssignmentSourceCatalogPage>;
+}
 export interface AssignmentRecord {
   id: string;
   organizationId: string;
