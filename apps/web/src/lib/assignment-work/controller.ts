@@ -5,6 +5,7 @@ import { canonical } from './mapping';
 import {
   createAssignmentWorkClient,
   readVerifiedSnapshot,
+  readVerifiedSubmissionRequest,
   type AssignmentWorkClient,
   type VerifiedAssignmentSnapshot,
 } from './client';
@@ -17,6 +18,9 @@ import {
   markAssignmentOutcome,
   prepareAssignmentSend,
   readAssignmentSnapshot,
+  prepareSubmission,
+  recordSubmissionOutcome,
+  continueAssignmentDraft,
 } from './repository';
 import { AssignmentRetryError, type AssignmentSnapshot } from './repositoryTypes';
 import { RequestScope } from './transport';
@@ -58,6 +62,7 @@ function invalidates(reason: unknown) {
       'session_changed',
       'session_expired',
       'work_changed',
+      'work_unavailable',
       'student_launch_required',
       'invalid_session',
     ].includes(e?.code)
@@ -79,6 +84,10 @@ class Controller implements StudentWorkController {
     view: null,
     saveStatus: 'none',
     submission: 'not-submitted',
+    submissionAvailability: 'unknown',
+    submissionRecord: null,
+    submissionHistory: [],
+    submissionError: null,
     needsCatchUp: false,
     localSaving: false,
     localError: null,
@@ -193,6 +202,11 @@ class Controller implements StudentWorkController {
       localError: null,
       reconciledOperationId: null,
       error: reason ? issue(reason) : null,
+      submission: 'not-submitted',
+      submissionAvailability: 'unknown',
+      submissionRecord: null,
+      submissionHistory: [],
+      submissionError: null,
     });
   }
   dispose = () => this.close('disposed');
@@ -284,6 +298,13 @@ class Controller implements StudentWorkController {
             : statuses.length || snapshot.binding.appliedCursor > 0
               ? 'acknowledged'
               : 'none',
+      submissionRecord: snapshot.submission,
+      submission:
+        (snapshot.submission?.outcome?.state === 'captured' &&
+          snapshot.submission.outcome.submission.phase === 'confirmed') ||
+        this.state.submissionHistory.some((s) => s.phase === 'confirmed')
+          ? 'confirmed'
+          : 'not-submitted',
     });
   }
   private async read(action: Action) {
@@ -401,6 +422,8 @@ class Controller implements StudentWorkController {
     readVerifiedSnapshot(verified);
     if (sequence === this.snapshotSequence) this.display(snapshot, action);
     await this.recover(action, verified);
+    action.check();
+    await this.loadSubmissions(action);
     action.check();
     this.publish({ phase: 'ready' });
   }
@@ -594,6 +617,164 @@ class Controller implements StudentWorkController {
   }
   sync = () => this.run('syncing', (action) => this.send(action));
   retry = (operationId: string) => this.run('syncing', (action) => this.send(action, operationId));
+
+  private async loadSubmissions(action: Action) {
+    try {
+      const history = await this.client.submissions({}, { signal: action.scope.controller.signal });
+      action.check();
+      this.publish({
+        submissionAvailability: 'available',
+        submissionHistory: history.submissions,
+        submissionError: null,
+        submission: history.submissions.some((s) => s.phase === 'confirmed')
+          ? 'confirmed'
+          : 'not-submitted',
+      });
+      const snapshot = await this.read(action);
+      if (snapshot.submission) {
+        try {
+          const verified = await this.client.submissionRequest(
+            snapshot.submission.request.requestId,
+            { signal: action.scope.controller.signal },
+          );
+          action.check();
+          const target = this.target();
+          await recordSubmissionOutcome(
+            target.id,
+            target.revision,
+            verified,
+            action.scope.controller.signal,
+          );
+          await this.read(action);
+        } catch (reason) {
+          action.check();
+          if ((reason as AssignmentWorkClientError).status !== 404) throw reason;
+          // Prepared locally does not imply dispatched. Preserve the exact request for explicit retry.
+        }
+      }
+    } catch (reason) {
+      action.check();
+      if (invalidates(reason)) throw reason;
+      if (this.provenance) {
+        try {
+          readVerifiedSnapshot(this.provenance);
+        } catch (verificationError) {
+          if (invalidates(verificationError)) throw verificationError;
+        }
+      }
+      this.publish({
+        submissionAvailability:
+          issue(reason).code === 'submission_unconfigured' ? 'unavailable' : 'unknown',
+        submissionError: issue(reason),
+      });
+    }
+  }
+  checkSubmissionStatus = () =>
+    this.run('syncing', async (action) => {
+      await action.scope.wait(this.flushLocal());
+      action.check();
+      await this.loadSubmissions(action);
+      this.publish({ phase: 'ready' });
+    });
+  submit = () =>
+    this.run('syncing', async (action) => {
+      await action.scope.wait(this.flushLocal());
+      action.check();
+      let snapshot = await this.read(action);
+      if (snapshot.submission?.outcome?.state === 'captured')
+        throw fail(
+          'submission_already_captured',
+          'This submission version is already saved. Check its delivery status.',
+        );
+      if (!snapshot.submission?.barrier) {
+        await this.loadSubmissions(action);
+        action.check();
+        if (this.state.submissionAvailability !== 'available')
+          throw fail(
+            'submission_unavailable',
+            'Submission is not available right now. Your saved work is kept.',
+          );
+        if (this.state.submissionHistory.length)
+          throw fail(
+            'submission_already_captured',
+            'A submission version already exists. Further attempts are not available yet.',
+          );
+        await this.send(action);
+        action.check();
+        snapshot = await this.read(action);
+        if (
+          snapshot.pending.length ||
+          !snapshot.binding.hydrated ||
+          snapshot.binding.appliedCursor !== snapshot.binding.observedCursor ||
+          this.state.needsCatchUp ||
+          this.localPending ||
+          this.localFailures.size
+        )
+          throw fail(
+            'submission_sync_required',
+            'Continue syncing all saved edits before submitting. No submission request was created.',
+          );
+        const verified = await this.verify(action);
+        const target = this.target();
+        await prepareSubmission(
+          target.id,
+          target.revision,
+          verified,
+          { requestId: crypto.randomUUID(), expectedCursor: snapshot.binding.appliedCursor },
+          action.scope.controller.signal,
+        );
+        snapshot = await this.read(action);
+      }
+      const record = snapshot.submission;
+      if (!record?.barrier)
+        throw fail('submission_request_missing', 'Prepare a saved submission request first.');
+      const outcome = await this.client.captureSubmission(record.request, {
+        signal: action.scope.controller.signal,
+      });
+      action.check();
+      const target = this.target();
+      await recordSubmissionOutcome(
+        target.id,
+        target.revision,
+        outcome,
+        action.scope.controller.signal,
+      );
+      await this.read(action);
+      const request = readVerifiedSubmissionRequest(outcome).request;
+      if (request.state === 'captured') this.publish({ submissionHistory: [request.submission] });
+      this.publish({ phase: 'ready', submissionError: null });
+    });
+  continueDraft = () =>
+    this.run('syncing', async (action) => {
+      await action.scope.wait(this.flushLocal());
+      action.check();
+      const snapshot = await this.read(action),
+        target = this.target();
+      if (!snapshot.submission?.barrier)
+        throw fail(
+          'submission_barrier_missing',
+          'There is no paused submission request to continue.',
+        );
+      const verified = await this.client.submissionRequest(snapshot.submission.request.requestId, {
+        signal: action.scope.controller.signal,
+      });
+      action.check();
+      await recordSubmissionOutcome(
+        target.id,
+        target.revision,
+        verified,
+        action.scope.controller.signal,
+      );
+      await continueAssignmentDraft(
+        target.id,
+        target.revision,
+        verified,
+        action.scope.controller.signal,
+      );
+      await this.read(action);
+      await this.recover(action, readVerifiedSubmissionRequest(verified).verified);
+      this.publish({ phase: 'ready', submissionError: null });
+    });
 }
 
 export function createStudentWorkController(

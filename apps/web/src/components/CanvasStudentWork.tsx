@@ -11,6 +11,7 @@ import {
 import { ArrowLeft, Loader2, LockKeyhole, RefreshCw } from 'lucide-react';
 import type { AnnotationTool, DocumentRecord } from '@margin/core';
 import { Brand } from './Brand';
+import { CanvasSubmissionStatus } from './CanvasSubmissionStatus';
 import { createStudentWorkController } from '../lib/assignment-work/controller';
 import type { StudentWorkController } from '../lib/assignment-work/controllerTypes';
 import { readAssignmentSnapshot } from '../lib/assignment-work/repository';
@@ -214,7 +215,11 @@ function StudentWorkSession({ controller }: { controller: StudentWorkController 
         <p role="status">
           {changed && !busy ? 'Newer saved work is available. Refresh before editing.' : status}
         </p>
-        <small>Not submitted to Canvas</small>
+        <small>
+          {state.submission === 'confirmed'
+            ? 'Canvas submission confirmed'
+            : 'Not submitted to Canvas'}
+        </small>
         {state.view?.assignment.instructions && (
           <details className="canvas-work-instructions">
             <summary>Assignment instructions</summary>
@@ -298,6 +303,13 @@ function StudentWorkSession({ controller }: { controller: StudentWorkController 
           Discard unsaved changes and refresh
         </button>
       )}
+      <CanvasSubmissionStatus
+        state={state}
+        disabled={busy || networkBusy || terminal}
+        submit={() => void perform(() => controller.submit())}
+        check={() => void perform(() => controller.checkSubmissionStatus())}
+        continueDraft={() => void perform(() => controller.continueDraft())}
+      />
     </section>
   );
 
@@ -319,7 +331,13 @@ function StudentWorkSession({ controller }: { controller: StudentWorkController 
           assignment={{
             persistence,
             allowedTools: state.view.assignment.policy.allowedTools as readonly AnnotationTool[],
-            readOnly: busy || networkBusy || changed || state.saveStatus === 'conflict',
+            readOnly:
+              busy ||
+              networkBusy ||
+              changed ||
+              state.needsCatchUp ||
+              state.saveStatus === 'conflict' ||
+              !!state.submissionRecord?.barrier,
             controls,
           }}
         />

@@ -37,11 +37,15 @@ export async function withAssignmentWorkRuntimeMembership(
   );
 }
 
-async function withAssignmentRoleMembership(
+export async function withAssignmentRoleMembership(
   admin: Pool,
   config: PoolConfig,
   runtimeGroup: string,
-  privileged: 'margin_assignment_provisioner' | 'margin_assignment_work_runtime',
+  privileged:
+    | 'margin_assignment_provisioner'
+    | 'margin_assignment_work_runtime'
+    | 'margin_submission_runtime'
+    | 'margin_submission_retention_guard',
   inherit: boolean,
   check: (unsafe: PoolConfig) => Promise<void>,
 ) {

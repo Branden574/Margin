@@ -1,6 +1,7 @@
 import type { Annotation, AnnotationOperation, DocumentRecord } from '@margin/core';
 import type { AssignmentWorkClient } from './client';
-import type { AssignmentSnapshot } from './repositoryTypes';
+import type { AssignmentSnapshot, AssignmentSubmissionRecord } from './repositoryTypes';
+import type { SubmissionStatus } from './submissionTypes';
 import type { WorkManifest } from './types';
 
 export type ReadonlyWorkValue<T> = T extends object
@@ -31,8 +32,12 @@ export interface StudentWorkState {
   /** Immutable snapshots; no PDF bytes, bearer credentials, or server-only source identifiers. */
   view: ReadonlyWorkValue<StudentWorkView> | null;
   saveStatus: 'none' | 'local-only' | 'sending' | 'uncertain' | 'conflict' | 'acknowledged';
-  /** This controller has no Canvas submission capability. A sync acknowledgement is not submission. */
-  submission: 'not-submitted';
+  /** Only an authenticated provider receipt can establish confirmation; saving never does. */
+  submission: 'not-submitted' | 'confirmed';
+  submissionAvailability: 'unknown' | 'available' | 'unavailable';
+  submissionRecord: ReadonlyWorkValue<AssignmentSubmissionRecord> | null;
+  submissionHistory: ReadonlyWorkValue<SubmissionStatus[]>;
+  submissionError: { code: string; message: string } | null;
   needsCatchUp: boolean;
   localSaving: boolean;
   localError: { code: string; message: string; operationId: string } | null;
@@ -58,6 +63,11 @@ export interface StudentWorkController {
   sync(): Promise<void>;
   /** Only this exact uncertain/sending operation can be retried; never rebases conflicts. */
   retry(operationId: string): Promise<void>;
+  /** Flush and fully synchronize before preparing one immutable request; retries reuse that request. */
+  submit(): Promise<void>;
+  checkSubmissionStatus(): Promise<void>;
+  /** Freshly confirm a captured attempt or durable rejection before releasing the local barrier. */
+  continueDraft(): Promise<void>;
   /** Abort network work and clear display state. Await flushLocal before normal editor teardown. */
   dispose(): void;
 }

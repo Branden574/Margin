@@ -7,6 +7,7 @@ vi.mock('pdfjs-dist', async () => import('pdfjs-dist/legacy/build/pdf.mjs'));
 import {
   createAssignmentWorkClient,
   type VerifiedAssignmentSnapshot,
+  type VerifiedSubmissionRequest,
 } from '../apps/web/src/lib/assignment-work/client';
 import {
   createVerifiedWorkCopy,
@@ -17,10 +18,14 @@ import {
   acknowledgeAssignmentOperation,
   markAssignmentOutcome,
   applyAssignmentCatchUp,
+  prepareSubmission,
+  recordSubmissionOutcome,
+  continueAssignmentDraft,
 } from '../apps/web/src/lib/assignment-work/repository';
 import {
   AssignmentRetryError,
   MAX_OUTBOX_OPERATIONS,
+  MAX_LOCAL_SUBMISSION_REQUESTS,
 } from '../apps/web/src/lib/assignment-work/repositoryTypes';
 import {
   createVault,
@@ -49,6 +54,7 @@ import type {
   CatchUpResult,
   WorkManifest,
 } from '../apps/web/src/lib/assignment-work/types';
+import type { SubmissionRequest } from '../apps/web/src/lib/assignment-work/submissionTypes';
 
 const passphrase = 'synthetic assignment vault testing only';
 const origin = 'https://assignment.synthetic.test';
@@ -69,6 +75,7 @@ async function harness(rotation = 0, unit = 1) {
     sessionId: id(1),
     userId: id(2),
     blob: await source(rotation, unit),
+    submissionRequests: new Map<string, SubmissionRequest>(),
     manifest: {
       assignment: {
         id: id(4),
@@ -103,9 +110,57 @@ async function harness(rotation = 0, unit = 1) {
       },
     } as WorkManifest,
   };
-  const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+  const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input),
       isSource = url.endsWith('/source');
+    const path = new URL(url).pathname;
+    if (path === '/api/assignments/work/submissions' && init?.method === 'POST') {
+      const request = JSON.parse(String(init.body)) as {
+        requestId: string;
+        expectedCursor: number;
+      };
+      const previous = state.submissionRequests.get(request.requestId);
+      const value: SubmissionRequest = previous ?? {
+        ...request,
+        state: 'captured',
+        submission: {
+          id: id(89),
+          requestId: request.requestId,
+          attempt: 1,
+          frozenCursor: request.expectedCursor,
+          frozenAt: new Date(state.now).toISOString(),
+          revision: 1,
+          phase: 'processing',
+          confirmedAt: null,
+          retryAllowed: false,
+          errorCode: null,
+        },
+      };
+      state.submissionRequests.set(request.requestId, value);
+      const response = new Response(JSON.stringify({ request: value, duplicate: !!previous }), {
+        status:
+          value.state === 'rejected' ? 409 : value.submission.phase === 'confirmed' ? 200 : 202,
+        headers: { 'content-type': 'application/json' },
+      });
+      Object.defineProperty(response, 'url', { value: url });
+      return response;
+    }
+    if (path.startsWith('/api/assignments/work/submission-requests/')) {
+      const value = state.submissionRequests.get(path.split('/').at(-1)!);
+      const response = new Response(
+        JSON.stringify(
+          value
+            ? { request: value }
+            : { error: { code: 'submission_not_found', message: 'No captured request.' } },
+        ),
+        {
+          status: value ? 200 : 404,
+          headers: { 'content-type': 'application/json' },
+        },
+      );
+      Object.defineProperty(response, 'url', { value: url });
+      return response;
+    }
     const value = url.endsWith('/session')
       ? {
           authenticated: true,
@@ -172,11 +227,454 @@ function edit(
     },
   };
 }
+describe('authenticated submission outcomes', () => {
+  async function prepared() {
+    const h = await fixture(),
+      revision = h.document.contentRevision!,
+      request = { requestId: id(90), expectedCursor: 0 };
+    await prepareSubmission(h.document.id, revision, h.verified, request);
+    return { ...h, revision, request };
+  }
+  async function proof(h: Awaited<ReturnType<typeof prepared>>, value: SubmissionRequest) {
+    h.state.submissionRequests.set(value.requestId, structuredClone(value));
+    const client = createAssignmentWorkClient({
+      expectedOrigin: origin,
+      fetch: h.fetcher,
+      now: () => h.state.now,
+    });
+    return client.submissionRequest(value.requestId);
+  }
+  it('refuses forged outcome JSON and leaves the prepared barrier intact', async () => {
+    const h = await prepared(),
+      before = await raw();
+    const fake = {
+      verified: h.verified,
+      request: { ...h.request, state: 'rejected', code: 'cursor_changed' },
+    } as unknown as VerifiedSubmissionRequest;
+    await expect(recordSubmissionOutcome(h.document.id, h.revision, fake)).rejects.toMatchObject({
+      code: 'verification_required',
+    });
+    await expect(continueAssignmentDraft(h.document.id, h.revision, fake)).rejects.toMatchObject({
+      code: 'verification_required',
+    });
+    expect(await raw()).toEqual(before);
+  });
+  it('keeps captured work paused until explicit continuation and never permits a second capture', async () => {
+    const h = await prepared(),
+      token = await h.client.captureSubmission(h.request);
+    const recorded = await recordSubmissionOutcome(h.document.id, h.revision, token);
+    expect(recorded.barrier).toBe(true);
+    expect(recorded.outcome?.state).toBe('captured');
+    await expect(
+      enqueueAssignmentOperation(h.document.id, h.revision, edit(h.document)),
+    ).rejects.toMatchObject({ code: 'submission_editing_paused' });
+    const resumed = await continueAssignmentDraft(h.document.id, h.revision, token);
+    expect(resumed.barrier).toBe(false);
+    await enqueueAssignmentOperation(h.document.id, h.revision, edit(h.document));
+    expect((await readAssignmentSnapshot(h.document.id, h.revision)).pending).toHaveLength(1);
+    expect(await prepareSubmission(h.document.id, h.revision, h.verified, h.request)).toEqual(
+      resumed,
+    );
+    await expect(
+      prepareSubmission(h.document.id, h.revision, h.verified, {
+        requestId: id(91),
+        expectedCursor: 0,
+      }),
+    ).rejects.toMatchObject({ code: 'submission_attempt_exists' });
+    // Status refresh after continuing must not re-arm the editing barrier.
+    expect((await recordSubmissionOutcome(h.document.id, h.revision, token)).barrier).toBe(false);
+  });
+  it('releases only a durable rejected fence and old continuations cannot unlock a newer request', async () => {
+    const h = await prepared();
+    const rejected: SubmissionRequest = { ...h.request, state: 'rejected', code: 'cursor_changed' };
+    const token = await proof(h, rejected);
+    await recordSubmissionOutcome(h.document.id, h.revision, token);
+    expect((await readAssignmentSnapshot(h.document.id, h.revision)).submission?.barrier).toBe(
+      true,
+    );
+    await continueAssignmentDraft(h.document.id, h.revision, token);
+    const next = await prepareSubmission(h.document.id, h.revision, await h.snapshot(), {
+      requestId: id(91),
+      expectedCursor: 0,
+    });
+    await continueAssignmentDraft(h.document.id, h.revision, token);
+    expect((await readAssignmentSnapshot(h.document.id, h.revision)).submission).toEqual(next);
+    await expect(
+      enqueueAssignmentOperation(h.document.id, h.revision, edit(h.document)),
+    ).rejects.toMatchObject({ code: 'submission_editing_paused' });
+  });
+  it('preserves newer delivery revisions when valid older snapshots arrive from another client', async () => {
+    const h = await prepared(),
+      first = await h.client.captureSubmission(h.request);
+    await recordSubmissionOutcome(h.document.id, h.revision, first);
+    const initial = h.state.submissionRequests.get(h.request.requestId)!;
+    if (initial.state !== 'captured') throw new Error('fixture');
+    const later: SubmissionRequest = {
+      ...initial,
+      submission: { ...initial.submission, revision: 3, phase: 'queued' },
+    };
+    await recordSubmissionOutcome(h.document.id, h.revision, await proof(h, later));
+    const stale: SubmissionRequest = {
+      ...initial,
+      submission: { ...initial.submission, revision: 2 },
+    };
+    const preserved = await recordSubmissionOutcome(
+      h.document.id,
+      h.revision,
+      await proof(h, stale),
+    );
+    expect(preserved.outcome).toEqual(later);
+    expect(preserved.barrier).toBe(true);
+  });
+  it.each(['same-revision', 'identity', 'frozen-at', 'rejection'] as const)(
+    'rejects authenticated but inconsistent %s outcomes without writes',
+    async (change) => {
+      const h = await prepared(),
+        token = await h.client.captureSubmission(h.request);
+      await recordSubmissionOutcome(h.document.id, h.revision, token);
+      const initial = h.state.submissionRequests.get(h.request.requestId)!;
+      if (initial.state !== 'captured') throw new Error('fixture');
+      const changed: SubmissionRequest =
+        change === 'rejection'
+          ? { ...h.request, state: 'rejected', code: 'cursor_changed' }
+          : {
+              ...initial,
+              submission: {
+                ...initial.submission,
+                ...(change === 'same-revision'
+                  ? { phase: 'queued' }
+                  : change === 'identity'
+                    ? { id: id(88) }
+                    : { frozenAt: new Date(time + 1).toISOString() }),
+              },
+            };
+      const other = await proof(h, changed),
+        before = await raw();
+      await expect(recordSubmissionOutcome(h.document.id, h.revision, other)).rejects.toMatchObject(
+        { code: 'invalid_submission_record' },
+      );
+      expect(await raw()).toEqual(before);
+    },
+  );
+  it('does not regress a confirmed outcome to another delivery phase', async () => {
+    const h = await prepared();
+    await h.client.captureSubmission(h.request);
+    const initial = h.state.submissionRequests.get(h.request.requestId)!;
+    if (initial.state !== 'captured') throw new Error('fixture');
+    const confirmed: SubmissionRequest = {
+      ...initial,
+      submission: {
+        ...initial.submission,
+        revision: 2,
+        phase: 'confirmed',
+        confirmedAt: new Date(time + 1).toISOString(),
+      },
+    };
+    await recordSubmissionOutcome(h.document.id, h.revision, await proof(h, confirmed));
+    const regressed: SubmissionRequest = {
+      ...initial,
+      submission: { ...initial.submission, revision: 3 },
+    };
+    await expect(
+      recordSubmissionOutcome(h.document.id, h.revision, await proof(h, regressed)),
+    ).rejects.toMatchObject({ code: 'invalid_submission_record' });
+  });
+  it('refuses unknown request IDs and outcomes from another authenticated student', async () => {
+    const h = await prepared(),
+      otherRequest = { requestId: id(91), expectedCursor: 0 };
+    h.state.submissionRequests.set(otherRequest.requestId, {
+      ...otherRequest,
+      state: 'rejected',
+      code: 'attempt_exists',
+    });
+    const otherToken = await h.client.captureSubmission(otherRequest);
+    await expect(
+      recordSubmissionOutcome(h.document.id, h.revision, otherToken),
+    ).rejects.toMatchObject({ code: 'submission_request_missing' });
+    const token = await h.client.captureSubmission(h.request);
+    h.state.userId = id(93);
+    const wrongStudent = await proof(h, h.state.submissionRequests.get(h.request.requestId)!);
+    await expect(
+      recordSubmissionOutcome(h.document.id, h.revision, wrongStudent),
+    ).rejects.toMatchObject({ code: 'binding_mismatch' });
+    expect(
+      (await readAssignmentSnapshot(h.document.id, h.revision)).submission?.outcome,
+    ).toBeUndefined();
+    expect(token).toBeDefined();
+  });
+  it.each(['record', 'continue'] as const)(
+    'does not release %s results or barrier changes after invalidation during encryption',
+    async (action) => {
+      const h = await prepared(),
+        token = await h.client.captureSubmission(h.request),
+        before = await raw(),
+        pause = pauseEncryption();
+      const saving = (action === 'record' ? recordSubmissionOutcome : continueAssignmentDraft)(
+        h.document.id,
+        h.revision,
+        token,
+      );
+      const outcome = saving.catch((reason: unknown) => reason);
+      await pause.started;
+      h.client.invalidate();
+      pause.release();
+      expect(await outcome).toBeInstanceOf(Error);
+      expect(await raw()).toEqual(before);
+      expect((await readAssignmentSnapshot(h.document.id, h.revision)).submission?.barrier).toBe(
+        true,
+      );
+    },
+  );
+  it('withholds post-commit continuation results after invalidation while preserving the actual durable outcome', async () => {
+    const h = await prepared(),
+      token = await h.client.captureSubmission(h.request);
+    vi.stubGlobal('window', {
+      dispatchEvent(event: Event) {
+        if (event.type === 'margin-data-change') h.client.invalidate();
+        return true;
+      },
+    });
+    await expect(continueAssignmentDraft(h.document.id, h.revision, token)).rejects.toMatchObject({
+      code: 'session_invalidated',
+    });
+    const saved = (await readAssignmentSnapshot(h.document.id, h.revision)).submission!;
+    expect(saved.barrier).toBe(false);
+    expect(saved.outcome?.state).toBe('captured');
+  });
+});
+
 const ack = (op: AppendOperation, cursor: number) => ({
   operationId: op.operationId,
   cursor,
   annotationRevision: op.baseRevision + 1,
   duplicate: false,
+});
+
+describe('encrypted submission checkpoint barrier', () => {
+  it('rejects forged proof, stale PDF revision and invalid request identifiers before any write', async () => {
+    const h = await fixture(),
+      before = await raw(),
+      input = { requestId: id(90), expectedCursor: 0 };
+    await expect(
+      prepareSubmission(
+        h.document.id,
+        h.document.contentRevision!,
+        {} as VerifiedAssignmentSnapshot,
+        input,
+      ),
+    ).rejects.toMatchObject({ code: 'verification_required' });
+    await expect(
+      prepareSubmission(h.document.id, crypto.randomUUID(), h.verified, input),
+    ).rejects.toMatchObject({ code: 'stale_binding' });
+    for (const request of [
+      { ...input, expectedCursor: -1 },
+      { ...input, expectedCursor: 0.5 },
+      { ...input, expectedCursor: 100001 },
+      { ...input, requestId: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA' },
+    ])
+      await expect(
+        prepareSubmission(h.document.id, h.document.contentRevision!, h.verified, request),
+      ).rejects.toMatchObject({ code: 'invalid_submission_record' });
+    expect(await raw()).toEqual(before);
+  });
+  it('adds a versioned barrier to an old binding without changing source, annotations or identity', async () => {
+    const h = await fixture(),
+      revision = h.document.contentRevision!;
+    const before = await readAssignmentSnapshot(h.document.id, revision);
+    expect(before.submission).toBeNull();
+    expect(before.binding.submissions).toBeUndefined();
+    const prepared = await prepareSubmission(h.document.id, revision, h.verified, {
+      requestId: id(90),
+      expectedCursor: 0,
+    });
+    expect(prepared).toEqual({
+      schema: 1,
+      localDocumentId: h.document.id,
+      request: { requestId: id(90), expectedCursor: 0 },
+      barrier: true,
+    });
+    const after = await readAssignmentSnapshot(h.document.id, revision);
+    expect(after.submission).toEqual(prepared);
+    expect(after.document).toEqual(before.document);
+    expect(after.annotations).toEqual(before.annotations);
+    expect(after.binding.identity).toEqual(before.binding.identity);
+    expect(await (await getDocumentBlob(h.document.id))!.arrayBuffer()).toEqual(
+      await h.state.blob.arrayBuffer(),
+    );
+    expect(JSON.stringify(await raw())).not.toContain(id(90));
+  });
+  it('recovers the exact prepared request after lock/unlock without replacing it', async () => {
+    const h = await fixture(),
+      revision = h.document.contentRevision!,
+      request = { requestId: id(90), expectedCursor: 0 };
+    const prepared = await prepareSubmission(h.document.id, revision, h.verified, request);
+    await lockVault();
+    await unlockVault(passphrase);
+    const fresh = await h.snapshot();
+    expect(await prepareSubmission(h.document.id, revision, fresh, request)).toEqual(prepared);
+    await expect(
+      prepareSubmission(h.document.id, revision, fresh, { ...request, requestId: id(91) }),
+    ).rejects.toMatchObject({ code: 'submission_request_pending' });
+    await expect(
+      prepareSubmission(h.document.id, revision, fresh, { ...request, expectedCursor: 1 }),
+    ).rejects.toMatchObject({ code: 'submission_request_conflict' });
+    await expect(
+      enqueueAssignmentOperation(h.document.id, revision, edit(h.document)),
+    ).rejects.toMatchObject({ code: 'submission_editing_paused' });
+  });
+  it.each(['queued', 'acknowledged', 'unhydrated', 'cursor', 'observed', 'server'] as const)(
+    'refuses preparation with %s state without changing saved work',
+    async (reason) => {
+      const h = await fixture(),
+        revision = h.document.contentRevision!;
+      if (reason === 'queued' || reason === 'acknowledged') {
+        await enqueueAssignmentOperation(h.document.id, revision, edit(h.document));
+        if (reason === 'acknowledged') {
+          const op = await prepareAssignmentSend(h.document.id, revision, h.verified);
+          await acknowledgeAssignmentOperation(h.document.id, revision, ack(op!, 1));
+        }
+      } else if (reason === 'server') {
+        if (h.state.manifest.work?.status !== 'provisioned') throw new Error('fixture');
+        h.state.manifest.work.document.cursor = 1;
+      } else
+        await vaultTransaction(async (tx) => {
+          const binding = await tx.get<any>('assignment-bindings', h.document.id);
+          if (reason === 'unhydrated') binding.hydrated = false;
+          else if (reason === 'cursor') binding.appliedCursor = 1;
+          else binding.observedCursor = 1;
+          tx.put('assignment-bindings', h.document.id, binding);
+        });
+      const verified = await h.snapshot(),
+        before = await raw();
+      await expect(
+        prepareSubmission(h.document.id, revision, verified, {
+          requestId: id(90),
+          expectedCursor: 0,
+        }),
+      ).rejects.toMatchObject({ code: 'submission_not_ready' });
+      expect(await raw()).toEqual(before);
+    },
+  );
+  it.each([false, true])(
+    'serializes a concurrent edit against preparation (prepare first: %s)',
+    async (prepareFirst) => {
+      const h = await fixture(),
+        revision = h.document.contentRevision!;
+      const prepare = () =>
+        prepareSubmission(h.document.id, revision, h.verified, {
+          requestId: id(90),
+          expectedCursor: 0,
+        });
+      const enqueue = () =>
+        enqueueAssignmentOperation(h.document.id, revision, edit(h.document), undefined, 0);
+      const results = await Promise.allSettled(
+        prepareFirst ? [prepare(), enqueue()] : [enqueue(), prepare()],
+      );
+      expect(results[0].status).toBe('fulfilled');
+      expect(results[1].status).toBe('rejected');
+      const snapshot = await readAssignmentSnapshot(h.document.id, revision);
+      expect(snapshot.pending).toHaveLength(prepareFirst ? 0 : 1);
+      expect(snapshot.submission?.barrier ?? false).toBe(prepareFirst);
+    },
+  );
+  it('permits only an exact persisted annotation retry while a submission barrier is held', async () => {
+    const h = await fixture(),
+      revision = h.document.contentRevision!,
+      local = edit(h.document);
+    await enqueueAssignmentOperation(h.document.id, revision, local);
+    const op = await prepareAssignmentSend(h.document.id, revision, h.verified);
+    await acknowledgeAssignmentOperation(h.document.id, revision, ack(op!, 1));
+    await applyAssignmentCatchUp(h.document.id, revision, h.verified, 0, events([op!]));
+    if (h.state.manifest.work?.status !== 'provisioned') throw new Error('fixture');
+    h.state.manifest.work.document.cursor = 1;
+    await prepareSubmission(h.document.id, revision, await h.snapshot(), {
+      requestId: id(90),
+      expectedCursor: 1,
+    });
+    const before = await raw();
+    await enqueueAssignmentOperation(h.document.id, revision, local, undefined, 0);
+    expect(await raw()).toEqual(before);
+    await expect(
+      enqueueAssignmentOperation(
+        h.document.id,
+        revision,
+        edit(h.document, 11, 'Newer draft'),
+        undefined,
+        1,
+      ),
+    ).rejects.toMatchObject({ code: 'submission_editing_paused' });
+  });
+  it('refuses damaged submission indexes and missing encrypted rows without bypassing the barrier', async () => {
+    const h = await fixture(),
+      revision = h.document.contentRevision!;
+    await prepareSubmission(h.document.id, revision, h.verified, {
+      requestId: id(90),
+      expectedCursor: 0,
+    });
+    const row = (await listVaultRecords('assignment-receipts')).find((entry) =>
+      entry.key.startsWith('submission:'),
+    )!;
+    await vaultTransaction(async (tx) => tx.delete('assignment-receipts', row.key));
+    await expect(readAssignmentSnapshot(h.document.id, revision)).rejects.toMatchObject({
+      code: 'invalid_submission_record',
+    });
+    await expect(
+      enqueueAssignmentOperation(h.document.id, revision, edit(h.document)),
+    ).rejects.toMatchObject({ code: 'invalid_submission_record' });
+  });
+  it('bounds retained rejected requests without dropping their history', async () => {
+    const h = await fixture(),
+      revision = h.document.contentRevision!;
+    await vaultTransaction(async (tx) => {
+      const binding = await tx.get<any>('assignment-bindings', h.document.id);
+      const requestIds = Array.from({ length: MAX_LOCAL_SUBMISSION_REQUESTS }, (_, i) =>
+        id(1000 + i),
+      );
+      binding.submissions = { schema: 1, requestIds, activeRequestId: null };
+      for (const requestId of requestIds)
+        tx.put('assignment-receipts', `submission:${h.document.id}:${requestId}`, {
+          schema: 1,
+          localDocumentId: h.document.id,
+          request: { requestId, expectedCursor: 0 },
+          outcome: { requestId, expectedCursor: 0, state: 'rejected', code: 'cursor_changed' },
+          barrier: false,
+        });
+      tx.put('assignment-bindings', h.document.id, binding);
+    });
+    const before = await raw();
+    await expect(
+      prepareSubmission(h.document.id, revision, h.verified, {
+        requestId: id(90),
+        expectedCursor: 0,
+      }),
+    ).rejects.toMatchObject({ code: 'submission_request_limit' });
+    expect(await raw()).toEqual(before);
+  });
+  it.each(['invalidate', 'expiry', 'abort'] as const)(
+    'rolls back preparation on %s during encryption',
+    async (change) => {
+      const h = await fixture(),
+        revision = h.document.contentRevision!,
+        before = await raw(),
+        pause = pauseEncryption(),
+        controller = new AbortController();
+      const pending = prepareSubmission(
+        h.document.id,
+        revision,
+        h.verified,
+        { requestId: id(90), expectedCursor: 0 },
+        controller.signal,
+      );
+      const result = pending.catch((reason: unknown) => reason);
+      await pause.started;
+      if (change === 'invalidate') h.client.invalidate();
+      else if (change === 'expiry') h.state.now += 60_001;
+      else controller.abort();
+      pause.release();
+      expect(await result).toBeInstanceOf(Error);
+      expect(await raw()).toEqual(before);
+    },
+  );
 });
 function events(ops: AppendOperation[], after = 0): CatchUpResult {
   return {

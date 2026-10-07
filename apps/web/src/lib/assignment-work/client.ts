@@ -2,6 +2,17 @@ import * as decode from './decode';
 import { createVaultGuard } from '../vault';
 import { RequestScope, Transport } from './transport';
 import {
+  decodeSubmissionInput,
+  decodeSubmissionPage,
+  decodeSubmissionRequest,
+} from './submissionDecode';
+import type {
+  SubmissionInput,
+  SubmissionPage,
+  SubmissionRequest,
+  SubmissionStatus,
+} from './submissionTypes';
+import {
   AssignmentWorkClientError,
   MAX_SOURCE_BYTES,
   REQUEST_TIMEOUT_MS,
@@ -38,6 +49,15 @@ export interface AssignmentWorkClient {
     input?: { afterCursor?: number; limit?: number },
     options?: RequestOptions,
   ): Promise<CatchUpResult>;
+  submissions(input?: { after?: string }, options?: RequestOptions): Promise<SubmissionPage>;
+  captureSubmission(
+    input: SubmissionInput,
+    options?: RequestOptions,
+  ): Promise<VerifiedSubmissionRequest>;
+  submissionRequest(
+    requestId: string,
+    options?: RequestOptions,
+  ): Promise<VerifiedSubmissionRequest>;
   /** Permanently clear this binding and abort active calls. Construct a new client after a new launch. */
   invalidate(): void;
   dispose(): void;
@@ -45,6 +65,25 @@ export interface AssignmentWorkClient {
 declare const verifiedSnapshotBrand: unique symbol;
 export interface VerifiedAssignmentSnapshot {
   readonly [verifiedSnapshotBrand]: true;
+}
+declare const verifiedSubmissionBrand: unique symbol;
+export interface VerifiedSubmissionRequest {
+  readonly [verifiedSubmissionBrand]: true;
+}
+const submissionSnapshots = new WeakMap<
+  object,
+  { verified: VerifiedAssignmentSnapshot; request: SubmissionRequest }
+>();
+/** Only live, issuer-verified outcomes can release a prepared local submission barrier. */
+export function readVerifiedSubmissionRequest(token: VerifiedSubmissionRequest) {
+  const record = submissionSnapshots.get(token);
+  if (!record)
+    throw new AssignmentWorkClientError(
+      'verification_required',
+      'Verify the saved submission request first.',
+    );
+  readVerifiedSnapshot(record.verified);
+  return { verified: record.verified, request: structuredClone(record.request) };
 }
 export interface VerifiedAssignmentData {
   origin: string;
@@ -92,6 +131,9 @@ class Client implements AssignmentWorkClient {
   private closed = false;
   private sourceActive = false;
   private manifestTail: Promise<void> = Promise.resolve();
+  private submissionInputs = new Map<string, number>();
+  private submissionOutcomes = new Map<string, SubmissionRequest>();
+  private submissionStatuses = new Map<string, SubmissionStatus>();
   constructor(dependencies: ClientDependencies) {
     const pageOrigin = globalThis.location?.origin;
     const expected = dependencies.expectedOrigin ?? pageOrigin;
@@ -137,6 +179,9 @@ class Client implements AssignmentWorkClient {
     this.session = null;
     this.view = null;
     this.reserved = null;
+    this.submissionInputs.clear();
+    this.submissionOutcomes.clear();
+    this.submissionStatuses.clear();
     for (const scope of this.active)
       scope.controller.abort(
         error(
@@ -173,6 +218,7 @@ class Client implements AssignmentWorkClient {
     options: RequestOptions,
     action: (scope: RequestScope, dispatched: () => void) => Promise<T>,
     operationId?: string,
+    uncertainAfterDispatch = false,
   ): Promise<T> {
     if (this.closed)
       throw error(
@@ -193,17 +239,25 @@ class Client implements AssignmentWorkClient {
       scope.check();
       return result;
     } catch (reason) {
-      const e =
+      let e =
         reason instanceof AssignmentWorkClientError
           ? reason
           : error('network_error', 'The assignment request could not be completed.');
-      if (e.status === 401 || e.status === 403) this.invalidate();
+      if (e.status === 401 || e.status === 403 || e.code === 'work_unavailable') this.invalidate();
+      // Nested requests share abort signals. Revocation may reach an outer scope as
+      // generic cancellation; never downgrade that known invalidation to a retryable read.
+      if (this.closed && e.code === 'cancelled')
+        e = error(
+          'session_invalidated',
+          'This assignment session was invalidated. Reopen it from Canvas.',
+        );
       throw new AssignmentWorkClientError(
         e.code,
         e.message,
         e.status,
         sent &&
-          (e.status === undefined ||
+          (uncertainAfterDispatch ||
+            e.status === undefined ||
             e.status >= 500 ||
             e.status === 408 ||
             e.code === 'work_request_cancelled'),
@@ -500,8 +554,171 @@ class Client implements AssignmentWorkClient {
       return result;
     });
   }
+
+  private rememberSubmission(value: SubmissionStatus): SubmissionStatus {
+    const previous = this.submissionStatuses.get(value.id);
+    if (previous) {
+      if (
+        previous.requestId !== value.requestId ||
+        previous.frozenCursor !== value.frozenCursor ||
+        previous.frozenAt !== value.frozenAt ||
+        previous.attempt !== value.attempt ||
+        (previous.revision === value.revision &&
+          JSON.stringify(previous) !== JSON.stringify(value)) ||
+        (previous.phase === 'confirmed' &&
+          value.revision > previous.revision &&
+          JSON.stringify(previous) !== JSON.stringify(value))
+      )
+        throw error(
+          'submission_changed',
+          'The saved submission identity changed. Keep your local request and reopen from Canvas.',
+        );
+      if (previous.revision > value.revision) return clone(previous);
+    } else if (this.submissionStatuses.size >= 64)
+      throw error('submission_limit', 'Reopen from Canvas before loading more submission history.');
+    this.submissionStatuses.set(value.id, clone(value));
+    return value;
+  }
+  private issueSubmission(verified: VerifiedAssignmentSnapshot, value: SubmissionRequest) {
+    const current = readVerifiedSnapshot(verified).manifest;
+    const preparedCursor = this.submissionInputs.get(value.requestId);
+    if (preparedCursor !== undefined && preparedCursor !== value.expectedCursor)
+      throw error('submission_request_changed', 'Retry the exact saved submission request.');
+    if (
+      value.state === 'captured' &&
+      (current.work?.status !== 'provisioned' ||
+        value.submission.frozenCursor > current.work.document.cursor)
+    )
+      decode.invalid();
+    const previous = this.submissionOutcomes.get(value.requestId);
+    if (
+      previous &&
+      (previous.expectedCursor !== value.expectedCursor ||
+        previous.state !== value.state ||
+        (previous.state === 'rejected' &&
+          value.state === 'rejected' &&
+          previous.code !== value.code) ||
+        (previous.state === 'captured' &&
+          value.state === 'captured' &&
+          previous.submission.id !== value.submission.id))
+    )
+      throw error(
+        'submission_changed',
+        'The saved submission request changed. Its local copy has been kept.',
+      );
+    if (!previous && this.submissionOutcomes.size >= 64)
+      throw error(
+        'submission_limit',
+        'Reopen from Canvas before loading more submission requests.',
+      );
+    if (value.state === 'captured')
+      value = { ...value, submission: this.rememberSubmission(value.submission) };
+    this.submissionOutcomes.set(value.requestId, clone(value));
+    const token = Object.freeze({}) as VerifiedSubmissionRequest;
+    submissionSnapshots.set(token, { verified, request: clone(value) });
+    return token;
+  }
+  async submissions(input: { after?: string } = {}, options: RequestOptions = {}) {
+    const query = decode.object(input, ['after']);
+    if (
+      query.after !== undefined &&
+      (typeof query.after !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(query.after))
+    )
+      throw error('invalid_request', 'The submission history cursor is invalid.');
+    return this.run(options, async (scope) => {
+      await this.verifiedSnapshot({ signal: scope.controller.signal });
+      this.manifestRequired(true);
+      const response = await this.transport.request(
+        scope,
+        `/api/assignments/work/submissions${query.after ? `?after=${query.after}` : ''}`,
+        200,
+      );
+      const result = decodeSubmissionPage(
+        await this.transport.json(scope, response, 32_768),
+        this.now(),
+      );
+      const verified = await this.verifiedSnapshot({ signal: scope.controller.signal });
+      scope.check();
+      const current = readVerifiedSnapshot(verified).manifest;
+      if (current.work?.status !== 'provisioned') decode.invalid();
+      const cursor = current.work.document.cursor;
+      if (result.submissions.some((v) => v.frozenCursor > cursor)) decode.invalid();
+      return { ...result, submissions: result.submissions.map((v) => this.rememberSubmission(v)) };
+    });
+  }
+  async captureSubmission(value: SubmissionInput, options: RequestOptions = {}) {
+    const input = decodeSubmissionInput(value);
+    const previous = this.submissionInputs.get(input.requestId);
+    if (previous !== undefined && previous !== input.expectedCursor)
+      throw error('submission_request_changed', 'Retry the exact saved submission request.');
+    if (previous === undefined && this.submissionInputs.size >= 64)
+      throw error(
+        'submission_limit',
+        'Reopen from Canvas before preparing another submission request.',
+      );
+    this.submissionInputs.set(input.requestId, input.expectedCursor);
+    return this.run(
+      options,
+      async (scope, dispatched) => {
+        await this.verifiedSnapshot({ signal: scope.controller.signal });
+        this.manifestRequired(true);
+        const csrf = this.bound().csrfToken;
+        dispatched();
+        const response = await this.transport.request(
+          scope,
+          '/api/assignments/work/submissions',
+          [200, 202, 409],
+          JSON.stringify(input),
+          csrf,
+        );
+        const body = decode.object(await this.transport.json(scope, response, 16_384), [
+          'request',
+          'duplicate',
+        ]);
+        if (typeof body.duplicate !== 'boolean') decode.invalid();
+        const request = decodeSubmissionRequest(body.request, this.now());
+        if (
+          request.requestId !== input.requestId ||
+          request.expectedCursor !== input.expectedCursor ||
+          (response.status === 409) !== (request.state === 'rejected') ||
+          (response.status === 200 &&
+            request.state === 'captured' &&
+            request.submission.phase !== 'confirmed') ||
+          (response.status === 202 &&
+            request.state === 'captured' &&
+            request.submission.phase === 'confirmed')
+        )
+          decode.invalid();
+        const verified = await this.verifiedSnapshot({ signal: scope.controller.signal });
+        scope.check();
+        return this.issueSubmission(verified, request);
+      },
+      input.requestId,
+      // A negative response cannot fence another tab's exact capture attempt.
+      // Only an authenticated durable request outcome resolves prepared intent.
+      true,
+    );
+  }
+  async submissionRequest(requestId: string, options: RequestOptions = {}) {
+    const requestKey = decode.id(requestId);
+    return this.run(options, async (scope) => {
+      await this.verifiedSnapshot({ signal: scope.controller.signal });
+      this.manifestRequired(true);
+      const response = await this.transport.request(
+        scope,
+        `/api/assignments/work/submission-requests/${requestKey}`,
+        200,
+      );
+      const body = decode.object(await this.transport.json(scope, response, 16_384), ['request']);
+      const request = decodeSubmissionRequest(body.request, this.now());
+      if (request.requestId !== requestKey) decode.invalid();
+      const verified = await this.verifiedSnapshot({ signal: scope.controller.signal });
+      scope.check();
+      return this.issueSubmission(verified, request);
+    });
+  }
 }
-/** No persistence, queue, retry, logging, local-vault adoption, or Canvas submission occurs here. */
+/** Transport only: no local persistence, queue drain, automatic retry or direct Canvas delivery. */
 export function createAssignmentWorkClient(
   testDependencies: ClientDependencies = {},
 ): AssignmentWorkClient {

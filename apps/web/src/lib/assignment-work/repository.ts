@@ -1,7 +1,12 @@
 import type { AnnotationOperation, DocumentRecord } from '@margin/core';
 import { createVaultGuard, vaultTransaction, type VaultTransaction } from '../vault';
 import { notifyAssignmentChange } from '../storage';
-import { readVerifiedSnapshot, type VerifiedAssignmentSnapshot } from './client';
+import {
+  readVerifiedSnapshot,
+  readVerifiedSubmissionRequest,
+  type VerifiedAssignmentSnapshot,
+  type VerifiedSubmissionRequest,
+} from './client';
 import * as decode from './decode';
 import {
   assignmentIdentity,
@@ -17,13 +22,22 @@ import {
   MAX_BASELINE_BYTES,
   MAX_OUTBOX_BYTES,
   MAX_OUTBOX_OPERATIONS,
+  MAX_LOCAL_SUBMISSION_REQUESTS,
   AssignmentRetryError,
   type AssignmentBaseline,
   type AssignmentBinding,
   type AssignmentIdentity,
   type AssignmentOutboxEntry,
   type AssignmentSnapshot,
+  type AssignmentSubmissionRecord,
 } from './repositoryTypes';
+import {
+  mergeSubmissionOutcome,
+  readSubmissionRecords,
+  submissionIndex,
+  submissionInput,
+  submissionRecordKey,
+} from './repositorySubmission';
 import type { AppendOperation, AppendReceipt, CatchUpResult } from './types';
 
 const size = (value: unknown) => new TextEncoder().encode(canonical(value)).byteLength;
@@ -70,6 +84,7 @@ async function load(tx: VaultTransaction, documentId: string, expectedRevision?:
       'stale_binding',
       'The saved assignment or PDF revision changed. Reopen its verified launch.',
     );
+  submissionIndex(binding);
   return { binding, document };
 }
 async function queue(tx: VaultTransaction, binding: AssignmentBinding) {
@@ -270,6 +285,7 @@ export async function readAssignmentSnapshot(
         if (baseline.annotation) annotations.set(id, baseline.annotation);
       }
       const pending = await queue(tx, binding);
+      const submission = (await readSubmissionRecords(tx, binding)).latest;
       for (const row of pending) {
         if (row.local.kind === 'delete') annotations.delete(row.local.annotationId);
         else annotations.set(row.local.annotationId, row.local.annotation!);
@@ -285,6 +301,7 @@ export async function readAssignmentSnapshot(
           annotationId: row.operation.annotationId,
           status: row.status,
         })),
+        submission,
       });
     },
     { signal },
@@ -339,6 +356,11 @@ export async function enqueueAssignmentOperation(
           );
         return;
       }
+      if ((await readSubmissionRecords(tx, binding)).index.activeRequestId !== null)
+        return repositoryError(
+          'submission_editing_paused',
+          'This submission checkpoint is paused. Confirm its outcome and explicitly continue the draft before adding edits.',
+        );
       // An identical persisted operation above is an idempotent confirmation,
       // not a new edit. Never derive a new revision from an unseen baseline.
       if (expectedAppliedCursor !== undefined && binding.appliedCursor !== expectedAppliedCursor)
@@ -403,6 +425,170 @@ export async function enqueueAssignmentOperation(
       tx.put('assignment-bindings', documentId, binding);
     },
     signal,
+  );
+}
+
+/** Atomically pause NEW local edits and retain the exact request before any network dispatch. */
+export async function prepareSubmission(
+  documentId: string,
+  expectedRevision: string,
+  verified: VerifiedAssignmentSnapshot,
+  input: { requestId: string; expectedCursor: number },
+  signal?: AbortSignal,
+): Promise<AssignmentSubmissionRecord> {
+  const request = submissionInput(input);
+  const assertLive = () => {
+    readVerifiedSnapshot(verified);
+  };
+  assertLive();
+  return commit(
+    documentId,
+    async (tx) => {
+      const { binding } = await load(tx, documentId, expectedRevision);
+      const data = assertVerified(binding, verified);
+      const { index, records } = await readSubmissionRecords(tx, binding);
+      const existing = records.find((row) => row.request.requestId === request.requestId);
+      if (existing) {
+        if (canonical(existing.request) !== canonical(request))
+          return repositoryError(
+            'submission_request_conflict',
+            'Retry the exact saved submission request without changing its cursor.',
+          );
+        return structuredClone(existing);
+      }
+      if (index.activeRequestId !== null)
+        return repositoryError(
+          'submission_request_pending',
+          'Confirm the existing submission request before preparing another.',
+        );
+      if (records.some((row) => row.outcome?.state === 'captured'))
+        return repositoryError(
+          'submission_attempt_exists',
+          'This assignment already has an immutable submission attempt. Additional attempts are not available.',
+        );
+      if (index.requestIds.length >= MAX_LOCAL_SUBMISSION_REQUESTS)
+        return repositoryError(
+          'submission_request_limit',
+          'This work reached its local submission request limit. Previous requests and saved edits are kept.',
+        );
+      if (
+        !binding.hydrated ||
+        binding.queue.length ||
+        binding.queueBytes ||
+        binding.appliedCursor !== request.expectedCursor ||
+        binding.observedCursor !== request.expectedCursor ||
+        data.manifest.work?.status !== 'provisioned' ||
+        data.manifest.work.document.cursor !== request.expectedCursor
+      )
+        return repositoryError(
+          'submission_not_ready',
+          'Finish saving and recovering every annotation before preparing this submission checkpoint.',
+        );
+      const record: AssignmentSubmissionRecord = {
+        schema: 1,
+        localDocumentId: documentId,
+        request,
+        barrier: true,
+      };
+      index.requestIds.push(request.requestId);
+      index.activeRequestId = request.requestId;
+      binding.submissions = index;
+      tx.put('assignment-receipts', submissionRecordKey(documentId, request.requestId), record);
+      tx.put('assignment-bindings', documentId, binding);
+      return structuredClone(record);
+    },
+    signal,
+    assertLive,
+  );
+}
+
+/** Only a live client's authenticated captured receipt or durable rejection fence can enter storage. */
+export async function recordSubmissionOutcome(
+  documentId: string,
+  expectedRevision: string,
+  proof: VerifiedSubmissionRequest,
+  signal?: AbortSignal,
+): Promise<AssignmentSubmissionRecord> {
+  return saveSubmissionOutcome(documentId, expectedRevision, proof, false, signal);
+}
+
+/** Explicitly resume future draft edits; the captured annotation prefix and past requests remain immutable. */
+export async function continueAssignmentDraft(
+  documentId: string,
+  expectedRevision: string,
+  proof: VerifiedSubmissionRequest,
+  signal?: AbortSignal,
+): Promise<AssignmentSubmissionRecord> {
+  return saveSubmissionOutcome(documentId, expectedRevision, proof, true, signal);
+}
+
+async function saveSubmissionOutcome(
+  documentId: string,
+  expectedRevision: string,
+  proof: VerifiedSubmissionRequest,
+  resume: boolean,
+  signal?: AbortSignal,
+): Promise<AssignmentSubmissionRecord> {
+  const initial = readVerifiedSubmissionRequest(proof);
+  const assertLive = () => {
+    const current = readVerifiedSubmissionRequest(proof);
+    readVerifiedSnapshot(current.verified);
+  };
+  assertLive();
+  return commit(
+    documentId,
+    async (tx) => {
+      const { binding } = await load(tx, documentId, expectedRevision);
+      assertVerified(binding, initial.verified);
+      const { index, records } = await readSubmissionRecords(tx, binding);
+      const record = records.find((row) => row.request.requestId === initial.request.requestId);
+      if (!record)
+        return repositoryError(
+          'submission_request_missing',
+          'This response has no matching prepared submission on this device. Existing drafts have not been adopted or replaced.',
+        );
+      if (
+        record.request.expectedCursor !== initial.request.expectedCursor ||
+        (initial.request.state === 'captured' &&
+          initial.request.submission.frozenCursor !== record.request.expectedCursor)
+      )
+        return repositoryError(
+          'submission_request_conflict',
+          'The submission response does not match the exact saved checkpoint.',
+        );
+      const next = mergeSubmissionOutcome(record.outcome, initial.request);
+      if (
+        next.state === 'captured' &&
+        records.some(
+          (row) =>
+            row.request.requestId !== record.request.requestId && row.outcome?.state === 'captured',
+        )
+      )
+        return repositoryError(
+          'submission_request_conflict',
+          'A different immutable submission attempt is already recorded for this work.',
+        );
+      record.outcome = next;
+      if (resume && record.barrier) {
+        if (index.activeRequestId !== record.request.requestId)
+          return repositoryError(
+            'invalid_submission_record',
+            'The current submission barrier does not match the saved request.',
+          );
+        record.barrier = false;
+        index.activeRequestId = null;
+        binding.submissions = index;
+        tx.put('assignment-bindings', documentId, binding);
+      }
+      tx.put(
+        'assignment-receipts',
+        submissionRecordKey(documentId, record.request.requestId),
+        record,
+      );
+      return structuredClone(record);
+    },
+    signal,
+    assertLive,
   );
 }
 

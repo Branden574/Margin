@@ -9,7 +9,7 @@ import { stopDisposablePostgres } from './helpers/postgres';
 import { withTableOwnerMembership } from './helpers/owner-role';
 import {
   withAssignmentProvisionerMembership,
-  withAssignmentWorkRuntimeMembership,
+  withAssignmentRoleMembership,
 } from './helpers/provisioner-role';
 import { LocalKeyProvider } from '../apps/api/src/encryption';
 import { PostgresIngestionRepository, type ArtifactReader } from '../apps/api/src/ingestion';
@@ -779,11 +779,20 @@ describe.skipIf(!available)(
         'margin_ingestion_inspector',
         'margin_ingestion_reader',
         'margin_assignment_provisioner',
-      ].flatMap((group) => [true, false].map((inherit) => ({ group, inherit }))),
+      ].flatMap((group) =>
+        (
+          [
+            'margin_assignment_work_runtime',
+            'margin_submission_runtime',
+            'margin_submission_retention_guard',
+          ] as const
+        ).flatMap((mixedRole) => [true, false].map((inherit) => ({ group, inherit, mixedRole }))),
+      ),
     )(
-      'rejects assignment-work runtime membership on $group inherited=$inherit',
-      async ({ group, inherit }) => {
-        // This suite applies the real work-runtime migration, so the test exercises its grants.
+      'rejects $mixedRole membership on $group inherited=$inherit',
+      async ({ group, inherit, mixedRole }) => {
+        // Work-runtime grants are present; the helper creates the submission role if its newer
+        // migration is absent. Both inherited and SET ROLE membership must fail before any work.
         expect(
           (
             await admin.query(
@@ -798,10 +807,11 @@ describe.skipIf(!available)(
         ].includes(group)
           ? await fixture()
           : undefined;
-        await withAssignmentWorkRuntimeMembership(
+        await withAssignmentRoleMembership(
           admin,
           config('unused_fixture_login'),
           group,
+          mixedRole,
           inherit,
           async (unsafe) => {
             if (group === 'margin_identity_runtime')

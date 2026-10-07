@@ -4,7 +4,14 @@ import { AssignmentError } from '../types.js';
 import { assignmentId } from '../policy.js';
 export class WorkPool {
   private readonly pool: Pool;
-  constructor(options: PoolConfig) {
+  constructor(
+    options: PoolConfig,
+    private readonly runtimeRole:
+      | 'margin_assignment_work_runtime'
+      | 'margin_submission_runtime' = 'margin_assignment_work_runtime',
+  ) {
+    if (!['margin_assignment_work_runtime', 'margin_submission_runtime'].includes(runtimeRole))
+      throw new Error('Unknown assignment runtime role.');
     const socket =
       process.env.NODE_ENV === 'test' && options.host?.startsWith('/') && !options.connectionString;
     if (
@@ -47,12 +54,17 @@ export class WorkPool {
     const c = await this.pool.connect();
     let discard = false;
     try {
-      await c.query('BEGIN');
+      await c.query(
+        this.runtimeRole === 'margin_submission_runtime'
+          ? 'BEGIN ISOLATION LEVEL READ COMMITTED'
+          : 'BEGIN',
+      );
       await c.query("SET LOCAL synchronous_commit='on'");
       await c.query("SET LOCAL lock_timeout='2s'");
       const guard = (
         await c.query<{ unsafe: boolean }>(
-          `SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,'margin_assignment_work_runtime','MEMBER') OR EXISTS(SELECT 1 FROM pg_roles p WHERE p.rolname IN ('margin_identity_runtime','margin_identity_provisioner','margin_sync_runtime','margin_sync_provisioner','margin_lms_runtime','margin_lms_provisioner','margin_assignments_runtime','margin_ingestion_runtime','margin_ingestion_reader','margin_ingestion_inspector','margin_assignment_provisioner') AND pg_has_role(current_user,p.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_identity','margin_lms','margin_assignments','margin_sync','margin_ingestion','margin_work') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user`,
+          `SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,$1,'MEMBER') OR EXISTS(SELECT 1 FROM pg_roles p WHERE p.rolname IN ('margin_identity_runtime','margin_identity_provisioner','margin_sync_runtime','margin_sync_provisioner','margin_lms_runtime','margin_lms_provisioner','margin_assignments_runtime','margin_ingestion_runtime','margin_ingestion_reader','margin_ingestion_inspector','margin_assignment_provisioner','margin_assignment_work_runtime','margin_submission_runtime','margin_submission_retention_guard') AND p.rolname<>$1 AND pg_has_role(current_user,p.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_identity','margin_lms','margin_assignments','margin_sync','margin_ingestion','margin_work','margin_submissions') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user`,
+          [this.runtimeRole],
         )
       ).rows[0];
       if (!guard || guard.unsafe)

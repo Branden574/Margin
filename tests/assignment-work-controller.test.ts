@@ -8,6 +8,10 @@ import { createAssignmentWorkClient } from '../apps/web/src/lib/assignment-work/
 import { createStudentWorkController } from '../apps/web/src/lib/assignment-work/controller';
 import type { StudentWorkController } from '../apps/web/src/lib/assignment-work/controllerTypes';
 import type {
+  SubmissionInput,
+  SubmissionRequest,
+} from '../apps/web/src/lib/assignment-work/submissionTypes';
+import type {
   AppendOperation,
   CommittedOperation,
   WorkManifest,
@@ -49,7 +53,7 @@ async function harness(options: Parameters<typeof createStudentWorkController>[0
       audience: 'members',
       pages: [{ id: id(8), index: 0, width: 400, height: 600 }],
     },
-  } as const;
+  } satisfies Extract<NonNullable<WorkManifest['work']>, { status: 'provisioned' }>;
   const state = {
     now: time,
     sessionId: id(1),
@@ -60,13 +64,20 @@ async function harness(options: Parameters<typeof createStudentWorkController>[0
     loseAppendReply: false,
     cancelAppendReply: false,
     failAppend: false,
+    submissionsConfigured: false,
+    loseCaptureReply: false,
+    hideSubmissionRequests: false,
+    rejectCapture: false,
+    submissionRequests: new Map<string, SubmissionRequest>(),
+    captureRequests: [] as SubmissionInput[],
+    frozenOperations: [] as CommittedOperation[],
     operations: [] as CommittedOperation[],
     requests: [] as { path: string; method: string; body?: AppendOperation }[],
     gate: undefined as
       | undefined
       | {
-          entered: ReturnType<typeof deferred>;
-          release: ReturnType<typeof deferred>;
+          entered: ReturnType<typeof deferred<void>>;
+          release: ReturnType<typeof deferred<void>>;
           path: string;
         },
     manifest: {
@@ -183,6 +194,69 @@ async function harness(options: Parameters<typeof createStudentWorkController>[0
           hasMore: nextCursor < state.operations.length,
         };
       }
+    } else if (
+      path === '/api/assignments/work/submissions' ||
+      path.startsWith('/api/assignments/work/submission-requests/')
+    ) {
+      if (!state.submissionsConfigured) {
+        status = 503;
+        value = {
+          error: {
+            code: 'submission_unconfigured',
+            message: 'Synthetic submission service unconfigured',
+          },
+        };
+      } else if (path.includes('/submission-requests/')) {
+        const request = state.submissionRequests.get(path.split('/').at(-1)!);
+        if (!request || state.hideSubmissionRequests) {
+          status = 404;
+          value = {
+            error: { code: 'submission_request_missing', message: 'Synthetic request not found' },
+          };
+        } else value = { request };
+      } else if (method === 'GET') {
+        value = {
+          submissions: Array.from(state.submissionRequests.values())
+            .filter((r) => r.state === 'captured')
+            .map((r) => r.submission),
+          nextCursor: null,
+        };
+      } else {
+        const input = JSON.parse(String(init?.body)) as SubmissionInput;
+        state.captureRequests.push(input);
+        let request = state.submissionRequests.get(input.requestId);
+        const duplicate = !!request;
+        if (!request) {
+          request =
+            state.rejectCapture || input.expectedCursor !== state.operations.length
+              ? { ...input, state: 'rejected', code: 'cursor_changed' }
+              : {
+                  ...input,
+                  state: 'captured',
+                  submission: {
+                    id: id(999),
+                    requestId: input.requestId,
+                    attempt: 1,
+                    frozenCursor: input.expectedCursor,
+                    frozenAt: new Date(time).toISOString(),
+                    revision: 1,
+                    phase: 'processing',
+                    confirmedAt: null,
+                    retryAllowed: false,
+                    errorCode: null,
+                  },
+                };
+          state.submissionRequests.set(input.requestId, request);
+          if (request.state === 'captured')
+            state.frozenOperations = structuredClone(state.operations);
+        }
+        status = request.state === 'rejected' ? 409 : 202;
+        value = { request, duplicate };
+        if (state.loseCaptureReply) {
+          state.loseCaptureReply = false;
+          throw new TypeError('Synthetic capture reply lost');
+        }
+      }
     } else if (method === 'POST') {
       status = 202;
       state.manifest.work ??= { id: id(5), status: 'pending' };
@@ -259,6 +333,143 @@ function edit(
 }
 const posts = (h: Awaited<ReturnType<typeof harness>>) =>
   h.state.requests.filter((r) => r.path.endsWith('/operations') && r.method === 'POST');
+
+describe('immutable submission capture controller', () => {
+  it('keeps normal editing usable when submission is unconfigured', async () => {
+    const h = await harness();
+    await h.controller.open();
+    expect(h.controller.getState().submissionAvailability).toBe('unavailable');
+    await h.controller.enqueue(edit(h.controller));
+    await expect(h.controller.submit()).rejects.toMatchObject({ code: 'submission_unavailable' });
+    expect(h.state.captureRequests).toHaveLength(0);
+    expect(h.controller.getState().submissionRecord).toBeNull();
+    expect(h.controller.getState().view!.pending).toHaveLength(1);
+  });
+  it('synchronizes every saved edit before capturing and separates later draft changes', async () => {
+    const h = await harness();
+    h.state.submissionsConfigured = true;
+    await h.controller.open();
+    await h.controller.enqueue(edit(h.controller));
+    await h.controller.submit();
+    expect(h.state.captureRequests).toHaveLength(1);
+    expect(h.state.captureRequests[0].expectedCursor).toBe(1);
+    expect(h.controller.getState()).toMatchObject({
+      submission: 'not-submitted',
+      submissionRecord: {
+        barrier: true,
+        outcome: { state: 'captured', submission: { phase: 'processing', frozenCursor: 1 } },
+      },
+    });
+    await h.controller.continueDraft();
+    await h.controller.enqueue(edit(h.controller, 11, 'Later draft'));
+    await h.controller.sync();
+    expect(h.state.operations).toHaveLength(2);
+    expect(h.state.frozenOperations).toHaveLength(1);
+    expect(h.state.frozenOperations[0].annotation?.text).toBe('Private student draft');
+    await expect(h.controller.submit()).rejects.toMatchObject({
+      code: 'submission_already_captured',
+    });
+    expect(h.state.captureRequests).toHaveLength(1);
+  });
+  it('refuses a partial bounded sync without preparing a submission barrier', async () => {
+    const h = await harness({ maxDispatches: 1, maxCatchUpBatches: 2 });
+    h.state.submissionsConfigured = true;
+    await h.controller.open();
+    await h.controller.enqueue(edit(h.controller));
+    await h.controller.enqueue(edit(h.controller, 11, 'Second edit', id(90)));
+    await expect(h.controller.submit()).rejects.toMatchObject({ code: 'submission_sync_required' });
+    expect(h.state.captureRequests).toHaveLength(0);
+    expect(h.controller.getState().submissionRecord).toBeNull();
+    expect(h.controller.getState().view!.pending).toHaveLength(1);
+  });
+  it('retains the exact prepared request after a lost response and retries without new intent', async () => {
+    const h = await harness();
+    h.state.submissionsConfigured = true;
+    await h.controller.open();
+    h.state.loseCaptureReply = true;
+    await expect(h.controller.submit()).rejects.toMatchObject({ uncertainSave: true });
+    const prepared = h.controller.getState().submissionRecord;
+    expect(prepared).toMatchObject({ barrier: true });
+    expect(prepared?.outcome).toBeUndefined();
+    await h.controller.submit();
+    expect(h.state.captureRequests).toHaveLength(2);
+    expect(h.state.captureRequests[0]).toEqual(h.state.captureRequests[1]);
+    expect(h.controller.getState().submissionRecord?.outcome?.state).toBe('captured');
+  });
+  it('recovers capture by read after reload and permits editing only after explicit continuation', async () => {
+    const h = await harness();
+    h.state.submissionsConfigured = true;
+    await h.controller.open();
+    h.state.loseCaptureReply = true;
+    await expect(h.controller.submit()).rejects.toThrow();
+    h.controller.dispose();
+    const fresh = h.anotherController();
+    await fresh.open();
+    expect(h.state.captureRequests).toHaveLength(1);
+    expect(fresh.getState().submissionRecord).toMatchObject({
+      barrier: true,
+      outcome: { state: 'captured' },
+    });
+    await fresh.continueDraft();
+    expect(fresh.getState().submissionRecord?.barrier).toBe(false);
+    await fresh.enqueue(edit(fresh));
+    expect(fresh.getState().view!.pending).toHaveLength(1);
+  });
+  it('requires a current durable outcome before releasing even a previously captured barrier', async () => {
+    const h = await harness();
+    h.state.submissionsConfigured = true;
+    await h.controller.open();
+    await h.controller.submit();
+    h.state.hideSubmissionRequests = true;
+    await expect(h.controller.continueDraft()).rejects.toMatchObject({ status: 404 });
+    expect(h.controller.getState().submissionRecord?.barrier).toBe(true);
+    h.state.hideSubmissionRequests = false;
+    await h.controller.continueDraft();
+    expect(h.controller.getState().submissionRecord?.barrier).toBe(false);
+  });
+  it('persists terminal fenced rejection and requires explicit continuation before a new request', async () => {
+    const h = await harness();
+    h.state.submissionsConfigured = true;
+    h.state.rejectCapture = true;
+    await h.controller.open();
+    await h.controller.submit();
+    expect(h.controller.getState().submissionRecord).toMatchObject({
+      barrier: true,
+      outcome: { state: 'rejected', code: 'cursor_changed' },
+    });
+    const first = h.state.captureRequests[0];
+    await h.controller.continueDraft();
+    h.state.rejectCapture = false;
+    await h.controller.submit();
+    expect(h.state.captureRequests[1].requestId).not.toBe(first.requestId);
+    expect(h.state.submissionRequests.get(first.requestId)?.state).toBe('rejected');
+    expect(h.controller.getState().submissionRecord?.outcome?.state).toBe('captured');
+  });
+  it('never shows Canvas confirmation for a failed or uncertain capture transport', async () => {
+    const h = await harness();
+    h.state.submissionsConfigured = true;
+    await h.controller.open();
+    h.state.loseCaptureReply = true;
+    await expect(h.controller.submit()).rejects.toThrow();
+    h.state.denied = true;
+    await expect(h.controller.checkSubmissionStatus()).rejects.toMatchObject({
+      code: 'session_invalidated',
+    });
+    expect(h.controller.getState()).toMatchObject({
+      phase: 'invalidated',
+      submission: 'not-submitted',
+      submissionRecord: null,
+      submissionHistory: [],
+    });
+    h.state.denied = false;
+    const fresh = h.anotherController();
+    await fresh.open();
+    expect(fresh.getState()).toMatchObject({
+      submission: 'not-submitted',
+      submissionRecord: { barrier: true, outcome: { state: 'captured' } },
+    });
+  });
+});
 function wire(n: number): AppendOperation {
   return {
     operationId: id(1000 + n),

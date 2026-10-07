@@ -66,7 +66,7 @@ export class PostgresIdentityRepository implements IdentityRepository {
       await client.query("SET LOCAL lock_timeout = '1s'");
       await client.query("SET LOCAL idle_in_transaction_session_timeout = '5s'");
       const privileges = await client.query<{ unsafe: boolean }>(
-        "SELECT (r.rolsuper OR r.rolbypassrls OR pg_has_role(current_user,'margin_identity_provisioner','MEMBER') OR EXISTS(SELECT 1 FROM pg_roles p WHERE p.rolname IN ('margin_assignment_provisioner','margin_assignment_work_runtime') AND pg_has_role(current_user,p.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_identity','margin_work') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user",
+        "SELECT (r.rolsuper OR r.rolbypassrls OR pg_has_role(current_user,'margin_identity_provisioner','MEMBER') OR EXISTS(SELECT 1 FROM pg_roles p WHERE p.rolname IN ('margin_assignment_provisioner','margin_assignment_work_runtime','margin_submission_runtime','margin_submission_retention_guard') AND pg_has_role(current_user,p.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_identity','margin_work','margin_submissions') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user",
       );
       if (!privileges.rows[0] || privileges.rows[0].unsafe)
         throw new Error(

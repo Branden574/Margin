@@ -25,6 +25,8 @@ import {
 import type { AssignmentWorkService } from './assignments/work/types.js';
 import { AssignmentError } from './assignments/types.js';
 import { handleCanvasAssignmentReturn, isCanvasAssignmentReturnPath } from './assignment-return.js';
+import { handleSubmissions, isSubmissionPath } from './submission-http.js';
+import type { AssignmentSubmissionService } from './assignments/submissions/types.js';
 
 const MIB = 1024 * 1024;
 export interface LocalIdentity {
@@ -55,6 +57,8 @@ export interface ApiOptions {
   assignmentService?: CanvasAssignmentService;
   /** Optional current-launch student adapter; never configured by the default local entry point. */
   assignmentWorkService?: AssignmentWorkService;
+  /** Explicit opt-in; capture alone does not confirm delivery to Canvas. */
+  assignmentSubmissionService?: AssignmentSubmissionService;
   keyEncryptionKey?: Buffer;
   keyManagementProvider?: KeyManagementProvider;
   tls?: { key: Buffer; cert: Buffer };
@@ -186,7 +190,9 @@ async function entries(path: string): Promise<string[]> {
 /** Encrypted local service. Production still requires OIDC, KMS, isolated scanning and a durable audit sink. */
 export function createApi(options: ApiOptions) {
   if (
-    (options.assignmentService || options.assignmentWorkService) &&
+    (options.assignmentService ||
+      options.assignmentWorkService ||
+      options.assignmentSubmissionService) &&
     (!options.identityService || !options.lmsService)
   )
     throw new Error('Canvas assignments require authenticated identity and LMS launch services.');
@@ -422,6 +428,7 @@ export function createApi(options: ApiOptions) {
           canvasConfigured: Boolean(options.lmsService),
           assignmentsConfigured: Boolean(options.assignmentService),
           assignmentWorkConfigured: Boolean(options.assignmentWorkService),
+          assignmentSubmissionsConfigured: Boolean(options.assignmentSubmissionService),
         });
         return;
       }
@@ -466,6 +473,20 @@ export function createApi(options: ApiOptions) {
       limit(`user:${identity.tenantId}:${identity.userId}`, options.requestsPerMinute ?? 1200);
       if (path === '/api/assignments' || path.startsWith('/api/assignments/')) {
         routeName = '/api/assignments/:action';
+        if (isSubmissionPath(path)) {
+          await handleSubmissions(
+            req,
+            res,
+            options.assignmentSubmissionService,
+            principal,
+            async () => {
+              const fresh = await options.identityService!.authenticateRequest(req);
+              options.identityService!.verifyCsrf(req, fresh);
+              return fresh.principal;
+            },
+          );
+          return;
+        }
         if (
           assignmentReturn &&
           options.assignmentService &&

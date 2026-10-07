@@ -76,3 +76,26 @@
     font-size: 12px;
   }
 }
+.canvas-submission {
+  flex-basis: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  border-top: 1px solid var(--ed-border);
+  padding-top: 12px;
+}
+.canvas-submission-copy {
+  flex: 1 1 280px;
+  min-width: 0;
+}
+.canvas-submission-copy strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.canvas-submission-copy p {
+  margin: 5px 0;
+}

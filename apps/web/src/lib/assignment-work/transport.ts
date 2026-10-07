@@ -64,7 +64,7 @@ export class Transport {
   async request(
     scope: RequestScope,
     path: string,
-    expectedStatus: number,
+    expectedStatus: number | readonly number[],
     body?: string,
     csrf?: string,
   ) {
@@ -97,7 +97,11 @@ export class Transport {
       cancel(response);
       throw fail('redirect_refused', 'The assignment service returned an unexpected destination.');
     }
-    if (response.status !== expectedStatus) {
+    if (
+      !(typeof expectedStatus === 'number' ? [expectedStatus] : expectedStatus).includes(
+        response.status,
+      )
+    ) {
       if (response.status >= 300 && response.status < 400) {
         cancel(response);
         throw fail('redirect_refused', 'Assignment redirects are not followed.');

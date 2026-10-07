@@ -1,10 +1,25 @@
 import type { Annotation, AnnotationOperation, DocumentRecord } from '@margin/core';
 import type { AppendOperation, AppendReceipt, WorkManifest } from './types';
+import type { SubmissionRequest } from './submissionTypes';
 
 export const MAX_OUTBOX_OPERATIONS = 1_000;
 export const MAX_OUTBOX_BYTES = 8 * 1024 * 1024;
 export const MAX_BASELINE_ANNOTATIONS = 20_000;
 export const MAX_BASELINE_BYTES = 32 * 1024 * 1024;
+export const MAX_LOCAL_SUBMISSION_REQUESTS = 32;
+export interface AssignmentSubmissionRecord {
+  schema: 1;
+  localDocumentId: string;
+  request: { requestId: string; expectedCursor: number };
+  outcome?: SubmissionRequest;
+  /** Remains set after capture until the student explicitly continues the draft. */
+  barrier: boolean;
+}
+export interface AssignmentSubmissionIndex {
+  schema: 1;
+  requestIds: string[];
+  activeRequestId: string | null;
+}
 export interface AssignmentIdentity {
   origin: string;
   organizationId: string;
@@ -30,6 +45,8 @@ export interface AssignmentBinding {
   baselineIds: string[];
   baselineBytes: number;
   hydrated: boolean;
+  /** Optional versioned extension; absence is the existing pre-submission vault format. */
+  submissions?: AssignmentSubmissionIndex;
 }
 export interface AssignmentOutboxEntry {
   schema: 1;
@@ -55,6 +72,7 @@ export interface AssignmentSnapshot {
   binding: AssignmentBinding;
   annotations: Annotation[];
   pending: { operationId: string; annotationId: string; status: AssignmentOutboxEntry['status'] }[];
+  submission: AssignmentSubmissionRecord | null;
 }
 export class AssignmentRepositoryError extends Error {
   readonly name = 'AssignmentRepositoryError';
