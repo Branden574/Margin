@@ -69,6 +69,10 @@ function notify(change: DataChange) {
 export function notifyAssignmentChange(documentId: string) {
   notify({ entity: 'document', id: documentId });
 }
+/** Navigation hint only; current Canvas launch verification remains required. */
+export async function isAssignmentCopy(documentId: string): Promise<boolean> {
+  return (await readVaultRecord('assignment-bindings', documentId)) !== undefined;
+}
 async function assertUnboundDocument(tx: VaultTransaction, documentId: string) {
   if (await tx.has('assignment-bindings', documentId))
     throw new Error(

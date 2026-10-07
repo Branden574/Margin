@@ -10,6 +10,7 @@ import {
 } from '../apps/web/src/lib/assignment-work/client';
 import {
   createVerifiedWorkCopy,
+  findVerifiedWorkCopy,
   enqueueAssignmentOperation,
   readAssignmentSnapshot,
   prepareAssignmentSend,
@@ -17,7 +18,10 @@ import {
   markAssignmentOutcome,
   applyAssignmentCatchUp,
 } from '../apps/web/src/lib/assignment-work/repository';
-import { MAX_OUTBOX_OPERATIONS } from '../apps/web/src/lib/assignment-work/repositoryTypes';
+import {
+  AssignmentRetryError,
+  MAX_OUTBOX_OPERATIONS,
+} from '../apps/web/src/lib/assignment-work/repositoryTypes';
 import {
   createVault,
   lockVault,
@@ -32,6 +36,7 @@ import {
   appendAnnotationOperation,
   deleteDocument,
   getDocumentBlob,
+  isAssignmentCopy,
   listDocuments,
   patchDocument,
   putDocumentBlob,
@@ -231,6 +236,142 @@ afterEach(async () => {
 });
 
 describe('encrypted assignment repository', () => {
+  it('finds only the verified identity and resumes the same copy after a fresh launch and vault unlock', async () => {
+    const h = await harness();
+    const verified = await h.snapshot();
+    const before = await raw();
+    expect(await findVerifiedWorkCopy(verified)).toBeUndefined();
+    expect(await raw()).toEqual(before);
+    const document = await createVerifiedWorkCopy(verified);
+    await patchDocument(document.id, { name: 'Saved local label' });
+    h.client.dispose();
+    await lockVault();
+    await unlockVault(passphrase);
+    const resumed = await harness();
+    resumed.state.sessionId = id(80);
+    const fresh = await resumed.client.verifiedSnapshot();
+    resumed.fetcher.mockClear();
+    const found = await findVerifiedWorkCopy(fresh);
+    expect(found).toMatchObject({
+      id: document.id,
+      contentRevision: document.contentRevision,
+      name: 'Saved local label',
+    });
+    expect(resumed.fetcher).not.toHaveBeenCalled();
+    found!.name = 'Caller mutation';
+    expect((await findVerifiedWorkCopy(fresh))!.name).toBe('Saved local label');
+    const other = await harness();
+    other.state.userId = id(81);
+    expect(await findVerifiedWorkCopy(await other.client.verifiedSnapshot())).toBeUndefined();
+  });
+  it.each([
+    ['null', null],
+    ['non-object', 'damaged'],
+    ['noncanonical ID', { localDocumentId: 'ABCDEF01-ABCD-4000-8000-ABCDEF012345' }],
+    ['extra properties', { localDocumentId: id(90), unrelated: true }],
+  ])('refuses a corrupt %s copy index instead of treating it as absent', async (_, damaged) => {
+    const h = await fixture();
+    const index = (await listVaultRecords('settings')).find((row) =>
+      row.key.startsWith('assignment-copy:'),
+    )!;
+    await vaultTransaction(async (tx) => tx.put('settings', index.key, damaged));
+    const before = await raw();
+    await expect(findVerifiedWorkCopy(h.verified)).rejects.toMatchObject({
+      code: 'invalid_copy_index',
+    });
+    expect(await raw()).toEqual(before);
+  });
+  it.each([
+    'missing-document',
+    'missing-binding',
+    'revision-mismatch',
+    'missing-revision',
+    'wrong-document-ID',
+    'wrong-identity',
+    'missing-blob',
+    'dangling-index',
+  ])('refuses an indexed copy with %s atomically', async (fault) => {
+    const h = await fixture();
+    await vaultTransaction(async (tx) => {
+      const document = await tx.get<any>('documents', h.document.id);
+      const binding = await tx.get<any>('assignment-bindings', h.document.id);
+      if (fault === 'missing-document') tx.delete('documents', h.document.id);
+      if (fault === 'missing-binding') tx.delete('assignment-bindings', h.document.id);
+      if (fault === 'revision-mismatch') {
+        document.contentRevision = id(90);
+        tx.put('documents', h.document.id, document);
+      }
+      if (fault === 'missing-revision') {
+        delete document.contentRevision;
+        delete binding.contentRevision;
+        tx.put('documents', h.document.id, document);
+        tx.put('assignment-bindings', h.document.id, binding);
+      }
+      if (fault === 'wrong-document-ID') {
+        document.id = id(90);
+        tx.put('documents', h.document.id, document);
+      }
+      if (fault === 'wrong-identity') {
+        binding.identity.userId = id(90);
+        tx.put('assignment-bindings', h.document.id, binding);
+      }
+      if (fault === 'missing-blob') tx.delete('blobs', h.document.id);
+      if (fault === 'dangling-index') {
+        const index = (await tx.list('settings')).find((row) =>
+          row.key.startsWith('assignment-copy:'),
+        )!;
+        tx.put('settings', index.key, { localDocumentId: id(90) });
+      }
+    });
+    const before = await raw();
+    await expect(findVerifiedWorkCopy(h.verified)).rejects.toMatchObject({
+      code:
+        fault === 'missing-blob'
+          ? 'source_missing'
+          : fault === 'wrong-identity'
+            ? 'binding_mismatch'
+            : 'stale_binding',
+    });
+    expect(await raw()).toEqual(before);
+  });
+  it.each(['expiry', 'dispose', 'abort'] as const)(
+    'withholds lookup results after %s while reading the encrypted index',
+    async (reason) => {
+      const h = await fixture(),
+        controller = new AbortController(),
+        before = await raw();
+      const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+      vi.spyOn(crypto.subtle, 'decrypt').mockImplementationOnce(async (...args) => {
+        const result = await decrypt(...args);
+        if (reason === 'expiry') h.state.now += 60_000;
+        else if (reason === 'dispose') h.client.dispose();
+        else controller.abort();
+        return result;
+      });
+      await expect(findVerifiedWorkCopy(h.verified, controller.signal)).rejects.toMatchObject(
+        reason === 'abort'
+          ? { name: 'AbortError' }
+          : { code: reason === 'expiry' ? 'verification_required' : 'session_invalidated' },
+      );
+      expect(await raw()).toEqual(before);
+    },
+  );
+  it('returns the single committed copy after concurrent verified creation attempts', async () => {
+    const h = await harness(),
+      verified = await h.snapshot();
+    const results = await Promise.allSettled([
+      createVerifiedWorkCopy(verified),
+      createVerifiedWorkCopy(verified),
+    ]);
+    const created = results.filter((result) => result.status === 'fulfilled');
+    const refused = results.filter((result) => result.status === 'rejected');
+    expect(created).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    expect(refused[0].reason).toMatchObject({ code: 'already_bound' });
+    expect(await findVerifiedWorkCopy(verified)).toEqual(created[0].value);
+    expect(await listDocuments()).toHaveLength(1);
+    expect(await listVaultRecords('assignment-bindings')).toHaveLength(1);
+  });
   it.each(['records', 'public'] as const)(
     'aborts active IDB changes when provenance is invalidated on the %s write response',
     async (store) => {
@@ -473,6 +614,100 @@ describe('encrypted assignment repository', () => {
     await enqueueAssignmentOperation(h.document.id, r, first);
     expect((await readAssignmentSnapshot(h.document.id, r)).pending).toEqual([]);
   });
+  it('refuses a stale rendered edit when concurrent catch-up advances the baseline before enqueue runs', async () => {
+    const h = await fixture(),
+      r = h.document.contentRevision!,
+      saved = edit(h.document);
+    await enqueueAssignmentOperation(h.document.id, r, saved, undefined, 0);
+    const first = (await prepareAssignmentSend(h.document.id, r, h.verified))!;
+    await applyAssignmentCatchUp(h.document.id, r, h.verified, 0, events([first]));
+    const rendered = await readAssignmentSnapshot(h.document.id, r);
+    const otherDevice = {
+      ...first,
+      operationId: id(70),
+      baseRevision: 1,
+      annotation: { ...first.annotation!, text: 'Newer other-device answer' },
+    };
+    const pause = pauseEncryption();
+    const refreshing = applyAssignmentCatchUp(
+      h.document.id,
+      r,
+      h.verified,
+      1,
+      events([otherDevice], 1),
+    );
+    await pause.started;
+    const local = edit(h.document, 11, 'Stale rendered answer');
+    const original = structuredClone(local);
+    const saving = enqueueAssignmentOperation(
+      h.document.id,
+      r,
+      local,
+      undefined,
+      rendered.binding.appliedCursor,
+    );
+    const outcome = expect(saving).rejects.toMatchObject({ code: 'stale_editor_cursor' });
+    pause.release();
+    await refreshing;
+    await outcome;
+    expect(local).toEqual(original);
+    const snapshot = await readAssignmentSnapshot(h.document.id, r);
+    expect(snapshot.binding.appliedCursor).toBe(2);
+    expect(snapshot.annotations[0].text).toBe('Newer other-device answer');
+    expect(snapshot.pending).toEqual([]);
+    expect(await readVaultRecord('annotations', local.id)).toBeUndefined();
+    expect(await listVaultRecords('assignment-outbox')).toEqual([]);
+    // A separately refreshed editor may submit its deliberate new edit at the current cursor.
+    await enqueueAssignmentOperation(h.document.id, r, local, undefined, 2);
+    expect((await prepareAssignmentSend(h.document.id, r, h.verified))!.baseRevision).toBe(2);
+  });
+  it('confirms an exact committed retry at an older cursor without accepting a new stale edit', async () => {
+    const h = await fixture(),
+      r = h.document.contentRevision!,
+      original = edit(h.document);
+    await enqueueAssignmentOperation(h.document.id, r, original, undefined, 0);
+    const sent = (await prepareAssignmentSend(h.document.id, r, h.verified))!;
+    await applyAssignmentCatchUp(h.document.id, r, h.verified, 0, events([sent]));
+    const before = await raw();
+    await enqueueAssignmentOperation(h.document.id, r, structuredClone(original), undefined, 0);
+    expect(await raw()).toEqual(before);
+    await expect(
+      enqueueAssignmentOperation(
+        h.document.id,
+        r,
+        edit(h.document, 11, 'New edit from stale editor'),
+        undefined,
+        0,
+      ),
+    ).rejects.toMatchObject({ code: 'stale_editor_cursor' });
+    await expect(
+      enqueueAssignmentOperation(
+        h.document.id,
+        r,
+        { ...original, annotation: { ...original.annotation!, text: 'Changed duplicate payload' } },
+        undefined,
+        0,
+      ),
+    ).rejects.toMatchObject({ code: 'local_operation_conflict' });
+    expect(await raw()).toEqual(before);
+  });
+  it.each([-1, 0.5, 100_001, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN])(
+    'rejects invalid rendered cursor %s without local writes',
+    async (cursor) => {
+      const h = await fixture(),
+        before = await raw();
+      await expect(
+        enqueueAssignmentOperation(
+          h.document.id,
+          h.document.contentRevision!,
+          edit(h.document),
+          undefined,
+          cursor,
+        ),
+      ).rejects.toMatchObject({ code: 'invalid_editor_cursor' });
+      expect(await raw()).toEqual(before);
+    },
+  );
   it('snapshots caller edits, preserves exact retries over lock/reload, and invalidates old capabilities', async () => {
     const h = await fixture(),
       r = h.document.contentRevision!,
@@ -484,16 +719,16 @@ describe('encrypted assignment repository', () => {
     expect(sent.annotation?.text).toBe('Private student draft');
     await lockVault();
     await unlockVault(passphrase);
-    await expect(prepareAssignmentSend(h.document.id, r, h.verified, true)).rejects.toThrow(
-      'locked',
-    );
+    await expect(
+      prepareAssignmentSend(h.document.id, r, h.verified, sent.operationId),
+    ).rejects.toThrow('locked');
     const fresh = await h.client.verifiedSnapshot();
     await expect(prepareAssignmentSend(h.document.id, r, fresh)).rejects.toMatchObject({
       code: 'uncertain_save',
     });
-    expect(await prepareAssignmentSend(h.document.id, r, fresh, true)).toEqual(sent);
+    expect(await prepareAssignmentSend(h.document.id, r, fresh, sent.operationId)).toEqual(sent);
     await markAssignmentOutcome(h.document.id, r, sent.operationId, 'uncertain');
-    expect(await prepareAssignmentSend(h.document.id, r, fresh, true)).toEqual(sent);
+    expect(await prepareAssignmentSend(h.document.id, r, fresh, sent.operationId)).toEqual(sent);
     expect((await readAssignmentSnapshot(h.document.id, r)).annotations[0].text).toBe(
       'Private student draft',
     );
@@ -520,6 +755,79 @@ describe('encrypted assignment repository', () => {
       prepareAssignmentSend(h.document.id, r, await other.client.verifiedSnapshot()),
     ).rejects.toMatchObject({ code: 'binding_mismatch' });
     expect((await readAssignmentSnapshot(h.document.id, r)).pending[0].status).toBe('queued');
+  });
+  it.each(['acknowledged', 'applied'] as const)(
+    'never retries a replacement queue head when the intended operation was %s during a concurrent transaction',
+    async (state) => {
+      const h = await fixture(),
+        r = h.document.contentRevision!;
+      await enqueueAssignmentOperation(h.document.id, r, edit(h.document));
+      await enqueueAssignmentOperation(h.document.id, r, edit(h.document, 11, 'Later draft'));
+      const original = (await prepareAssignmentSend(h.document.id, r, h.verified))!;
+      await markAssignmentOutcome(h.document.id, r, original.operationId, 'uncertain');
+      // Reconciliation wins the transaction queue after a caller has observed the uncertain row.
+      // An exact retry queued during that save must see the new head without choosing it.
+      const pause = pauseEncryption();
+      const reconcile =
+        state === 'acknowledged'
+          ? acknowledgeAssignmentOperation(h.document.id, r, ack(original, 1))
+          : applyAssignmentCatchUp(h.document.id, r, h.verified, 0, events([original]));
+      await pause.started;
+      const retry = prepareAssignmentSend(h.document.id, r, h.verified, original.operationId);
+      const outcome = retry.catch((error: unknown) => error);
+      pause.release();
+      await reconcile;
+      const error = await outcome;
+      expect(error).toBeInstanceOf(AssignmentRetryError);
+      expect(error).toMatchObject({
+        code: 'retry_reconciled',
+        operationId: original.operationId,
+      });
+      const saved = await readAssignmentSnapshot(h.document.id, r);
+      expect(saved.pending.find((row) => row.operationId === id(11))!.status).toBe('queued');
+      expect(saved.annotations[0].text).toBe('Later draft');
+      // Deliberately preparing the next normal send is a separate caller decision.
+      expect((await prepareAssignmentSend(h.document.id, r, h.verified))!.operationId).toBe(id(11));
+    },
+  );
+  it.each([
+    ['noncanonical', 'ABCDEF01-ABCD-4000-8000-ABCDEF012345', 'invalid_retry_operation'],
+    ['unknown', id(99), 'retry_not_pending'],
+    ['queued', id(10), 'retry_not_pending'],
+  ])('refuses a %s retry ID without sending a queued row', async (_, retryId, code) => {
+    const h = await fixture(),
+      r = h.document.contentRevision!;
+    await enqueueAssignmentOperation(h.document.id, r, edit(h.document));
+    const before = await raw();
+    const error = await prepareAssignmentSend(h.document.id, r, h.verified, retryId).catch(
+      (value: unknown) => value,
+    );
+    expect(error).toBeInstanceOf(AssignmentRetryError);
+    expect(error).toMatchObject({ code, operationId: retryId });
+    expect(await raw()).toEqual(before);
+    expect((await readAssignmentSnapshot(h.document.id, r)).pending[0].status).toBe('queued');
+  });
+  it('requires an exact unresolved retry to remain the first eligible row', async () => {
+    const h = await fixture(),
+      r = h.document.contentRevision!;
+    await enqueueAssignmentOperation(h.document.id, r, edit(h.document));
+    await enqueueAssignmentOperation(h.document.id, r, edit(h.document, 11, 'Later draft'));
+    const first = (await prepareAssignmentSend(h.document.id, r, h.verified))!;
+    await acknowledgeAssignmentOperation(h.document.id, r, ack(first, 1));
+    const later = (await prepareAssignmentSend(h.document.id, r, h.verified))!;
+    // A competing operation conflicts with both retained drafts, including the earlier head.
+    await applyAssignmentCatchUp(
+      h.document.id,
+      r,
+      h.verified,
+      0,
+      events([{ ...first, operationId: id(70) }]),
+    );
+    const before = await raw();
+    await expect(
+      prepareAssignmentSend(h.document.id, r, h.verified, later.operationId),
+    ).rejects.toMatchObject({ code: 'retry_not_head', operationId: later.operationId });
+    expect(await raw()).toEqual(before);
   });
   it('keeps a newer offline overlay when an older acknowledged echo arrives', async () => {
     const h = await fixture(),
@@ -553,7 +861,9 @@ describe('encrypted assignment repository', () => {
     const snapshot = await readAssignmentSnapshot(h.document.id, r);
     expect(snapshot.annotations[0].text).toBe('Second offline draft');
     expect(snapshot.pending.every((p) => p.status === 'conflict')).toBe(true);
-    await expect(prepareAssignmentSend(h.document.id, r, h.verified, true)).rejects.toMatchObject({
+    await expect(
+      prepareAssignmentSend(h.document.id, r, h.verified, original.operationId),
+    ).rejects.toMatchObject({
       code: 'outbox_conflict',
     });
     const stored = await readVaultRecord<{ operation: AppendOperation }>(
@@ -613,6 +923,8 @@ describe('encrypted assignment repository', () => {
     const h = await fixture(),
       doc = h.document,
       blob = (await getDocumentBlob(doc.id))!;
+    expect(await isAssignmentCopy(doc.id)).toBe(true);
+    expect(await isAssignmentCopy(id(999))).toBe(false);
     for (const run of [
       () => appendAnnotationOperation(edit(doc)),
       () => putDocumentBlob(doc.id, blob),

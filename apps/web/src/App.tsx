@@ -135,6 +135,10 @@ export default function App() {
       // Its guard runs after all destination I/O, directly before committing the route.
       let target: { document: DocumentRecord; blob: Blob } | null = null;
       if (route.documentId) {
+        if (await db.isAssignmentCopy(route.documentId))
+          throw new Error(
+            'Open this assignment from its Canvas activity to continue. Your saved work remains on this device.',
+          );
         const [document, blob] = await Promise.all([
           db.getDocument(route.documentId),
           db.getDocumentBlob(route.documentId),

@@ -1,0 +1,78 @@
+.canvas-work-opening {
+  min-height: 100dvh;
+  padding: clamp(24px, 5vw, 64px);
+  background: var(--bg);
+  color: var(--ink);
+}
+.canvas-work-message {
+  max-width: 560px;
+  margin: 14vh auto 0;
+}
+.canvas-work-message h1 {
+  font-family: 'Manrope', sans-serif;
+  font-size: clamp(24px, 4vw, 34px);
+  line-height: 1.3;
+  letter-spacing: -0.04em;
+}
+.canvas-work-message p {
+  line-height: 1.7;
+  margin: 18px 0 24px;
+}
+.canvas-work-back {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: inherit;
+  margin-top: 28px;
+  width: fit-content;
+}
+.canvas-work-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 24px;
+  padding: 10px 28px;
+  background: var(--ed-paper);
+  border-bottom: 1px solid var(--ed-border);
+  flex: none;
+}
+.canvas-work-status > div:first-child {
+  flex: 1;
+  min-width: 220px;
+}
+.canvas-work-status p {
+  margin: 0;
+}
+.canvas-work-status small {
+  color: var(--ed-ink);
+  opacity: 0.8;
+}
+.canvas-work-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.canvas-work-instructions summary {
+  cursor: pointer;
+  margin-top: 5px;
+}
+.canvas-work-instructions p {
+  white-space: pre-wrap;
+  margin-top: 8px;
+  max-width: 70ch;
+}
+.canvas-work-error {
+  color: var(--ink, #292925);
+  font-weight: 600;
+  flex-basis: 100%;
+}
+.canvas-work-status .canvas-work-error {
+  color: var(--ed-ink);
+}
+@media (max-width: 760px) {
+  .canvas-work-status {
+    padding: 8px 14px;
+    font-size: 12px;
+  }
+}

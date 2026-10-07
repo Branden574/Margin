@@ -65,3 +65,17 @@ export class AssignmentRepositoryError extends Error {
     super(message);
   }
 }
+/** An exact retry is never allowed to select a different queued operation. */
+export class AssignmentRetryError extends AssignmentRepositoryError {
+  constructor(
+    readonly code:
+      | 'invalid_retry_operation'
+      | 'retry_reconciled'
+      | 'retry_not_pending'
+      | 'retry_not_head',
+    readonly operationId: string,
+    message: string,
+  ) {
+    super(code, message);
+  }
+}

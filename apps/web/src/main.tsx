@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import { VaultGate } from './components/VaultGate';
 import './styles.css';
+const CanvasStudentWork = React.lazy(() => import('./components/CanvasStudentWork'));
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
   { error: string | null }
@@ -29,7 +30,13 @@ class ErrorBoundary extends React.Component<
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <ErrorBoundary>
     <VaultGate>
-      <App />
+      {location.pathname === '/canvas/work' ? (
+        <React.Suspense fallback={<div className="app-loading">Opening Canvas assignment…</div>}>
+          <CanvasStudentWork />
+        </React.Suspense>
+      ) : (
+        <App />
+      )}
     </VaultGate>
   </ErrorBoundary>,
 );

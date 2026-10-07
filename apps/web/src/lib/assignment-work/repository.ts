@@ -17,16 +17,18 @@ import {
   MAX_BASELINE_BYTES,
   MAX_OUTBOX_BYTES,
   MAX_OUTBOX_OPERATIONS,
+  AssignmentRetryError,
   type AssignmentBaseline,
   type AssignmentBinding,
+  type AssignmentIdentity,
   type AssignmentOutboxEntry,
   type AssignmentSnapshot,
 } from './repositoryTypes';
-import type { AppendReceipt, CatchUpResult } from './types';
+import type { AppendOperation, AppendReceipt, CatchUpResult } from './types';
 
 const size = (value: unknown) => new TextEncoder().encode(canonical(value)).byteLength;
 const rowKey = (documentId: string, id: string) => `${documentId}:${id}`;
-const indexKey = (binding: AssignmentBinding) => `assignment-copy:${canonical(binding.identity)}`;
+const indexKey = (identity: AssignmentIdentity) => `assignment-copy:${canonical(identity)}`;
 interface AppliedReceipt {
   operationId: string;
   cursor: number;
@@ -174,7 +176,7 @@ export async function createVerifiedWorkCopy(
     id,
     async (tx) => {
       readVerifiedSnapshot(verified);
-      if (await tx.has('settings', indexKey(binding)))
+      if (await tx.has('settings', indexKey(binding.identity)))
         return repositoryError(
           'already_bound',
           'A local copy of this assignment already exists. Open that copy instead.',
@@ -187,7 +189,7 @@ export async function createVerifiedWorkCopy(
       tx.put('documents', id, document);
       tx.put('blobs', id, data.source);
       tx.put('assignment-bindings', id, binding);
-      tx.put('settings', indexKey(binding), { localDocumentId: id });
+      tx.put('settings', indexKey(binding.identity), { localDocumentId: id });
       return document;
     },
     signal,
@@ -195,6 +197,54 @@ export async function createVerifiedWorkCopy(
       readVerifiedSnapshot(verified);
     },
   );
+}
+
+/** Resolve only a verified identity; the eventual blob read must authenticate PDF ciphertext before display. */
+export async function findVerifiedWorkCopy(
+  verified: VerifiedAssignmentSnapshot,
+  signal?: AbortSignal,
+): Promise<DocumentRecord | undefined> {
+  const guard = createVaultGuard();
+  const identity = assignmentIdentity(readVerifiedSnapshot(verified));
+  const assertLive = () => {
+    guard();
+    if (signal?.aborted)
+      throw new DOMException('This assignment lookup was cancelled.', 'AbortError');
+    readVerifiedSnapshot(verified);
+  };
+  const document = await vaultTransaction(
+    async (tx) => {
+      const index = await tx.get<unknown>('settings', indexKey(identity));
+      if (index === undefined) return undefined;
+      let documentId: string;
+      try {
+        if (!index || typeof index !== 'object' || Array.isArray(index)) throw new Error();
+        const value = index as Record<string, unknown>;
+        documentId = decode.id(value.localDocumentId);
+        if (documentId !== value.localDocumentId || Object.keys(value).length !== 1)
+          throw new Error();
+      } catch {
+        return repositoryError('invalid_copy_index', 'The saved assignment copy index is damaged.');
+      }
+      const { binding, document } = await load(tx, documentId);
+      assertVerified(binding, verified);
+      if (
+        document.id !== documentId ||
+        typeof document.contentRevision !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+          document.contentRevision,
+        )
+      )
+        return repositoryError('stale_binding', 'The saved assignment PDF revision is damaged.');
+      if (!(await tx.has('blobs', documentId)))
+        return repositoryError('source_missing', 'The saved assignment PDF is missing.');
+      return structuredClone(document);
+    },
+    { signal, guard: assertLive },
+  );
+  guard();
+  assertLive();
+  return document;
 }
 
 /** Local data only. Wire payloads are deliberately absent; this does not authorize dispatch. */
@@ -247,8 +297,16 @@ export async function enqueueAssignmentOperation(
   expectedRevision: string,
   value: AnnotationOperation,
   signal?: AbortSignal,
+  expectedAppliedCursor?: number,
 ): Promise<void> {
   const local = structuredClone(value);
+  if (
+    expectedAppliedCursor !== undefined &&
+    (!Number.isSafeInteger(expectedAppliedCursor) ||
+      expectedAppliedCursor < 0 ||
+      expectedAppliedCursor > 100_000)
+  )
+    return repositoryError('invalid_editor_cursor', 'The rendered assignment cursor is invalid.');
   try {
     if (decode.id(local.id) !== local.id || decode.id(local.annotationId) !== local.annotationId)
       throw new Error();
@@ -281,6 +339,13 @@ export async function enqueueAssignmentOperation(
           );
         return;
       }
+      // An identical persisted operation above is an idempotent confirmation,
+      // not a new edit. Never derive a new revision from an unseen baseline.
+      if (expectedAppliedCursor !== undefined && binding.appliedCursor !== expectedAppliedCursor)
+        return repositoryError(
+          'stale_editor_cursor',
+          'Assignment updates arrived from another tab. Your draft has been kept; refresh the saved work before editing again.',
+        );
       const rows = await queue(tx, binding);
       const previous = [...rows]
         .reverse()
@@ -346,14 +411,54 @@ export async function prepareAssignmentSend(
   documentId: string,
   expectedRevision: string,
   verified: VerifiedAssignmentSnapshot,
-  retry = false,
+  retryOperationId?: string,
   signal?: AbortSignal,
-) {
+): Promise<AppendOperation | null> {
+  if (retryOperationId !== undefined) {
+    try {
+      if (decode.id(retryOperationId) !== retryOperationId) throw new Error();
+    } catch {
+      throw new AssignmentRetryError(
+        'invalid_retry_operation',
+        retryOperationId,
+        'Choose the exact canonical operation ID to retry.',
+      );
+    }
+  }
   return commit(
     documentId,
     async (tx) => {
       const { binding } = await load(tx, documentId, expectedRevision);
       const data = assertVerified(binding, verified);
+      const rows = await queue(tx, binding),
+        row = rows.find((candidate) => candidate.status !== 'acknowledged');
+      if (retryOperationId !== undefined) {
+        const intended = rows.find(
+          (candidate) => candidate.operation.operationId === retryOperationId,
+        );
+        const applied = await tx.get<AppliedReceipt>(
+          'assignment-receipts',
+          rowKey(documentId, retryOperationId),
+        );
+        if (intended?.status === 'acknowledged' || applied)
+          throw new AssignmentRetryError(
+            'retry_reconciled',
+            retryOperationId,
+            'This operation was already confirmed. Reload its saved state before continuing.',
+          );
+        if (!intended || !['sending', 'uncertain', 'conflict'].includes(intended.status))
+          throw new AssignmentRetryError(
+            'retry_not_pending',
+            retryOperationId,
+            'This operation has no unresolved send to retry.',
+          );
+        if (intended !== row)
+          throw new AssignmentRetryError(
+            'retry_not_head',
+            retryOperationId,
+            'Resolve the earlier queued operation before retrying this operation.',
+          );
+      }
       const serverCursor =
         data.manifest.work?.status === 'provisioned'
           ? data.manifest.work.document.cursor
@@ -363,15 +468,16 @@ export async function prepareAssignmentSend(
           'catch_up_required',
           'Recover the current assignment operations before sending drafts.',
         );
-      const rows = await queue(tx, binding),
-        row = rows.find((candidate) => candidate.status !== 'acknowledged');
       if (!row) return null;
       if (row.status === 'conflict')
         return repositoryError(
           'outbox_conflict',
           'Resolve the saved assignment conflict before sending later edits.',
         );
-      if ((row.status === 'sending' || row.status === 'uncertain') && !retry)
+      if (
+        (row.status === 'sending' || row.status === 'uncertain') &&
+        retryOperationId === undefined
+      )
         return repositoryError(
           'uncertain_save',
           'Retry the exact saved operation to resolve its uncertain outcome.',

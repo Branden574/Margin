@@ -3,6 +3,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type ReactNode,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import {
@@ -53,7 +54,8 @@ import {
   getOcrForExport,
   replaceDocumentWithAnnotations,
 } from '../lib/storage';
-import { useAnnotations } from './useAnnotations';
+import { useAnnotations, type AnnotationPersistence } from './useAnnotations';
+import { assertAssignmentEdit, assignmentToolAllowed } from './assignmentEditing';
 import { usePdf } from './usePdf';
 import { PdfCanvas } from './PdfCanvas';
 import { AnnotationGraphic } from './AnnotationLayer';
@@ -93,6 +95,12 @@ import { useDocumentLock } from './useDocumentLock';
 import { createVaultGuard, encryptExport, onBeforeVaultLock, onVaultLock } from '../lib/vault';
 import './editor.css';
 
+export interface AssignmentEditorOptions {
+  persistence: AnnotationPersistence;
+  allowedTools: readonly AnnotationTool[];
+  readOnly: boolean;
+  controls: ReactNode;
+}
 interface Props {
   document: DocumentRecord;
   blob: Blob;
@@ -100,6 +108,7 @@ interface Props {
   onDocumentChange: (changes: { blob: Blob; document: DocumentRecord }) => Promise<void>;
   shortcuts?: boolean;
   registerLeaveGuard?: (guard: (() => Promise<void>) | null) => void;
+  assignment?: AssignmentEditorOptions;
 }
 interface Snapshot {
   annotations: Annotation[];
@@ -135,7 +144,10 @@ export default function DocumentEditor({
   onDocumentChange,
   shortcuts = true,
   registerLeaveGuard,
+  assignment,
 }: Props) {
+  const assignmentRef = useRef(assignment);
+  assignmentRef.current = assignment;
   const [workingBlob, setWorkingBlob] = useState(blob);
   const [contentRevision, setContentRevision] = useState('');
   const [ocrRefresh, setOcrRefresh] = useState(0);
@@ -156,7 +168,7 @@ export default function DocumentEditor({
     loaded,
     reload,
     syncTimestamp,
-  } = useAnnotations(record.id, record.updatedAt);
+  } = useAnnotations(record.id, record.updatedAt, assignment?.persistence);
   const [pageIndex, setPageIndex] = useState(0),
     [zoom, setZoom] = useState(0.95),
     [pageSize, setPageSize] = useState({ width: 612, height: 792 });
@@ -239,6 +251,10 @@ export default function DocumentEditor({
     !vaultLocking &&
     !leaving &&
     !busy;
+  const editable = ready && !assignment?.readOnly;
+  const canUseTool = (next: AnnotationTool | Annotation['type']) =>
+    ready && assignmentToolAllowed(assignment, next);
+  const canChangePdf = ready && !assignment;
   const ocr = usePageOcr(pdf, record.id, contentRevision, pageIndex, ready, () =>
     setOcrRefresh((value) => value + 1),
   );
@@ -398,15 +414,55 @@ export default function DocumentEditor({
     });
     setFuture([]);
   }
+  function allowPdfMutation() {
+    if (!assignmentRef.current) return true;
+    setError('Assignment PDF pages and form fields cannot be changed.');
+    return false;
+  }
+  function openSignature() {
+    if (!canUseTool('signature')) return;
+    setError('');
+    setSignatureOpen(true);
+  }
+  function editAnnotationText(item: Annotation) {
+    if (!canUseTool(item.type)) return;
+    setEditing({
+      point: { x: item.x, y: item.y },
+      type: item.type === 'comment' ? 'comment' : 'text',
+      text: item.text ?? '',
+      id: item.id,
+    });
+  }
+  function navigatePage(next: number | ((current: number) => number)) {
+    if (assignmentRef.current && draft.current) {
+      setError('Save or discard the pending annotation before changing pages.');
+      return;
+    }
+    setPageIndex(next);
+  }
   function commit(next: Annotation[]) {
-    if (transition.current) return;
+    if (!editorIdentity.current.ready || transition.current) return false;
+    const before = current.current;
+    try {
+      assertAssignmentEdit(before, next, assignmentRef.current);
+      replace(next);
+    } catch (reason) {
+      setError(errorMessage(reason));
+      return false;
+    }
     pushHistory(
-      { annotations: current.current, blob: workingBlob, pageIndex, pageCount },
+      { annotations: before, blob: workingBlob, pageIndex, pageCount },
       { annotations: next, blob: workingBlob, pageIndex, pageCount },
     );
-    replace(next);
+    return true;
   }
   async function restore(snapshot: Snapshot) {
+    assertAssignmentEdit(
+      current.current,
+      snapshot.annotations,
+      assignmentRef.current,
+      snapshot.blob !== workingBlob || snapshot.pageCount !== pageCount,
+    );
     if (snapshot.blob !== workingBlob) {
       await flush();
       const saved = await replaceDocumentWithAnnotations(
@@ -421,12 +477,12 @@ export default function DocumentEditor({
       setWorkingBlob(snapshot.blob);
       await onDocumentChange({ blob: snapshot.blob, document: saved });
     } else replace(snapshot.annotations);
-    setPageIndex(snapshot.pageIndex);
+    navigatePage(snapshot.pageIndex);
     setSelected(null);
   }
   async function undo() {
     const entry = history.at(-1);
-    if (!entry || busy || transition.current) return;
+    if (!entry || !editable || transition.current) return;
     setBusy('Undoing');
     try {
       await restore(entry.before);
@@ -440,7 +496,7 @@ export default function DocumentEditor({
   }
   async function redo() {
     const entry = future.at(-1);
-    if (!entry || busy || transition.current) return;
+    if (!entry || !editable || transition.current) return;
     setBusy('Redoing');
     try {
       await restore(entry.after);
@@ -453,7 +509,11 @@ export default function DocumentEditor({
     }
   }
   const chooseTool = (next: AnnotationTool) => {
-    if (!ready || transition.current) return;
+    if (!canUseTool(next) || transition.current) return;
+    if (assignment && draft.current) {
+      setError('Finish or cancel the pending annotation before choosing another tool.');
+      return;
+    }
     setSelected(null);
     draft.current = null;
     setDraftAnnotation(null);
@@ -465,8 +525,7 @@ export default function DocumentEditor({
   };
   function removeSelected() {
     if (selected) {
-      commit(current.current.filter((a) => a.id !== selected));
-      setSelected(null);
+      if (commit(current.current.filter((a) => a.id !== selected))) setSelected(null);
     }
   }
   useEffect(() => {
@@ -482,8 +541,8 @@ export default function DocumentEditor({
       if (focusMode) {
         if (e.metaKey || e.ctrlKey || e.altKey) return;
         if (e.key === 'Escape') setFocusMode(false);
-        if (e.key === 'ArrowRight') setPageIndex((i) => Math.min(pageCount - 1, i + 1));
-        if (e.key === 'ArrowLeft') setPageIndex((i) => Math.max(0, i - 1));
+        if (e.key === 'ArrowRight') navigatePage((i) => Math.min(pageCount - 1, i + 1));
+        if (e.key === 'ArrowLeft') navigatePage((i) => Math.max(0, i - 1));
         return;
       }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -508,6 +567,8 @@ export default function DocumentEditor({
         removeSelected();
       }
       if (e.key === 'Escape') {
+        draft.current = null;
+        setDraftAnnotation(null);
         setSelected(null);
         setPageMenu(false);
         setShapeMenu(false);
@@ -533,8 +594,8 @@ export default function DocumentEditor({
         }
         return;
       }
-      if (e.key === 'ArrowRight') setPageIndex((i) => Math.min(pageCount - 1, i + 1));
-      if (e.key === 'ArrowLeft') setPageIndex((i) => Math.max(0, i - 1));
+      if (e.key === 'ArrowRight') navigatePage((i) => Math.min(pageCount - 1, i + 1));
+      if (e.key === 'ArrowLeft') navigatePage((i) => Math.max(0, i - 1));
     };
     window.addEventListener('keydown', keydown);
     return () => window.removeEventListener('keydown', keydown);
@@ -570,13 +631,13 @@ export default function DocumentEditor({
   }
   function insertAtCenter(item: Annotation) {
     if (!ready || transition.current) return;
-    commit([...current.current, item]);
+    if (!commit([...current.current, item])) return;
     setTool('select');
     setSelected(item.id);
     setShapeMenu(false);
   }
   function insertSignature(value: SignatureInput) {
-    if (!ready || transition.current) return;
+    if (!canUseTool('signature') || transition.current) return;
     const width = Math.max(10, Math.min(320, pageSize.width - 40));
     if (value.kind === 'typed') {
       const context = document.createElement('canvas').getContext('2d');
@@ -643,7 +704,7 @@ export default function DocumentEditor({
     });
   }
   function pointerDown(event: ReactPointerEvent<SVGSVGElement>) {
-    if (!ready || transition.current || event.button !== 0) return;
+    if (!canUseTool(tool) || transition.current || event.button !== 0 || draft.current) return;
     const point = position(event);
     event.currentTarget.setPointerCapture(event.pointerId);
     if (tool === 'text' || tool === 'comment') {
@@ -660,7 +721,8 @@ export default function DocumentEditor({
       if (hit?.type === 'comment') {
         setPanel('comments');
       }
-      if (hit) draft.current = { tool, start: point, points: [], original: hit };
+      if (hit && canUseTool(hit.type))
+        draft.current = { tool, start: point, points: [], original: hit };
       return;
     }
     draft.current = { tool, start: point, points: [point] };
@@ -673,7 +735,7 @@ export default function DocumentEditor({
   }
   function pointerMove(event: ReactPointerEvent<SVGSVGElement>) {
     const gesture = draft.current;
-    if (!gesture) return;
+    if (!gesture || !editable) return;
     const point = position(event);
     if (gesture.tool === 'select' && gesture.original) {
       setDraftAnnotation(
@@ -704,10 +766,16 @@ export default function DocumentEditor({
   function pointerUp(event: ReactPointerEvent<SVGSVGElement>) {
     if (event.currentTarget.hasPointerCapture(event.pointerId))
       event.currentTarget.releasePointerCapture(event.pointerId);
+    savePointerDraft();
+  }
+  function savePointerDraft() {
     if (draftAnnotation) {
-      if (draft.current?.tool === 'select')
-        commit(current.current.map((a) => (a.id === draftAnnotation.id ? draftAnnotation : a)));
-      else if (
+      if (draft.current?.tool === 'select') {
+        if (
+          !commit(current.current.map((a) => (a.id === draftAnnotation.id ? draftAnnotation : a)))
+        )
+          return;
+      } else if (
         draftAnnotation.type === 'line' || draftAnnotation.type === 'arrow'
           ? Boolean(
               draftAnnotation.points &&
@@ -719,8 +787,9 @@ export default function DocumentEditor({
             )
           : draftAnnotation.points?.length ||
             ((draftAnnotation.width ?? 0) > 2 && (draftAnnotation.height ?? 0) > 2)
-      )
-        commit([...current.current, draftAnnotation]);
+      ) {
+        if (!commit([...current.current, draftAnnotation])) return;
+      }
     }
     draft.current = null;
     setDraftAnnotation(null);
@@ -738,14 +807,17 @@ export default function DocumentEditor({
           : Math.max(...editing.text.split('\n').map((line) => line.length * 8.3), 100),
       height: editing.type === 'comment' ? 24 : editing.text.split('\n').length * 21,
     };
-    commit(
-      old ? current.current.map((a) => (a.id === old.id ? item : a)) : [...current.current, item],
-    );
+    if (
+      !commit(
+        old ? current.current.map((a) => (a.id === old.id ? item : a)) : [...current.current, item],
+      )
+    )
+      return;
     setEditing(null);
     if (item.type === 'comment') setPanel('comments');
   }
   async function openForm() {
-    if (!ready || transition.current) return;
+    if (!allowPdfMutation() || !ready || transition.current) return;
     setBusy('Reading PDF form');
     setError('');
     setFormError('');
@@ -759,7 +831,7 @@ export default function DocumentEditor({
     }
   }
   async function saveForm(changes: PdfFormChange[]) {
-    if (!ready || transition.current) return;
+    if (!allowPdfMutation() || !ready || transition.current) return;
     setBusy('Saving form');
     setFormError('');
     try {
@@ -833,7 +905,7 @@ export default function DocumentEditor({
     }
   }
   async function openCrop() {
-    if (!pdf || !ready || transition.current || cropAbort.current) return;
+    if (!allowPdfMutation() || !pdf || !ready || transition.current || cropAbort.current) return;
     setPageMenu(false);
     setBusy('Reading page dimensions');
     setError('');
@@ -858,7 +930,8 @@ export default function DocumentEditor({
     }
   }
   async function saveCrop(request: CropRequest) {
-    if (!ready || !cropInspection || transition.current || cropAbort.current) return;
+    if (!allowPdfMutation() || !ready || !cropInspection || transition.current || cropAbort.current)
+      return;
     setBusy('Saving page crop');
     setCropError('');
     let savingStarted = false;
@@ -953,7 +1026,7 @@ export default function DocumentEditor({
     }
   }
   async function editPage(action: PageAction) {
-    if (!pdf || !ready || transition.current) return;
+    if (!allowPdfMutation() || !pdf || !ready || transition.current) return;
     setPageMenu(false);
     setBusy('Updating pages');
     setError('');
@@ -991,7 +1064,7 @@ export default function DocumentEditor({
       );
       replace(nextAnnotations, false);
       setWorkingBlob(nextBlob);
-      setPageIndex(nextIndex);
+      navigatePage(nextIndex);
       await onDocumentChange({ blob: nextBlob, document: saved });
       setNotice('Pages updated and saved on this device.');
     } catch (e) {
@@ -1067,7 +1140,7 @@ export default function DocumentEditor({
     }
   }
   async function mergePages(file: File) {
-    if (!ready || transition.current) return;
+    if (!allowPdfMutation() || !ready || transition.current) return;
     setBusy('Merging PDF pages');
     setError('');
     try {
@@ -1098,7 +1171,7 @@ export default function DocumentEditor({
         },
       );
       setWorkingBlob(merged.blob);
-      setPageIndex(pageCount);
+      navigatePage(pageCount);
       await onDocumentChange({ blob: merged.blob, document: saved });
       setNotice(`Added ${merged.pageCount - pageCount} pages. Saved on this device.`);
     } catch (e) {
@@ -1154,7 +1227,7 @@ export default function DocumentEditor({
   }
   async function highlightOcrSelection() {
     if (
-      !ready ||
+      !canUseTool('highlight') ||
       !pdf ||
       !ocr.record ||
       !ocrSelection ||
@@ -1194,15 +1267,18 @@ export default function DocumentEditor({
       setError('Select a smaller passage to highlight.');
       return;
     }
-    commit([
-      ...current.current,
-      ...lines.map((box) => ({
-        ...baseAnnotation('highlight', box),
-        ...box,
-        color: colors[1],
-        opacity: 0.32,
-      })),
-    ]);
+    if (
+      !commit([
+        ...current.current,
+        ...lines.map((box) => ({
+          ...baseAnnotation('highlight', box),
+          ...box,
+          color: colors[1],
+          opacity: 0.32,
+        })),
+      ])
+    )
+      return;
     setNotice('Recognized passage highlighted.');
     setOcrSelection(null);
     window.getSelection()?.removeAllRanges();
@@ -1211,6 +1287,10 @@ export default function DocumentEditor({
     setPanel('text');
   }
   function toggleFocusMode(value: boolean) {
+    if (assignmentRef.current && draft.current) {
+      setError('Save or discard the pending annotation before changing reading mode.');
+      return;
+    }
     setFocusMode(value);
     if (value) {
       setSelectingOcr(false);
@@ -1235,15 +1315,25 @@ export default function DocumentEditor({
     }
   }
   const commands = [
-    ...tools.map((t) => ({ label: `${t.label} tool`, detail: t.key, run: () => chooseTool(t.id) })),
-    { label: 'Arrow tool', detail: 'Shapes', run: () => chooseTool('arrow') },
-    { label: 'Fill PDF form', detail: 'Existing document fields', run: () => void openForm() },
-    { label: 'Add signature', detail: 'Typed or drawn', run: () => setSignatureOpen(true) },
-    { label: 'Add reviewed stamp', detail: 'Feedback', run: () => insertStamp('REVIEWED') },
+    ...tools
+      .filter((t) => assignmentToolAllowed(assignment, t.id))
+      .map((t) => ({ label: `${t.label} tool`, detail: t.key, run: () => chooseTool(t.id) })),
+    ...(!assignment
+      ? [
+          { label: 'Arrow tool', detail: 'Shapes', run: () => chooseTool('arrow') },
+          {
+            label: 'Fill PDF form',
+            detail: 'Existing document fields',
+            run: () => void openForm(),
+          },
+          { label: 'Add signature', detail: 'Typed or drawn', run: openSignature },
+          { label: 'Add reviewed stamp', detail: 'Feedback', run: () => insertStamp('REVIEWED') },
+          { label: 'Add a blank page', detail: 'Pages', run: () => void editPage('insert') },
+          { label: 'Rotate current page', detail: 'Pages', run: () => void editPage('rotate') },
+          { label: 'Crop current page', detail: 'Pages', run: () => void openCrop() },
+        ]
+      : []),
     { label: 'Export encrypted file', detail: '.margin', run: () => void exportPdf() },
-    { label: 'Add a blank page', detail: 'Pages', run: () => void editPage('insert') },
-    { label: 'Rotate current page', detail: 'Pages', run: () => void editPage('rotate') },
-    { label: 'Crop current page', detail: 'Pages', run: () => void openCrop() },
     { label: 'Find in document', detail: 'Search', run: () => setPanel('search') },
     { label: 'Read current page aloud', detail: 'Accessibility', run: readAloud },
     { label: 'Fit page to width', detail: 'View', run: fitPage },
@@ -1282,14 +1372,19 @@ export default function DocumentEditor({
         </button>
         <div className="editor-title">
           <div className="editor-breadcrumb">
-            WORKSPACE <span>/</span> MY DOCUMENTS
+            {assignment ? 'CANVAS' : 'WORKSPACE'} <span>/</span>{' '}
+            {assignment ? 'ASSIGNMENT' : 'MY DOCUMENTS'}
           </div>
           <h1>{record.name.replace(/\.pdf$/i, '')}</h1>
         </div>
         <div
           className={`editor-save ${saveState === 'error' ? 'has-error' : ''}`}
           aria-live="polite"
-          title="Annotations and document pages are saved in this browser's IndexedDB. Cloud sync is not configured."
+          title={
+            assignment
+              ? 'Assignment edits are saved in the encrypted local queue. See assignment status for server confirmation.'
+              : "Annotations and document pages are saved in this browser's IndexedDB. Cloud sync is not configured."
+          }
         >
           {saveState === 'saving' || saveState === 'loading' ? (
             <Loader2 size={14} className="is-spinning" />
@@ -1336,7 +1431,7 @@ export default function DocumentEditor({
         <button
           className="editor-secondary editor-form-button"
           onClick={() => void openForm()}
-          disabled={!ready}
+          disabled={!canChangePdf}
           title="Fill existing PDF form fields"
           aria-label="Fill form"
         >
@@ -1354,6 +1449,7 @@ export default function DocumentEditor({
           <span>Export encrypted file</span>
         </button>
       </header>
+      {assignment?.controls}
       <div className="editor-toolbar">
         <button
           className="editor-icon"
@@ -1372,7 +1468,7 @@ export default function DocumentEditor({
               onClick={() => chooseTool(id)}
               aria-pressed={tool === id}
               title={`${label}${shortcuts ? ` (${key})` : ''}`}
-              disabled={!ready}
+              disabled={!canUseTool(id)}
             >
               <Icon size={18} />
               <span>{label}</span>
@@ -1382,7 +1478,11 @@ export default function DocumentEditor({
             <button
               className={`editor-tool ${['rectangle', 'ellipse', 'line', 'arrow'].includes(tool) ? 'is-active' : ''}`}
               onClick={() => setShapeMenu(!shapeMenu)}
-              disabled={!ready}
+              disabled={
+                !['rectangle', 'ellipse', 'line', 'arrow'].some((id) =>
+                  canUseTool(id as AnnotationTool),
+                )
+              }
               aria-expanded={shapeMenu}
               aria-label="Shapes"
             >
@@ -1398,14 +1498,22 @@ export default function DocumentEditor({
                   { id: 'line', label: 'Line', Icon: Minus },
                   { id: 'arrow', label: 'Arrow', Icon: ArrowUpRight },
                 ].map(({ id, label, Icon }) => (
-                  <button key={id} onClick={() => chooseTool(id as AnnotationTool)}>
+                  <button
+                    key={id}
+                    disabled={!canUseTool(id as AnnotationTool)}
+                    onClick={() => chooseTool(id as AnnotationTool)}
+                  >
                     <Icon size={15} />
                     {label}
                   </button>
                 ))}
                 <div className="editor-dropdown-label">Feedback stamps</div>
                 {(['REVIEWED', 'GREAT WORK', 'REVISE'] as const).map((text) => (
-                  <button key={text} onClick={() => insertStamp(text)}>
+                  <button
+                    key={text}
+                    disabled={!canUseTool('stamp')}
+                    onClick={() => insertStamp(text)}
+                  >
                     <Stamp size={15} />
                     {text === 'REVIEWED'
                       ? 'Reviewed stamp'
@@ -1419,11 +1527,8 @@ export default function DocumentEditor({
           </div>
           <button
             className="editor-tool"
-            disabled={!ready}
-            onClick={() => {
-              setError('');
-              setSignatureOpen(true);
-            }}
+            disabled={!canUseTool('signature')}
+            onClick={openSignature}
             aria-label="Add signature"
           >
             <PenTool size={18} />
@@ -1435,7 +1540,7 @@ export default function DocumentEditor({
           className="editor-icon"
           title="Undo (⌘Z)"
           aria-label="Undo"
-          disabled={!history.length || !!busy || leaving}
+          disabled={!history.length || !editable}
           onClick={() => void undo()}
         >
           <Undo2 size={18} />
@@ -1444,7 +1549,7 @@ export default function DocumentEditor({
           className="editor-icon"
           title="Redo (⌘⇧Z)"
           aria-label="Redo"
-          disabled={!future.length || !!busy || leaving}
+          disabled={!future.length || !editable}
           onClick={() => void redo()}
         >
           <Redo2 size={18} />
@@ -1529,9 +1634,11 @@ export default function DocumentEditor({
                 <select
                   aria-label="Line style"
                   value={lineStyle}
-                  onChange={(e) =>
-                    setLineStyle(e.target.value as NonNullable<Annotation['lineStyle']>)
-                  }
+                  disabled={!!assignment || !editable}
+                  onChange={(e) => {
+                    if (assignmentRef.current) return;
+                    setLineStyle(e.target.value as NonNullable<Annotation['lineStyle']>);
+                  }}
                 >
                   <option value="solid">Solid</option>
                   <option value="dashed">Dashed</option>
@@ -1543,7 +1650,7 @@ export default function DocumentEditor({
               <button
                 className="editor-inline-action"
                 onClick={insertKeyboardShape}
-                disabled={!ready}
+                disabled={!canUseTool(tool)}
               >
                 Insert {tool} at center
               </button>
@@ -1580,22 +1687,33 @@ export default function DocumentEditor({
               (a) => a.id === selected && (a.type === 'text' || a.type === 'comment'),
             )?.text ? (
               <button
+                disabled={!canUseTool(current.current.find((a) => a.id === selected)!.type)}
                 onClick={() => {
                   const a = current.current.find((a) => a.id === selected)!;
-                  setEditing({
-                    point: { x: a.x, y: a.y },
-                    type: a.type === 'comment' ? 'comment' : 'text',
-                    text: a.text ?? '',
-                    id: a.id,
-                  });
+                  editAnnotationText(a);
                 }}
               >
                 Edit text
               </button>
             ) : null}
-            <button onClick={removeSelected}>
+            <button onClick={removeSelected} disabled={!canUseTool('eraser')}>
               <Trash2 size={13} />
               Delete
+            </button>
+          </div>
+        ) : null}
+        {assignment && draftAnnotation ? (
+          <div className="editor-selection-actions">
+            <button onClick={savePointerDraft} disabled={!editable}>
+              Save draft
+            </button>
+            <button
+              onClick={() => {
+                draft.current = null;
+                setDraftAnnotation(null);
+              }}
+            >
+              Discard draft
             </button>
           </div>
         ) : null}
@@ -1656,7 +1774,7 @@ export default function DocumentEditor({
                   <button
                     key={index}
                     className={`editor-thumbnail ${index === pageIndex ? 'is-current' : ''}`}
-                    onClick={() => setPageIndex(index)}
+                    onClick={() => navigatePage(index)}
                     aria-label={`Go to page ${index + 1}`}
                     aria-current={index === pageIndex ? 'page' : undefined}
                   >
@@ -1676,7 +1794,7 @@ export default function DocumentEditor({
             <button
               className="editor-add-page"
               onClick={() => void editPage('insert')}
-              disabled={!ready}
+              disabled={!canChangePdf}
             >
               <Plus size={16} />
               Add page
@@ -1700,24 +1818,26 @@ export default function DocumentEditor({
               </button>
               {pageMenu ? (
                 <div className="editor-dropdown editor-page-dropdown">
-                  <button onClick={() => void openCrop()}>
+                  <button disabled={!canChangePdf} onClick={() => void openCrop()}>
                     <Crop size={15} />
                     Crop page
                   </button>
-                  <button onClick={() => void editPage('rotate')}>
+                  <button disabled={!canChangePdf} onClick={() => void editPage('rotate')}>
                     <RotateCw size={15} />
                     Rotate clockwise
                   </button>
-                  <button onClick={() => void editPage('duplicate')}>
+                  <button disabled={!canChangePdf} onClick={() => void editPage('duplicate')}>
                     <Copy size={15} />
                     Duplicate page
                   </button>
-                  <button onClick={() => void editPage('insert')}>
+                  <button disabled={!canChangePdf} onClick={() => void editPage('insert')}>
                     <FilePlus2 size={15} />
                     Insert blank page
                   </button>
                   <button
+                    disabled={!canChangePdf}
                     onClick={() => {
+                      if (!allowPdfMutation()) return;
                       setPageMenu(false);
                       mergeInput.current?.click();
                     }}
@@ -1734,12 +1854,15 @@ export default function DocumentEditor({
                     <Download size={15} />
                     Extract encrypted page
                   </button>
-                  <button disabled={pageIndex === 0} onClick={() => void editPage('earlier')}>
+                  <button
+                    disabled={!canChangePdf || pageIndex === 0}
+                    onClick={() => void editPage('earlier')}
+                  >
                     <ArrowUp size={15} />
                     Move earlier
                   </button>
                   <button
-                    disabled={pageIndex === pageCount - 1}
+                    disabled={!canChangePdf || pageIndex === pageCount - 1}
                     onClick={() => void editPage('later')}
                   >
                     <ArrowDown size={15} />
@@ -1747,7 +1870,7 @@ export default function DocumentEditor({
                   </button>
                   <button
                     className="is-danger"
-                    disabled={pageCount === 1}
+                    disabled={!canChangePdf || pageCount === 1}
                     onClick={() => void editPage('delete')}
                   >
                     <Trash2 size={15} />
@@ -1813,13 +1936,7 @@ export default function DocumentEditor({
                           item.text &&
                           hitTest(item, p),
                       );
-                  if (a)
-                    setEditing({
-                      point: { x: a.x, y: a.y },
-                      type: a.type === 'comment' ? 'comment' : 'text',
-                      text: a.text ?? '',
-                      id: a.id,
-                    });
+                  if (a) editAnnotationText(a);
                 }}
                 aria-label={
                   focusMode
@@ -1896,11 +2013,13 @@ export default function DocumentEditor({
             {panel === 'comments' ? (
               <>
                 <p className="editor-panel-description">
-                  Notes are private to this browser. Add a comment anywhere on a page.
+                  {assignment
+                    ? 'Assignment comments are saved locally and queued with your work.'
+                    : 'Notes are private to this browser. Add a comment anywhere on a page.'}
                 </p>
                 <button
                   className="editor-panel-add"
-                  disabled={!ready}
+                  disabled={!canUseTool('comment')}
                   onClick={() => chooseTool('comment')}
                 >
                   <Plus size={15} />
@@ -1918,7 +2037,7 @@ export default function DocumentEditor({
                           <button
                             className="editor-comment-locator"
                             onClick={() => {
-                              setPageIndex(a.pageIndex);
+                              navigatePage(a.pageIndex);
                               setSelected(a.id);
                             }}
                           >
@@ -1937,20 +2056,13 @@ export default function DocumentEditor({
                           <p>{a.text}</p>
                           <div className="editor-comment-actions">
                             <button
-                              disabled={!ready}
-                              onClick={() =>
-                                setEditing({
-                                  point: { x: a.x, y: a.y },
-                                  type: 'comment',
-                                  text: a.text ?? '',
-                                  id: a.id,
-                                })
-                              }
+                              disabled={!canUseTool('comment')}
+                              onClick={() => editAnnotationText(a)}
                             >
                               Edit
                             </button>
                             <button
-                              disabled={!ready}
+                              disabled={!canUseTool('eraser')}
                               onClick={() =>
                                 commit(current.current.filter((item) => item.id !== a.id))
                               }
@@ -2015,7 +2127,7 @@ export default function DocumentEditor({
                 )}
                 <div className="editor-search-results">
                   {searchResults.map((result) => (
-                    <button key={result.page} onClick={() => setPageIndex(result.page)}>
+                    <button key={result.page} onClick={() => navigatePage(result.page)}>
                       <strong>Page {result.page + 1}</strong>
                       <span>{result.snippet}</span>
                     </button>
@@ -2035,7 +2147,7 @@ export default function DocumentEditor({
                     if (value) setFocusMode(false);
                   }}
                   canSelect={pageReading.canCopy}
-                  canHighlight={ocr.canHighlight}
+                  canHighlight={ocr.canHighlight && canUseTool('highlight')}
                   hasSelection={!!ocrSelection}
                   onHighlight={() => void highlightOcrSelection()}
                 />
@@ -2070,7 +2182,7 @@ export default function DocumentEditor({
             className="editor-icon"
             aria-label="Previous page"
             disabled={pageIndex === 0}
-            onClick={() => setPageIndex((i) => i - 1)}
+            onClick={() => navigatePage((i) => i - 1)}
           >
             <ChevronLeft size={16} />
           </button>
@@ -2081,7 +2193,7 @@ export default function DocumentEditor({
               max={pageCount}
               value={pageIndex + 1}
               onChange={(e) =>
-                setPageIndex(clamp((Number(e.target.value) || 1) - 1, 0, pageCount - 1))
+                navigatePage(clamp((Number(e.target.value) || 1) - 1, 0, pageCount - 1))
               }
               aria-label="Current page"
             />
@@ -2091,7 +2203,7 @@ export default function DocumentEditor({
             className="editor-icon"
             aria-label="Next page"
             disabled={pageIndex >= pageCount - 1}
-            onClick={() => setPageIndex((i) => i + 1)}
+            onClick={() => navigatePage((i) => i + 1)}
           >
             <ChevronRight size={16} />
           </button>
@@ -2222,7 +2334,7 @@ export default function DocumentEditor({
             <button
               type="submit"
               className="editor-primary"
-              disabled={!ready || !editing?.text.trim()}
+              disabled={!editing || !canUseTool(editing.type) || !editing.text.trim()}
             >
               Save {editing?.type === 'comment' ? 'comment' : 'text'}
             </button>

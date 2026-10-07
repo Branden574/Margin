@@ -3,7 +3,31 @@ import type { Annotation, AnnotationOperation } from '@margin/core';
 import { appendAnnotationOperation, loadAnnotations } from '../lib/storage';
 import { uid } from './model';
 export type SaveState = 'loading' | 'saved' | 'saving' | 'error';
-export function useAnnotations(documentId: string, initialTimestamp = 0) {
+export interface AnnotationPersistence {
+  load(documentId: string): Promise<Annotation[]>;
+  append(operation: AnnotationOperation): Promise<void>;
+}
+const localPersistence: AnnotationPersistence = {
+  load: loadAnnotations,
+  append: appendAnnotationOperation,
+};
+export function useAnnotations(
+  documentId: string,
+  initialTimestamp = 0,
+  persistence: AnnotationPersistence = localPersistence,
+) {
+  const binding = useRef({ documentId, persistence });
+  const activeBinding = useRef({ documentId, persistence });
+  activeBinding.current = { documentId, persistence };
+  const assertBinding = useCallback(() => {
+    if (
+      activeBinding.current.documentId !== binding.current.documentId ||
+      activeBinding.current.persistence !== binding.current.persistence
+    )
+      throw new Error(
+        'The annotation persistence changed. Reopen this editor before saving; pending drafts have been kept.',
+      );
+  }, []);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [saveState, setSaveState] = useState<SaveState>('loading');
   const [saveError, setSaveError] = useState('');
@@ -17,8 +41,13 @@ export function useAnnotations(documentId: string, initialTimestamp = 0) {
   useEffect(() => {
     let alive = true;
     const generation = ++loadGeneration.current;
-    void loadAnnotations(documentId)
+    void Promise.resolve()
+      .then(() => {
+        assertBinding();
+        return binding.current.persistence.load(documentId);
+      })
       .then((items) => {
+        assertBinding();
         if (alive && generation === loadGeneration.current) {
           current.current = items;
           setAnnotations(items);
@@ -35,13 +64,19 @@ export function useAnnotations(documentId: string, initialTimestamp = 0) {
     return () => {
       alive = false;
     };
-  }, [documentId]);
+  }, [documentId, persistence, assertBinding]);
   const reload = useCallback(async () => {
     const generation = ++loadGeneration.current;
     setLoaded(false);
     setSaveState('loading');
     try {
-      const items = await loadAnnotations(documentId);
+      assertBinding();
+      if (pending.current.length || draining.current)
+        throw new Error(
+          'Save pending annotation edits before reloading. Your drafts have been kept.',
+        );
+      const items = await binding.current.persistence.load(documentId);
+      assertBinding();
       if (generation !== loadGeneration.current) return;
       current.current = items;
       setAnnotations(items);
@@ -54,15 +89,18 @@ export function useAnnotations(documentId: string, initialTimestamp = 0) {
         setSaveState('error');
       }
     }
-  }, [documentId]);
+  }, [documentId, persistence, assertBinding]);
   const flush = useCallback(() => {
     if (draining.current) return drainingPromise.current;
     draining.current = true;
     const work = (async () => {
       if (pending.current.length) setSaveState('saving');
       try {
+        assertBinding();
         while (pending.current.length) {
-          await appendAnnotationOperation(pending.current[0]);
+          assertBinding();
+          await binding.current.persistence.append(structuredClone(pending.current[0]));
+          assertBinding();
           pending.current.shift();
         }
         setSaveState('saved');
@@ -79,9 +117,10 @@ export function useAnnotations(documentId: string, initialTimestamp = 0) {
     })();
     drainingPromise.current = work;
     return work;
-  }, []);
+  }, [assertBinding]);
   const replace = useCallback(
     (next: Annotation[], persist = true) => {
+      assertBinding();
       if (persist) {
         const old = new Map(current.current.map((a) => [a.id, a]));
         const nextIds = new Set(next.map((a) => a.id));
@@ -95,7 +134,7 @@ export function useAnnotations(documentId: string, initialTimestamp = 0) {
           timestamp: (timestamp.current = Math.max(timestamp.current + 1, Date.now())),
           kind,
           annotationId,
-          annotation,
+          annotation: annotation ? structuredClone(annotation) : undefined,
         });
         for (const a of next)
           if (a !== old.get(a.id)) pending.current.push(operation('put', a.id, a));
@@ -106,7 +145,7 @@ export function useAnnotations(documentId: string, initialTimestamp = 0) {
       setAnnotations(next);
       if (persist) void flush().catch(() => {});
     },
-    [documentId, flush],
+    [documentId, flush, assertBinding],
   );
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
@@ -121,14 +160,16 @@ export function useAnnotations(documentId: string, initialTimestamp = 0) {
   const syncTimestamp = (value: number) => {
     timestamp.current = Math.max(timestamp.current, value);
   };
+  const sameBinding =
+    documentId === binding.current.documentId && persistence === binding.current.persistence;
   return {
-    annotations,
+    annotations: sameBinding ? annotations : [],
     current,
     replace,
     flush,
     saveState,
     saveError,
-    loaded,
+    loaded: loaded && sameBinding,
     reload,
     syncTimestamp,
   };
