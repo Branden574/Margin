@@ -33,7 +33,7 @@ describe.skipIf(!f.available)(
   { timeout: 20000 },
   () => {
     beforeAll(async () => {
-      await f.boot();
+      await f.boot({ processingStatus: true });
       service = new PostgresAssignmentSubmissionService(f.config('submission_api'), f.kms, {
         captureEnabled: true,
       });
@@ -66,6 +66,8 @@ describe.skipIf(!f.available)(
           () => off.capture(t.studentP, request()),
           () => off.request(t.studentP, randomUUID()),
           () => off.list(t.studentP, {}),
+          () => off.reprocess(t.studentP, randomUUID(), { expectedRevision: 1 }),
+          () => off.reprocessRequest(t.studentP, randomUUID(), 1),
         ])
           await expect(action()).rejects.toMatchObject({ code: 'submission_unconfigured' });
       } finally {

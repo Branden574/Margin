@@ -9,7 +9,7 @@ import { SubmissionReplay } from '../apps/api/src/assignments/submissions/proces
 import type { SubmissionProcessingClaim } from '../apps/api/src/assignments/submissions/processing/types';
 let capture: PostgresAssignmentSubmissionService, processor: PostgresSubmissionProcessor, sql: Pool;
 beforeAll(async () => {
-  await f.boot({ materialization: true });
+  await f.boot({ processingStatus: true });
   capture = new PostgresAssignmentSubmissionService(f.config('submission_api'), f.kms, {
     captureEnabled: true,
   });

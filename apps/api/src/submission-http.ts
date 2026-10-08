@@ -5,6 +5,7 @@ import type {
   AssignmentSubmissionService,
   SubmissionRequest,
   SubmissionStatus,
+  SubmissionReprocessRequest,
 } from './assignments/submissions/types.js';
 
 const collection = '/api/assignments/work/submissions';
@@ -12,7 +13,7 @@ const requests = '/api/assignments/work/submission-requests/';
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 
 export function isSubmissionPath(path: string): boolean {
-  return path === collection || path.startsWith(requests);
+  return path === collection || path.startsWith(collection + '/') || path.startsWith(requests);
 }
 
 function student(principal: SessionPrincipal) {
@@ -54,11 +55,20 @@ function publicRequest(value: SubmissionRequest): SubmissionRequest {
         code: value.code,
       };
 }
+function publicReprocess(value: SubmissionReprocessRequest): SubmissionReprocessRequest {
+  return {
+    request: publicRequest(value.request) as SubmissionReprocessRequest['request'],
+    expectedRevision: value.expectedRevision,
+    state: value.state,
+    acceptedRevision: value.acceptedRevision,
+    code: value.code,
+  };
+}
 function requestStatus(value: SubmissionRequest): number {
   return value.state === 'rejected' ? 409 : value.submission.phase === 'confirmed' ? 200 : 202;
 }
 
-async function captureBody(req: IncomingMessage) {
+async function submissionBody(req: IncomingMessage, reprocessing = false) {
   const maximum = 1024;
   if (!/^application\/json(?:\s*;\s*charset=utf-8)?\s*$/i.test(req.headers['content-type'] ?? ''))
     throw new AssignmentError(415, 'json_required', 'Send this submission request as UTF-8 JSON.');
@@ -79,86 +89,102 @@ async function captureBody(req: IncomingMessage) {
     throw new AssignmentError(400, 'request_aborted', 'The submission request was interrupted.');
   const bytes = Buffer.alloc(maximum);
   let size = 0;
-  return new Promise<{ requestId: string; expectedCursor: number }>((resolve, reject) => {
-    let done = false;
-    const finish = (error?: Error) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timeout);
-      req.off('data', data);
-      req.off('end', end);
-      req.off('aborted', aborted);
-      req.off('error', aborted);
-      try {
-        if (error) {
-          req.resume();
-          reject(error);
-          return;
+  return new Promise<{ requestId: string; expectedCursor: number } | { expectedRevision: number }>(
+    (resolve, reject) => {
+      let done = false;
+      const finish = (error?: Error) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timeout);
+        req.off('data', data);
+        req.off('end', end);
+        req.off('aborted', aborted);
+        req.off('error', aborted);
+        try {
+          if (error) {
+            req.resume();
+            reject(error);
+            return;
+          }
+          const value: unknown = JSON.parse(
+            new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, size)),
+          );
+          if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
+          const input = value as Record<string, unknown>;
+          if (reprocessing) {
+            if (
+              Object.keys(input).length !== 1 ||
+              !Object.hasOwn(input, 'expectedRevision') ||
+              !Number.isSafeInteger(input.expectedRevision) ||
+              Number(input.expectedRevision) < 1 ||
+              Number(input.expectedRevision) >= Number.MAX_SAFE_INTEGER
+            )
+              throw new Error();
+            resolve({ expectedRevision: input.expectedRevision as number });
+            return;
+          }
+          if (
+            Object.keys(input).length !== 2 ||
+            !Object.hasOwn(input, 'requestId') ||
+            !Object.hasOwn(input, 'expectedCursor') ||
+            typeof input.requestId !== 'string' ||
+            !uuid.test(input.requestId) ||
+            !Number.isSafeInteger(input.expectedCursor) ||
+            (input.expectedCursor as number) < 0 ||
+            (input.expectedCursor as number) > 100_000
+          )
+            throw new Error();
+          resolve({
+            requestId: input.requestId.toLowerCase(),
+            expectedCursor: input.expectedCursor as number,
+          });
+        } catch {
+          reject(
+            new AssignmentError(
+              400,
+              'invalid_submission_request',
+              reprocessing
+                ? 'Send only a positive saved submission revision.'
+                : 'Send only a request ID and a bounded saved-work cursor.',
+            ),
+          );
+        } finally {
+          bytes.fill(0);
         }
-        const value: unknown = JSON.parse(
-          new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, size)),
-        );
-        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
-        const input = value as Record<string, unknown>;
-        if (
-          Object.keys(input).length !== 2 ||
-          !Object.hasOwn(input, 'requestId') ||
-          !Object.hasOwn(input, 'expectedCursor') ||
-          typeof input.requestId !== 'string' ||
-          !uuid.test(input.requestId) ||
-          !Number.isSafeInteger(input.expectedCursor) ||
-          (input.expectedCursor as number) < 0 ||
-          (input.expectedCursor as number) > 100_000
-        )
-          throw new Error();
-        resolve({
-          requestId: input.requestId.toLowerCase(),
-          expectedCursor: input.expectedCursor as number,
-        });
-      } catch {
-        reject(
-          new AssignmentError(
-            400,
-            'invalid_submission_request',
-            'Send only a request ID and a bounded saved-work cursor.',
-          ),
-        );
-      } finally {
-        bytes.fill(0);
-      }
-    };
-    const data = (chunk: Buffer) => {
-      if (size + chunk.length > maximum)
+      };
+      const data = (chunk: Buffer) => {
+        if (size + chunk.length > maximum)
+          finish(
+            new AssignmentError(
+              413,
+              'submission_request_too_large',
+              'Submission requests must fit within 1 KiB.',
+            ),
+          );
+        else {
+          bytes.set(chunk, size);
+          size += chunk.length;
+        }
+      };
+      const end = () => finish();
+      const aborted = () =>
         finish(
-          new AssignmentError(
-            413,
-            'submission_request_too_large',
-            'Submission requests must fit within 1 KiB.',
-          ),
+          new AssignmentError(400, 'request_aborted', 'The submission request was interrupted.'),
         );
-      else {
-        bytes.set(chunk, size);
-        size += chunk.length;
-      }
-    };
-    const end = () => finish();
-    const aborted = () =>
-      finish(
-        new AssignmentError(400, 'request_aborted', 'The submission request was interrupted.'),
+      const timeout = setTimeout(
+        () =>
+          finish(
+            new AssignmentError(408, 'request_timeout', 'The submission request took too long.'),
+          ),
+        5000,
       );
-    const timeout = setTimeout(
-      () =>
-        finish(
-          new AssignmentError(408, 'request_timeout', 'The submission request took too long.'),
-        ),
-      5000,
-    );
-    timeout.unref();
-    req.on('data', data);
-    req.on('end', end);
-    req.on('aborted', aborted);
-    req.on('error', aborted);
-  });
+      timeout.unref();
+      req.on('data', data);
+      req.on('end', end);
+      req.on('aborted', aborted);
+      req.on('error', aborted);
+    },
+  );
 }
 
 /** Invoked only after the shared session, Origin, header-CSRF and admission checks. */
@@ -176,7 +202,20 @@ export async function handleSubmissions(
     throw new AssignmentError(414, 'request_too_large', 'The submission request is too large.');
   const url = new URL(req.url ?? '/', 'https://localhost');
   const list = url.pathname === collection;
-  const methods = list ? ['GET', 'POST'] : ['GET'];
+  const reprocess = /^\/api\/assignments\/work\/submissions\/([^/]+)\/reprocess$/.exec(
+    url.pathname,
+  );
+  const reprocessLookup =
+    /^\/api\/assignments\/work\/submissions\/([^/]+)\/reprocess-requests\/([^/]+)$/.exec(
+      url.pathname,
+    );
+  if (!list && !reprocess && !reprocessLookup && !url.pathname.startsWith(requests))
+    throw new AssignmentError(
+      404,
+      'submission_route_not_found',
+      'This submission action is unavailable.',
+    );
+  const methods = list ? ['GET', 'POST'] : reprocess ? ['POST'] : ['GET'];
   if (!methods.includes(req.method ?? '')) {
     res.setHeader('Allow', methods.join(', '));
     throw new AssignmentError(
@@ -201,7 +240,28 @@ export async function handleSubmissions(
       );
     after = value;
   }
-  const requestId = list ? undefined : url.pathname.slice(requests.length);
+  const requestId =
+    list || reprocess || reprocessLookup ? undefined : url.pathname.slice(requests.length);
+  const submissionId = reprocess?.[1] ?? reprocessLookup?.[1];
+  if (submissionId !== undefined && !uuid.test(submissionId))
+    throw new AssignmentError(
+      400,
+      'invalid_submission_request',
+      'Use a valid saved submission ID.',
+    );
+  const expectedRevision = reprocessLookup ? Number(reprocessLookup[2]) : undefined;
+  if (
+    reprocessLookup &&
+    (!/^[1-9][0-9]*$/.test(reprocessLookup[2]) ||
+      !Number.isSafeInteger(expectedRevision) ||
+      Number(expectedRevision) < 1 ||
+      Number(expectedRevision) >= Number.MAX_SAFE_INTEGER)
+  )
+    throw new AssignmentError(
+      400,
+      'invalid_submission_request',
+      'Use a positive saved submission revision.',
+    );
   if (requestId !== undefined && !uuid.test(requestId))
     throw new AssignmentError(
       400,
@@ -249,7 +309,7 @@ export async function handleSubmissions(
   try {
     const options = { signal: controller.signal };
     if (req.method === 'POST') {
-      const input = await captureBody(req);
+      const input = await submissionBody(req, !!reprocess);
       const current = await refreshPrincipal();
       student(current);
       if (
@@ -264,11 +324,24 @@ export async function handleSubmissions(
           'request_aborted',
           'The submission request was interrupted.',
         );
-      const value = await service.capture(current, input, options);
-      send(requestStatus(value.request), {
-        request: publicRequest(value.request),
-        duplicate: value.duplicate,
-      });
+      if (reprocess) {
+        const value = await service.reprocess(current, submissionId!.toLowerCase(), input, options);
+        send(value.state === 'accepted' ? 202 : 409, publicReprocess(value));
+      } else {
+        const value = await service.capture(current, input, options);
+        send(requestStatus(value.request), {
+          request: publicRequest(value.request),
+          duplicate: value.duplicate,
+        });
+      }
+    } else if (reprocessLookup) {
+      const value = await service.reprocessRequest(
+        principal,
+        submissionId!.toLowerCase(),
+        expectedRevision!,
+        options,
+      );
+      send(200, publicReprocess(value));
     } else if (requestId !== undefined) {
       const value = await service.request(principal, requestId.toLowerCase(), options);
       send(200, { request: publicRequest(value.request) });

@@ -1,6 +1,6 @@
 import type { Annotation, AnnotationOperation, DocumentRecord } from '@margin/core';
 import type { AppendOperation, AppendReceipt, WorkManifest } from './types';
-import type { SubmissionRequest } from './submissionTypes';
+import type { SubmissionRequest, SubmissionReprocess } from './submissionTypes';
 
 export const MAX_OUTBOX_OPERATIONS = 1_000;
 export const MAX_OUTBOX_BYTES = 8 * 1024 * 1024;
@@ -14,6 +14,8 @@ export interface AssignmentSubmissionRecord {
   outcome?: SubmissionRequest;
   /** Remains set after capture until the student explicitly continues the draft. */
   barrier: boolean;
+  /** Exact processing command, persisted before dispatch; never pauses later draft edits. */
+  retry?: { expectedRevision: number; outcome?: SubmissionReprocess };
 }
 export interface AssignmentSubmissionIndex {
   schema: 1;

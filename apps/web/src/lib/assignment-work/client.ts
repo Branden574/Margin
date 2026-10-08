@@ -5,12 +5,16 @@ import {
   decodeSubmissionInput,
   decodeSubmissionPage,
   decodeSubmissionRequest,
+  decodeSubmissionReprocess,
+  decodeSubmissionReprocessInput,
 } from './submissionDecode';
 import type {
   SubmissionInput,
   SubmissionPage,
   SubmissionRequest,
   SubmissionStatus,
+  SubmissionReprocess,
+  SubmissionReprocessInput,
 } from './submissionTypes';
 import {
   AssignmentWorkClientError,
@@ -58,6 +62,16 @@ export interface AssignmentWorkClient {
     requestId: string,
     options?: RequestOptions,
   ): Promise<VerifiedSubmissionRequest>;
+  retrySubmission(
+    submissionId: string,
+    input: SubmissionReprocessInput,
+    options?: RequestOptions,
+  ): Promise<VerifiedSubmissionRetry>;
+  submissionRetryRequest(
+    submissionId: string,
+    expectedRevision: number,
+    options?: RequestOptions,
+  ): Promise<VerifiedSubmissionRetry>;
   /** Permanently clear this binding and abort active calls. Construct a new client after a new launch. */
   invalidate(): void;
   dispose(): void;
@@ -69,6 +83,25 @@ export interface VerifiedAssignmentSnapshot {
 declare const verifiedSubmissionBrand: unique symbol;
 export interface VerifiedSubmissionRequest {
   readonly [verifiedSubmissionBrand]: true;
+}
+declare const verifiedSubmissionRetryBrand: unique symbol;
+export interface VerifiedSubmissionRetry {
+  readonly [verifiedSubmissionRetryBrand]: true;
+}
+const submissionRetries = new WeakMap<
+  object,
+  { verified: VerifiedAssignmentSnapshot; outcome: SubmissionReprocess }
+>();
+/** Structural data, cached JSON and an absent lookup cannot resolve saved retry intent. */
+export function readVerifiedSubmissionRetry(token: VerifiedSubmissionRetry) {
+  const record = submissionRetries.get(token);
+  if (!record)
+    throw new AssignmentWorkClientError(
+      'verification_required',
+      'Verify the saved submission retry first.',
+    );
+  readVerifiedSnapshot(record.verified);
+  return { verified: record.verified, outcome: structuredClone(record.outcome) };
 }
 const submissionSnapshots = new WeakMap<
   object,
@@ -134,6 +167,7 @@ class Client implements AssignmentWorkClient {
   private submissionInputs = new Map<string, number>();
   private submissionOutcomes = new Map<string, SubmissionRequest>();
   private submissionStatuses = new Map<string, SubmissionStatus>();
+  private retryOutcomes = new Map<string, SubmissionReprocess>();
   constructor(dependencies: ClientDependencies) {
     const pageOrigin = globalThis.location?.origin;
     const expected = dependencies.expectedOrigin ?? pageOrigin;
@@ -182,6 +216,7 @@ class Client implements AssignmentWorkClient {
     this.submissionInputs.clear();
     this.submissionOutcomes.clear();
     this.submissionStatuses.clear();
+    this.retryOutcomes.clear();
     for (const scope of this.active)
       scope.controller.abort(
         error(
@@ -715,6 +750,104 @@ class Client implements AssignmentWorkClient {
       const verified = await this.verifiedSnapshot({ signal: scope.controller.signal });
       scope.check();
       return this.issueSubmission(verified, request);
+    });
+  }
+  private issueSubmissionRetry(verified: VerifiedAssignmentSnapshot, value: SubmissionReprocess) {
+    const key = `${value.request.submission.id}:${value.expectedRevision}`;
+    const previous = this.retryOutcomes.get(key);
+    if (
+      previous &&
+      (previous.state !== value.state ||
+        previous.acceptedRevision !== value.acceptedRevision ||
+        previous.code !== value.code)
+    )
+      throw error(
+        'submission_retry_changed',
+        'The saved retry outcome changed. Preserve the exact retry request.',
+      );
+    if (!previous && this.retryOutcomes.size >= 64)
+      throw error(
+        'submission_limit',
+        'Reopen from Canvas before loading more submission retry requests.',
+      );
+    // Reuse capture identity checks and monotonic status merging. Only the immutable retry
+    // decision is fenced; the contained authenticated current status may advance later.
+    const request = readVerifiedSubmissionRequest(
+      this.issueSubmission(verified, value.request),
+    ).request;
+    if (request.state !== 'captured') decode.invalid();
+    const outcome: SubmissionReprocess = { ...value, request };
+    this.retryOutcomes.set(key, clone(outcome));
+    const token = Object.freeze({}) as VerifiedSubmissionRetry;
+    submissionRetries.set(token, { verified, outcome: clone(outcome) });
+    return token;
+  }
+  async retrySubmission(
+    submissionId: string,
+    value: SubmissionReprocessInput,
+    options: RequestOptions = {},
+  ) {
+    const id = decode.id(submissionId),
+      input = decodeSubmissionReprocessInput(value);
+    return this.run(
+      options,
+      async (scope, dispatched) => {
+        await this.verifiedSnapshot({ signal: scope.controller.signal });
+        this.manifestRequired(true);
+        const csrf = this.bound().csrfToken;
+        dispatched();
+        const response = await this.transport.request(
+          scope,
+          `/api/assignments/work/submissions/${id}/reprocess`,
+          [202, 409],
+          JSON.stringify(input),
+          csrf,
+        );
+        const outcome = decodeSubmissionReprocess(
+          await this.transport.json(scope, response, 16_384),
+          this.now(),
+        );
+        if (
+          outcome.request.submission.id !== id ||
+          outcome.expectedRevision !== input.expectedRevision ||
+          (response.status === 202) !== (outcome.state === 'accepted')
+        )
+          decode.invalid();
+        const verified = await this.verifiedSnapshot({ signal: scope.controller.signal });
+        scope.check();
+        return this.issueSubmissionRetry(verified, outcome);
+      },
+      `${id}:${input.expectedRevision}`,
+      true,
+    );
+  }
+  async submissionRetryRequest(
+    submissionId: string,
+    expectedRevision: number,
+    options: RequestOptions = {},
+  ) {
+    const id = decode.id(submissionId),
+      input = decodeSubmissionReprocessInput({ expectedRevision });
+    return this.run(options, async (scope) => {
+      await this.verifiedSnapshot({ signal: scope.controller.signal });
+      this.manifestRequired(true);
+      const response = await this.transport.request(
+        scope,
+        `/api/assignments/work/submissions/${id}/reprocess-requests/${input.expectedRevision}`,
+        200,
+      );
+      const outcome = decodeSubmissionReprocess(
+        await this.transport.json(scope, response, 16_384),
+        this.now(),
+      );
+      if (
+        outcome.request.submission.id !== id ||
+        outcome.expectedRevision !== input.expectedRevision
+      )
+        decode.invalid();
+      const verified = await this.verifiedSnapshot({ signal: scope.controller.signal });
+      scope.check();
+      return this.issueSubmissionRetry(verified, outcome);
     });
   }
 }

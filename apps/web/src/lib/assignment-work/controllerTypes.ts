@@ -66,6 +66,8 @@ export interface StudentWorkController {
   /** Flush and fully synchronize before preparing one immutable request; retries reuse that request. */
   submit(): Promise<void>;
   checkSubmissionStatus(): Promise<void>;
+  /** Reprocess the same frozen version; uncertain retries reuse their persisted revision. */
+  retrySubmission(): Promise<void>;
   /** Freshly confirm a captured attempt or durable rejection before releasing the local barrier. */
   continueDraft(): Promise<void>;
   /** Abort network work and clear display state. Await flushLocal before normal editor teardown. */

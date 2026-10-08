@@ -4,6 +4,8 @@ import type {
   SubmissionPage,
   SubmissionRequest,
   SubmissionStatus,
+  SubmissionReprocess,
+  SubmissionReprocessInput,
 } from './submissionTypes';
 
 export function decodeSubmissionInput(value: unknown): SubmissionInput {
@@ -60,6 +62,8 @@ export function decodeSubmissionStatus(value: unknown, now?: number): Submission
     (row.phase === 'confirmed') !== (confirmedAt !== null) ||
     (confirmedAt !== null && Date.parse(confirmedAt) < Date.parse(frozenAt)) ||
     (row.phase === 'confirmed' && (row.retryAllowed || row.errorCode !== null)) ||
+    (row.retryAllowed &&
+      (row.phase !== 'failed' || (row.revision as number) >= Number.MAX_SAFE_INTEGER)) ||
     (row.phase === 'failed' && row.errorCode === null)
   )
     invalid();
@@ -74,6 +78,47 @@ export function decodeSubmissionStatus(value: unknown, now?: number): Submission
     confirmedAt,
     retryAllowed: row.retryAllowed as boolean,
     errorCode: row.errorCode as SubmissionStatus['errorCode'],
+  };
+}
+export function decodeSubmissionReprocessInput(value: unknown): SubmissionReprocessInput {
+  const row = object(value, ['expectedRevision']);
+  if (
+    !Number.isSafeInteger(row.expectedRevision) ||
+    (row.expectedRevision as number) < 1 ||
+    (row.expectedRevision as number) >= Number.MAX_SAFE_INTEGER
+  )
+    invalid();
+  return { expectedRevision: row.expectedRevision as number };
+}
+/** Durable retry identity is independent of its contained, evolving submission status. */
+export function decodeSubmissionReprocess(value: unknown, now?: number): SubmissionReprocess {
+  const row = object(value, ['request', 'expectedRevision', 'state', 'acceptedRevision', 'code']);
+  const { expectedRevision } = decodeSubmissionReprocessInput({
+    expectedRevision: row.expectedRevision,
+  });
+  const request = decodeSubmissionRequest(row.request, now);
+  if (request.state !== 'captured') invalid();
+  if (row.state === 'accepted') {
+    if (
+      row.code !== null ||
+      row.acceptedRevision !== expectedRevision + 1 ||
+      request.submission.revision < expectedRevision + 1
+    )
+      invalid();
+  } else if (
+    row.state !== 'rejected' ||
+    row.acceptedRevision !== null ||
+    !['revision_changed', 'not_retryable', 'retry_limit'].includes(row.code as string) ||
+    request.submission.revision < expectedRevision ||
+    (row.code === 'revision_changed' && request.submission.revision === expectedRevision)
+  )
+    invalid();
+  return {
+    request,
+    expectedRevision,
+    state: row.state as SubmissionReprocess['state'],
+    acceptedRevision: row.acceptedRevision as number | null,
+    code: row.code as SubmissionReprocess['code'],
   };
 }
 export function decodeSubmissionRequest(value: unknown, now?: number): SubmissionRequest {

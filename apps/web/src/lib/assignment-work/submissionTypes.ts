@@ -4,4 +4,6 @@ export type {
   SubmissionStatus,
   SubmissionRequest,
   SubmissionPage,
+  SubmissionReprocessInput,
+  SubmissionReprocessRequest as SubmissionReprocess,
 } from '../../../../api/src/assignments/submissions/types';

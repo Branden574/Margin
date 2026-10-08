@@ -280,7 +280,7 @@ const operation = (f: Awaited<ReturnType<typeof fixture>>, page: string) => ({
   },
 });
 
-async function boot(options: { materialization?: boolean } = {}) {
+async function boot(options: { materialization?: boolean; processingStatus?: boolean } = {}) {
   if (!available) throw new Error('Required PostgreSQL binaries unavailable');
   dir = mkdtempSync(join(tmpdir(), 'margin-submission-pg-'));
   socket = join(dir, 'socket');
@@ -326,7 +326,10 @@ async function boot(options: { materialization?: boolean } = {}) {
     '007-assignment-work-runtime.sql',
     '008-authorization-plan-cache.sql',
     '009-submissions.sql',
-    ...(options.materialization ? ['010-submission-materialization.sql'] : []),
+    ...(options.materialization || options.processingStatus
+      ? ['010-submission-materialization.sql']
+      : []),
+    ...(options.processingStatus ? ['011-submission-outcomes.sql'] : []),
   ]) {
     await admin.query(
       readFileSync(new URL('../../infra/migrations/' + name, import.meta.url), 'utf8'),
@@ -341,7 +344,9 @@ async function boot(options: { materialization?: boolean } = {}) {
     ['work_ingest', 'margin_ingestion_runtime'],
     ['work_inspect', 'margin_ingestion_inspector'],
     ['work_read', 'margin_ingestion_reader'],
-    ...(options.materialization ? [['submission_processor', 'margin_submission_processor']] : []),
+    ...(options.materialization || options.processingStatus
+      ? [['submission_processor', 'margin_submission_processor']]
+      : []),
   ])
     await admin.query(
       `CREATE ROLE ${login} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; GRANT ${group} TO ${login}`,

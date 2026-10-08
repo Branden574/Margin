@@ -4,8 +4,10 @@ import { notifyAssignmentChange } from '../storage';
 import {
   readVerifiedSnapshot,
   readVerifiedSubmissionRequest,
+  readVerifiedSubmissionRetry,
   type VerifiedAssignmentSnapshot,
   type VerifiedSubmissionRequest,
+  type VerifiedSubmissionRetry,
 } from './client';
 import * as decode from './decode';
 import {
@@ -520,6 +522,119 @@ export async function continueAssignmentDraft(
   signal?: AbortSignal,
 ): Promise<AssignmentSubmissionRecord> {
   return saveSubmissionOutcome(documentId, expectedRevision, proof, true, signal);
+}
+
+/** Preserve the exact failed generation before dispatch. This does not freeze the current draft. */
+export async function prepareSubmissionRetry(
+  documentId: string,
+  expectedRevision: string,
+  proof: VerifiedSubmissionRequest,
+  signal?: AbortSignal,
+): Promise<AssignmentSubmissionRecord> {
+  const initial = readVerifiedSubmissionRequest(proof);
+  const assertLive = () => {
+    readVerifiedSubmissionRequest(proof);
+  };
+  assertLive();
+  return commit(
+    documentId,
+    async (tx) => {
+      const { binding } = await load(tx, documentId, expectedRevision);
+      assertVerified(binding, initial.verified);
+      const { records } = await readSubmissionRecords(tx, binding);
+      const record = records.find((row) => row.request.requestId === initial.request.requestId);
+      if (!record || initial.request.state !== 'captured')
+        return repositoryError(
+          'submission_request_missing',
+          'Confirm the saved submission version before retrying preparation.',
+        );
+      const next = mergeSubmissionOutcome(record.outcome, initial.request);
+      if (next.state !== 'captured')
+        return repositoryError(
+          'submission_request_missing',
+          'The saved submission version is unavailable.',
+        );
+      if (record.retry && !record.retry.outcome)
+        return repositoryError(
+          'submission_retry_pending',
+          'Confirm the exact saved preparation retry before starting another.',
+        );
+      const status = next.submission;
+      if (
+        status.revision !== initial.request.submission.revision ||
+        status.revision >= Number.MAX_SAFE_INTEGER ||
+        status.phase !== 'failed' ||
+        !status.retryAllowed ||
+        (record.retry && record.retry.expectedRevision >= status.revision)
+      )
+        return repositoryError(
+          'submission_not_retryable',
+          'Check the current submission status before retrying preparation.',
+        );
+      record.outcome = next;
+      record.retry = { expectedRevision: status.revision };
+      tx.put(
+        'assignment-receipts',
+        submissionRecordKey(documentId, record.request.requestId),
+        record,
+      );
+      return structuredClone(record);
+    },
+    signal,
+    assertLive,
+  );
+}
+
+/** A bare error or newer status cannot resolve an uncertain command; require its durable outcome. */
+export async function recordSubmissionRetryOutcome(
+  documentId: string,
+  expectedRevision: string,
+  proof: VerifiedSubmissionRetry,
+  signal?: AbortSignal,
+): Promise<AssignmentSubmissionRecord> {
+  const initial = readVerifiedSubmissionRetry(proof);
+  const assertLive = () => {
+    readVerifiedSubmissionRetry(proof);
+  };
+  assertLive();
+  return commit(
+    documentId,
+    async (tx) => {
+      const { binding } = await load(tx, documentId, expectedRevision);
+      assertVerified(binding, initial.verified);
+      const { records } = await readSubmissionRecords(tx, binding);
+      const outcome = initial.outcome;
+      const record = records.find((row) => row.request.requestId === outcome.request.requestId);
+      if (!record?.retry || record.retry.expectedRevision !== outcome.expectedRevision)
+        return repositoryError(
+          'submission_retry_missing',
+          'This result has no matching saved preparation retry.',
+        );
+      if (record.retry.outcome) {
+        const previous = record.retry.outcome;
+        if (
+          previous.state !== outcome.state ||
+          previous.acceptedRevision !== outcome.acceptedRevision ||
+          previous.code !== outcome.code
+        )
+          return repositoryError(
+            'submission_retry_conflict',
+            'The preparation retry result changed unexpectedly.',
+          );
+      }
+      record.outcome = mergeSubmissionOutcome(record.outcome, outcome.request);
+      // Keep command identity immutable while allowing the accompanying status to advance.
+      record.retry.outcome = { ...outcome, request: record.outcome as typeof outcome.request };
+      tx.put(
+        'assignment-receipts',
+        submissionRecordKey(documentId, record.request.requestId),
+        record,
+      );
+      return structuredClone(record);
+    },
+    signal,
+    assertLive,
+  );
 }
 
 async function saveSubmissionOutcome(

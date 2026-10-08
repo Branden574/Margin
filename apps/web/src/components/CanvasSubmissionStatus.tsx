@@ -7,12 +7,14 @@ export function CanvasSubmissionStatus({
   submit,
   check,
   continueDraft,
+  retry,
 }: {
   state: ReadonlyWorkValue<StudentWorkState>;
   disabled: boolean;
   submit(): void;
   check(): void;
   continueDraft(): void;
+  retry(): void;
 }) {
   const record = state.submissionRecord;
   const captured = record?.outcome?.state === 'captured' ? record.outcome.submission : null;
@@ -24,12 +26,20 @@ export function CanvasSubmissionStatus({
   const rejected = record?.outcome?.state === 'rejected' ? record.outcome : null;
   const prepared = record?.barrier && !record.outcome;
   const confirmed = status?.phase === 'confirmed';
+  const retryPending = !!record?.retry && !record.retry.outcome;
+  const canRetry =
+    status?.phase === 'failed' &&
+    status.retryAllowed &&
+    captured &&
+    (!record?.retry || record.retry.expectedRevision < status.revision);
   const descriptions = {
     processing: 'Preparing submission. Not submitted to Canvas yet.',
     queued: 'Waiting for Canvas. Delivery has not been confirmed.',
     sending: 'Sending the saved submission version to Canvas.',
     uncertain: 'Canvas delivery is awaiting confirmation. Your saved version is kept.',
-    failed: 'Canvas could not receive this submission. Your saved version is kept.',
+    failed: status?.retryAllowed
+      ? 'Preparation could not finish. Retry the same saved version; your draft edits are kept.'
+      : 'Preparation could not finish. Your saved version is kept. Check with your teacher or support before trying again.',
     confirmed: status?.confirmedAt
       ? `Submitted to Canvas at ${new Date(status.confirmedAt).toLocaleString()}.`
       : '',
@@ -72,11 +82,25 @@ export function CanvasSubmissionStatus({
               : 'Later draft edits are separate from this submission version. Additional attempts are not available yet.'}
           </small>
         )}
+        {retryPending && (
+          <p>
+            A preparation retry is awaiting confirmation. Confirm this saved retry to recover its
+            result. You can continue editing your draft.
+          </p>
+        )}
+        {record?.retry?.outcome?.state === 'rejected' && status?.phase === 'failed' && (
+          <p>The saved retry was not accepted. Check the current status before trying again.</p>
+        )}
         {state.submissionError && state.submissionAvailability !== 'unavailable' && (
           <p className="canvas-work-error">{state.submissionError.message}</p>
         )}
       </div>
       <div className="canvas-work-actions">
+        {(retryPending || canRetry) && (
+          <button className="editor-secondary" disabled={disabled} onClick={retry}>
+            {retryPending ? 'Confirm preparation retry' : 'Retry preparation'}
+          </button>
+        )}
         {prepared ? (
           <button className="editor-secondary" disabled={disabled} onClick={submit}>
             Confirm saved submission

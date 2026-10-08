@@ -15,6 +15,7 @@ import { AssignmentError } from '../apps/api/src/assignments';
 import type {
   AssignmentSubmissionService,
   SubmissionRequest,
+  SubmissionReprocessRequest,
   SubmissionStatus,
 } from '../apps/api/src/assignments/submissions/types';
 
@@ -59,7 +60,24 @@ const rejected: SubmissionRequest = {
 const capture = vi.fn<AssignmentSubmissionService['capture']>();
 const lookupRequest = vi.fn<AssignmentSubmissionService['request']>();
 const list = vi.fn<AssignmentSubmissionService['list']>();
-const service: AssignmentSubmissionService = { capture, request: lookupRequest, list };
+const reprocess = vi.fn<AssignmentSubmissionService['reprocess']>();
+const reprocessRequest = vi.fn<AssignmentSubmissionService['reprocessRequest']>();
+const service: AssignmentSubmissionService = {
+  capture,
+  request: lookupRequest,
+  list,
+  reprocess,
+  reprocessRequest,
+};
+const retryPath = `${path}/${submission.id}/reprocess`;
+const retryLookup = `${path}/${submission.id}/reprocess-requests/2`;
+const retryOutcome: SubmissionReprocessRequest = {
+  request: { ...captured, submission: { ...submission, revision: 3 } },
+  expectedRevision: 2,
+  state: 'accepted',
+  acceptedRevision: 3,
+  code: null,
+};
 let revoked = false,
   federationActive = true;
 let directory: string,
@@ -148,6 +166,8 @@ beforeEach(() => {
   capture.mockReset().mockResolvedValue({ request: captured, duplicate: false });
   lookupRequest.mockReset().mockResolvedValue({ request: captured });
   list.mockReset().mockResolvedValue({ submissions: [submission], nextCursor: null });
+  reprocess.mockReset().mockResolvedValue(retryOutcome);
+  reprocessRequest.mockReset().mockResolvedValue(retryOutcome);
   logs.length = 0;
 });
 type Reply = { status: number; headers: IncomingHttpHeaders; body: string };
@@ -196,9 +216,14 @@ function request(
   });
 }
 const post = (body: string | Buffer = payload()) => ({ method: 'POST', body });
-function streaming(length: number, resolve: (r: Reply) => void, reject: (e: Error) => void) {
+function streaming(
+  length: number,
+  resolve: (r: Reply) => void,
+  reject: (e: Error) => void,
+  target = path,
+) {
   const req = httpsRequest(
-    base + path,
+    base + target,
     {
       method: 'POST',
       ca: certificate,
@@ -235,6 +260,8 @@ describe('current-launch submission HTTP boundary', () => {
       [path, {}],
       [path, post()],
       [lookup, {}],
+      [retryPath, post(JSON.stringify({ expectedRevision: 2 }))],
+      [retryLookup, {}],
     ] as const) {
       const result = await request(target, { ...options, endpoint: fallback });
       expect(result.status).toBe(503);
@@ -498,4 +525,152 @@ describe('current-launch submission HTTP boundary', () => {
     expect(capture).not.toHaveBeenCalled();
     expect((await request(path)).status).toBe(200);
   }, 8000);
+});
+
+describe('same-capture reprocessing HTTP boundary', () => {
+  const retryBody = () => JSON.stringify({ expectedRevision: 2 });
+  it('returns an accepted command and recovers that exact durable outcome by revision', async () => {
+    const accepted = await request(
+      retryPath.replace(submission.id, submission.id.toUpperCase()),
+      post(retryBody()),
+    );
+    expect(accepted.status).toBe(202);
+    expect(JSON.parse(accepted.body)).toEqual(retryOutcome);
+    expect(reprocess).toHaveBeenCalledExactlyOnceWith(
+      principal,
+      submission.id,
+      { expectedRevision: 2 },
+      { signal: expect.any(AbortSignal) },
+    );
+    const recovered = await request(retryLookup);
+    expect(recovered.status).toBe(200);
+    expect(JSON.parse(recovered.body)).toEqual(retryOutcome);
+    expect(reprocessRequest).toHaveBeenCalledExactlyOnceWith(principal, submission.id, 2, {
+      signal: expect.any(AbortSignal),
+    });
+    expect(recovered.headers['cache-control']).toBe('no-store');
+    expect(capture).not.toHaveBeenCalled();
+    for (const secret of [csrf, token, submission.id, requestId, principal.userId])
+      expect(JSON.stringify(logs)).not.toContain(secret);
+  });
+  it('distinguishes durable rejection, unknown response and future-revision conflict', async () => {
+    const rejected: SubmissionReprocessRequest = {
+      ...retryOutcome,
+      state: 'rejected',
+      acceptedRevision: null,
+      code: 'revision_changed',
+    };
+    reprocess.mockResolvedValueOnce(rejected);
+    reprocessRequest.mockResolvedValueOnce(rejected);
+    const response = await request(retryPath, post(retryBody()));
+    expect(response.status).toBe(409);
+    expect(JSON.parse(response.body)).toEqual(rejected);
+    expect(JSON.parse((await request(retryLookup)).body)).toEqual(rejected);
+    reprocessRequest.mockRejectedValueOnce(
+      new AssignmentError(404, 'submission_reprocess_not_found', 'No saved command.'),
+    );
+    const unknown = await request(retryLookup);
+    expect(unknown.status).toBe(404);
+    expect(JSON.parse(unknown.body)).not.toHaveProperty('state');
+    reprocess.mockRejectedValueOnce(
+      new AssignmentError(409, 'submission_revision_ahead', 'Refresh the saved status.'),
+    );
+    const ahead = await request(retryPath, post(retryBody()));
+    expect(ahead.status).toBe(409);
+    expect(JSON.parse(ahead.body)).not.toHaveProperty('state');
+  });
+  it('allowlists the retry outcome and nested frozen capture', async () => {
+    const privateValue = {
+      ...retryOutcome,
+      providerToken: 'secret',
+      request: {
+        ...retryOutcome.request,
+        snapshot: 'secret',
+        submission: { ...retryOutcome.request.submission, wrappedKey: 'secret' },
+      },
+    };
+    reprocess.mockResolvedValueOnce(privateValue);
+    reprocessRequest.mockResolvedValueOnce(privateValue);
+    expect(JSON.parse((await request(retryPath, post(retryBody()))).body)).toEqual(retryOutcome);
+    expect(JSON.parse((await request(retryLookup)).body)).toEqual(retryOutcome);
+  });
+  it.each([
+    {},
+    [],
+    null,
+    { expectedRevision: 0 },
+    { expectedRevision: -1 },
+    { expectedRevision: 2.1 },
+    { expectedRevision: '2' },
+    { expectedRevision: Number.MAX_SAFE_INTEGER },
+    { expectedRevision: 2, expectedCursor: 4 },
+    { expectedRevision: 2, userId: principal.userId },
+  ])('rejects malformed or authority-bearing retry input %#', async (value) => {
+    expect((await request(retryPath, post(JSON.stringify(value)))).status).toBe(400);
+    expect(reprocess).not.toHaveBeenCalled();
+  });
+  it('bounds URL revisions, methods, query, read bodies and encodings', async () => {
+    for (const revision of ['0', '-1', '01', '1.5', '1e1', String(Number.MAX_SAFE_INTEGER)])
+      expect((await request(retryLookup.replace(/2$/, revision))).status).toBe(400);
+    for (const target of [retryPath + '?after=x', retryLookup + '?after=x'])
+      expect(
+        (await request(target, target.startsWith(retryPath + '?') ? post(retryBody()) : {})).status,
+      ).toBe(400);
+    expect((await request(retryLookup, { body: '{}' })).status).toBe(400);
+    expect((await request(retryLookup, { headers: { range: 'bytes=0-1' } })).status).toBe(400);
+    expect((await request(retryPath)).status).toBe(405);
+    expect((await request(retryLookup, post(retryBody()))).status).toBe(405);
+    expect((await request(path + '/unknown')).status).toBe(404);
+    expect((await request(retryPath, post('x'.repeat(1025)))).status).toBe(413);
+    expect((await request(retryPath, post(Buffer.from([0xc0, 0xaf])))).status).toBe(400);
+    expect(
+      (await request(retryPath, { ...post(retryBody()), headers: { 'content-encoding': 'gzip' } }))
+        .status,
+    ).toBe(415);
+    expect(reprocess).not.toHaveBeenCalled();
+    expect(reprocessRequest).not.toHaveBeenCalled();
+  });
+  it('requires a current LTI student and CSRF for reprocessing', async () => {
+    for (const headers of [
+      { origin: undefined },
+      { origin: 'https://attacker.test' },
+      { 'x-csrf-token': undefined },
+      { 'x-csrf-token': 'wrong' },
+    ])
+      expect((await request(retryPath, { ...post(retryBody()), headers })).status).toBe(403);
+    principal.role = 'teacher';
+    expect((await request(retryPath, post(retryBody()))).status).toBe(403);
+    expect((await request(retryLookup)).status).toBe(403);
+    principal.role = 'student';
+    principal.authenticationMethod = 'oidc';
+    expect((await request(retryPath, post(retryBody()))).status).toBe(403);
+    principal.authenticationMethod = 'lti';
+    federationActive = false;
+    expect((await request(retryLookup)).status).toBe(403);
+    expect(reprocess).not.toHaveBeenCalled();
+    expect(reprocessRequest).not.toHaveBeenCalled();
+  });
+  it('rechecks revocation after a partial retry body before recording a command', async () => {
+    let seen!: () => void;
+    const initial = new Promise<void>((resolve) => {
+      seen = resolve;
+    });
+    const original = identity.authenticateRequest.bind(identity);
+    vi.spyOn(identity, 'authenticateRequest').mockImplementationOnce(async (req) => {
+      const value = await original(req);
+      seen();
+      return value;
+    });
+    const body = retryBody();
+    const result = new Promise<Reply>((resolve, reject) => {
+      const req = streaming(Buffer.byteLength(body), resolve, reject, retryPath);
+      req.write(body.slice(0, 10));
+      void initial.then(() => {
+        revoked = true;
+        req.end(body.slice(10));
+      });
+    });
+    expect((await result).status).toBe(401);
+    expect(reprocess).not.toHaveBeenCalled();
+  });
 });

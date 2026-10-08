@@ -37,11 +37,15 @@ import type {
   MaterializationReceipt,
   MaterializationSummary,
   SubmissionReplayContext,
+  ProcessingFailureCode,
 } from './types.js';
 interface Job {
   attempt_id: string;
   work_id: string;
-  materialization_state: 'pending' | 'completed';
+  materialization_state: 'pending' | 'completed' | 'failed';
+  status_revision: string;
+  processing_generation: number;
+  published_error_code: ProcessingFailureCode | null;
   materialization_attempt: number;
   claim_id: string | null;
   token_digest: string | null;
@@ -215,7 +219,12 @@ export class PostgresSubmissionProcessor {
       c.release(discard);
     }
   }
-  private async state(c: PoolClient, claim: SubmissionProcessingClaim, completed = false) {
+  private async state(
+    c: PoolClient,
+    claim: SubmissionProcessingClaim,
+    completed = false,
+    bookkeeping = false,
+  ) {
     for (const value of [claim.submissionId, claim.workId, claim.claimId])
       if (assignmentId(value) !== value) throw fail('invalid_claim');
     if (
@@ -246,11 +255,16 @@ export class PostgresSubmissionProcessor {
       j.materialization_attempt !== claim.attempt ||
       !j.lease_expires_at ||
       j.lease_expires_at.getTime() !== claim.expiresAt ||
-      (!(completed && j.materialization_state === 'completed') &&
+      (!(
+        completed &&
+        (j.materialization_state === 'completed' ||
+          (bookkeeping && j.materialization_state === 'failed'))
+      ) &&
         (j.materialization_state !== 'pending' || j.lease_expires_at.getTime() <= Date.now()))
     )
       throw fail('stale_claim');
     if (
+      !bookkeeping &&
       !(
         await c.query<{ active: boolean }>('SELECT margin_submissions.active($1) AS active', [
           claim.workId,
@@ -264,6 +278,7 @@ export class PostgresSubmissionProcessor {
     cancelled(signal);
     this.external.assertAvailable();
     if (this.preparing + this.live.size >= 2) throw fail('processor_busy');
+    await this.settleStalled(signal);
     return this.tx(async (c) => {
       const j = (
         await c.query<Job>(
@@ -669,7 +684,7 @@ export class PostgresSubmissionProcessor {
           ],
         );
         await c.query(
-          "UPDATE margin_submissions.outbox SET materialization_state='completed',materialized_at=clock_timestamp() WHERE attempt_id=$1",
+          "UPDATE margin_submissions.outbox SET materialization_state='completed',materialized_at=clock_timestamp(),status_revision=status_revision+1 WHERE attempt_id=$1",
           [claim.submissionId],
         );
         await fresh(c, p.snapshot, p.decoded, signal);
@@ -766,6 +781,68 @@ export class PostgresSubmissionProcessor {
       };
     }, signal);
   }
+  private async recordFailure(c: PoolClient, submissionId: string, code: ProcessingFailureCode) {
+    await c.query(
+      "UPDATE margin_submissions.outbox SET materialization_state='failed',status_revision=status_revision+1,published_error_code=$2,failed_at=statement_timestamp() WHERE attempt_id=$1",
+      [submissionId, code],
+    );
+  }
+  /** Redacted bookkeeping only; no source, key or annotation bytes are read here. */
+  async fail(
+    claim: SubmissionProcessingClaim,
+    code: ProcessingFailureCode,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (
+      !['source_unavailable', 'snapshot_invalid', 'authority_revoked', 'retry_exhausted'].includes(
+        code,
+      )
+    )
+      throw fail('invalid_failure');
+    await this.tx(async (c) => {
+      const job = await this.state(c, claim, true, true);
+      if (job.materialization_state === 'completed') return;
+      if (job.materialization_state === 'failed') {
+        if (job.published_error_code !== code) throw fail('failure_conflict');
+        return;
+      }
+      const active = (
+        await c.query<{ active: boolean }>('SELECT margin_submissions.active($1) AS active', [
+          claim.workId,
+        ])
+      ).rows[0]?.active;
+      if (active && code === 'authority_revoked') throw fail('authority_restored');
+      await this.recordFailure(c, claim.submissionId, active ? code : 'authority_revoked');
+    }, signal);
+    for (const p of this.live) if (p.claim.claimId === claim.claimId) this.destroy(p);
+  }
+  /** Bounded sweep also catches a crashed tenth claimant. Never steals an unexpired lease. */
+  async settleStalled(signal?: AbortSignal): Promise<number> {
+    return this.tx(async (c) => {
+      const jobs = (
+        await c.query<Job>(
+          "SELECT * FROM margin_submissions.outbox WHERE materialization_state='pending' AND (lease_expires_at IS NULL OR lease_expires_at<=statement_timestamp()) AND (materialization_attempt>=10 OR NOT margin_submissions.active(work_id)) ORDER BY next_attempt_at,created_at FOR UPDATE SKIP LOCKED LIMIT 10",
+        )
+      ).rows;
+      let settled = 0;
+      for (const job of jobs) {
+        cancelled(signal);
+        const active = (
+          await c.query<{ active: boolean }>('SELECT margin_submissions.active($1) AS active', [
+            job.work_id,
+          ])
+        ).rows[0]?.active;
+        if (active && job.materialization_attempt < 10) continue;
+        await this.recordFailure(
+          c,
+          job.attempt_id,
+          active ? 'retry_exhausted' : 'authority_revoked',
+        );
+        settled++;
+      }
+      return settled;
+    }, signal);
+  }
   async retry(
     claim: SubmissionProcessingClaim,
     delaySeconds = 30,
@@ -774,11 +851,24 @@ export class PostgresSubmissionProcessor {
     if (!Number.isInteger(delaySeconds) || delaySeconds < 0 || delaySeconds > 3600)
       throw fail('invalid_retry');
     await this.tx(async (c) => {
-      await this.state(c, claim);
-      await c.query(
-        "UPDATE margin_submissions.outbox SET claim_id=NULL,token_digest=NULL,lease_expires_at=NULL,next_attempt_at=statement_timestamp()+($2::text||' seconds')::interval WHERE attempt_id=$1",
-        [claim.submissionId, delaySeconds],
-      );
+      const job = await this.state(c, claim, false, true);
+      const active = (
+        await c.query<{ active: boolean }>('SELECT margin_submissions.active($1) AS active', [
+          claim.workId,
+        ])
+      ).rows[0]?.active;
+      if (!active || job.materialization_attempt >= 10) {
+        await this.recordFailure(
+          c,
+          claim.submissionId,
+          active ? 'retry_exhausted' : 'authority_revoked',
+        );
+      } else {
+        await c.query(
+          "UPDATE margin_submissions.outbox SET claim_id=NULL,token_digest=NULL,lease_expires_at=NULL,next_attempt_at=statement_timestamp()+($2::text||' seconds')::interval WHERE attempt_id=$1",
+          [claim.submissionId, delaySeconds],
+        );
+      }
     }, signal);
     for (const p of this.live) if (p.claim.claimId === claim.claimId) this.destroy(p);
   }

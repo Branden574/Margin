@@ -236,3 +236,57 @@ test('durable capture rejection keeps editing paused until the exact fresh recei
   });
   expect(fixture.submissions).toHaveLength(1);
 });
+
+test('failed preparation retries the frozen version and recovers a lost retry after reload', async ({
+  page,
+}) => {
+  const fixture = await installFixture(page);
+  fixture.state.submissionsConfigured = true;
+  await openWork(page);
+  await addText(page, 'Frozen answer for retry');
+  await page.getByRole('button', { name: 'Submit assignment', exact: true }).click();
+  const panel = page.getByRole('region', { name: 'Canvas submission', exact: true });
+  await panel.getByRole('button', { name: 'Continue draft', exact: true }).click();
+  const submission = fixture.submissions[0];
+  const frozen = structuredClone(fixture.frozenOperations.get(submission.id));
+  Object.assign(submission, {
+    phase: 'failed',
+    revision: 2,
+    retryAllowed: true,
+    errorCode: 'retry_exhausted',
+  });
+  await panel.getByRole('button', { name: 'Check submission status', exact: true }).click();
+  await expect(panel.getByRole('button', { name: 'Retry preparation', exact: true })).toBeEnabled();
+  await addText(page, 'Later editable draft', 330);
+  fixture.state.loseNextReprocessAcknowledgement = true;
+  fixture.state.hideReprocessRequests = true;
+  await panel.getByRole('button', { name: 'Retry preparation', exact: true }).click();
+  await expect(
+    panel.getByRole('button', { name: 'Confirm preparation retry', exact: true }),
+  ).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Text', exact: true })).toBeEnabled();
+  await page.reload();
+  await unlockWorkspace(page);
+  await expect(
+    panel.getByRole('button', { name: 'Confirm preparation retry', exact: true }),
+  ).toBeEnabled();
+  await expect(page.getByText('Later editable draft', { exact: true })).toBeVisible();
+  expect(fixture.reprocessPosts).toEqual([2]);
+  await panel.getByRole('button', { name: 'Confirm preparation retry', exact: true }).click();
+  await expect(
+    panel.getByRole('button', { name: 'Confirm preparation retry', exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    panel.getByText('Preparing submission. Not submitted to Canvas yet.', { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText('Not submitted to Canvas', { exact: true })).toBeVisible();
+  expect(fixture.reprocessPosts).toEqual([2, 2]);
+  expect(fixture.captures).toHaveLength(1);
+  expect(submission).toMatchObject({ revision: 3, frozenCursor: 1 });
+  expect(fixture.frozenOperations.get(submission.id)).toEqual(frozen);
+  const a11y = await new AxeBuilder({ page })
+    .include('.canvas-submission')
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+    .analyze();
+  expect(a11y.violations).toEqual([]);
+});

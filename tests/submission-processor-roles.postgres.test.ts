@@ -26,7 +26,7 @@ async function rejectsMixedRole<T extends { close(): Promise<void> }>(
 describe.skipIf(!f.available)('processor credentials remain isolated from request runtimes', () => {
   let assignment: Awaited<ReturnType<typeof f.ready>>;
   beforeAll(async () => {
-    await f.boot({ materialization: true });
+    await f.boot({ processingStatus: true });
     // These assertions require the real migration-created processor role,
     // never the empty compatibility role used by older migration fixture suites.
     expect(

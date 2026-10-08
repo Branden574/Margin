@@ -5,13 +5,20 @@ import {
   createAssignmentWorkClient,
   readVerifiedSnapshot,
   readVerifiedSubmissionRequest,
+  readVerifiedSubmissionRetry,
   type VerifiedSubmissionRequest,
+  type VerifiedSubmissionRetry,
 } from '../apps/web/src/lib/assignment-work/client';
 import type { WorkManifest } from '../apps/web/src/lib/assignment-work/types';
 import type {
   SubmissionRequest,
   SubmissionStatus,
+  SubmissionReprocess,
 } from '../apps/web/src/lib/assignment-work/submissionTypes';
+import {
+  decodeSubmissionReprocess,
+  decodeSubmissionStatus,
+} from '../apps/web/src/lib/assignment-work/submissionDecode';
 import {
   createVault,
   lockVault,
@@ -50,6 +57,29 @@ const rejected = (): SubmissionRequest => ({
   state: 'rejected',
   code: 'cursor_changed',
 });
+function reprocess(patch: Partial<SubmissionReprocess> = {}): SubmissionReprocess {
+  const request = captured({ revision: 3 });
+  if (request.state !== 'captured') throw Error('Synthetic capture required');
+  return {
+    request,
+    expectedRevision: 2,
+    state: 'accepted',
+    acceptedRevision: 3,
+    code: null,
+    ...patch,
+  };
+}
+function retryRejected(
+  code: 'revision_changed' | 'not_retryable' | 'retry_limit' = 'not_retryable',
+): SubmissionReprocess {
+  const request = captured({
+    revision: code === 'revision_changed' ? 3 : 2,
+    phase: 'failed',
+    errorCode: 'retry_exhausted',
+  });
+  if (request.state !== 'captured') throw Error('Synthetic capture required');
+  return reprocess({ request, state: 'rejected', acceptedRevision: null, code });
+}
 function json(url: string, body: unknown, code = 200, headers: Record<string, string> = {}) {
   const response = new Response(JSON.stringify(body), {
     status: code,
@@ -110,6 +140,7 @@ function harness(timeoutMs = 45_000) {
       },
     } as WorkManifest,
     outcome: captured(),
+    reprocess: reprocess(),
     history: [] as SubmissionStatus[],
     hook: undefined as Hook | undefined,
   };
@@ -135,6 +166,10 @@ function harness(timeoutMs = 45_000) {
     }
     if (path === `/api/assignments/work/submission-requests/${id(20)}`)
       return json(url, { request: state.outcome });
+    if (path === `/api/assignments/work/submissions/${id(21)}/reprocess`)
+      return json(url, state.reprocess, state.reprocess.state === 'accepted' ? 202 : 409);
+    if (path.startsWith(`/api/assignments/work/submissions/${id(21)}/reprocess-requests/`))
+      return json(url, state.reprocess);
     throw new Error('Unexpected synthetic request');
   });
   const client = createAssignmentWorkClient({
@@ -157,6 +192,463 @@ beforeEach(async () => {
   await tx.done;
   db.close();
   await createVault(passphrase);
+});
+
+describe('verified same-capture preparation retry transport', () => {
+  it('rejects retryable status revisions that cannot advance to a safe accepted revision', () => {
+    expect(() =>
+      decodeSubmissionStatus(
+        status({
+          revision: Number.MAX_SAFE_INTEGER,
+          phase: 'failed',
+          errorCode: 'retry_exhausted',
+          retryAllowed: true,
+        }),
+      ),
+    ).toThrow();
+    expect(
+      decodeSubmissionStatus(
+        status({
+          revision: Number.MAX_SAFE_INTEGER - 1,
+          phase: 'failed',
+          errorCode: 'retry_exhausted',
+          retryAllowed: true,
+        }),
+      ).revision,
+    ).toBe(Number.MAX_SAFE_INTEGER - 1);
+    expect(
+      decodeSubmissionStatus(
+        status({
+          revision: Number.MAX_SAFE_INTEGER,
+          phase: 'failed',
+          errorCode: 'retry_exhausted',
+          retryAllowed: false,
+        }),
+      ).revision,
+    ).toBe(Number.MAX_SAFE_INTEGER);
+  });
+  it('sends only the immutable revision tuple and returns a cloned opaque proof with current capture provenance', async () => {
+    const h = harness(),
+      input = { expectedRevision: 2 };
+    const pending = h.client.retrySubmission(id(21), input);
+    input.expectedRevision = 99;
+    const token = await pending;
+    expect(Object.isFrozen(token)).toBe(true);
+    expect(JSON.stringify(token)).toBe('{}');
+    const proof = readVerifiedSubmissionRetry(token);
+    expect(proof.outcome).toEqual(reprocess());
+    expect(readVerifiedSnapshot(proof.verified).session).not.toHaveProperty('csrfToken');
+    proof.outcome.request.submission.revision = 900;
+    expect(readVerifiedSubmissionRetry(token).outcome).toEqual(reprocess());
+    expect(posts(h)).toHaveLength(1);
+    const [url, init] = posts(h)[0];
+    expect(url).toBe(`${origin}/api/assignments/work/submissions/${id(21)}/reprocess`);
+    expect(JSON.parse(String(init!.body))).toEqual({ expectedRevision: 2 });
+    expect(init).toMatchObject({
+      method: 'POST',
+      credentials: 'same-origin',
+      mode: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      referrerPolicy: 'no-referrer',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': 'a'.repeat(43) },
+    });
+    for (const [url, options] of h.fetcher.mock.calls) {
+      expect(String(url)).not.toMatch(/csrf|token|student|organization|documentId|versionId/);
+      expect(String(url)).not.toContain('a'.repeat(43));
+      if (options?.method === 'GET') expect(options.headers).not.toHaveProperty('X-CSRF-Token');
+    }
+  });
+
+  it.each(['revision_changed', 'not_retryable', 'retry_limit'] as const)(
+    'accepts a durable %s rejection and lookup without creating another capture',
+    async (code) => {
+      const h = harness();
+      h.state.reprocess = retryRejected(code);
+      expect(
+        readVerifiedSubmissionRetry(await h.client.retrySubmission(id(21), { expectedRevision: 2 }))
+          .outcome,
+      ).toEqual(h.state.reprocess);
+      expect(
+        readVerifiedSubmissionRetry(await h.client.submissionRetryRequest(id(21), 2)).outcome,
+      ).toEqual(h.state.reprocess);
+      expect(posts(h)).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    [
+      'extra field',
+      (v: any) => {
+        v.providerUrl = 'https://private.invalid';
+      },
+    ],
+    [
+      'rejected capture',
+      (v: any) => {
+        v.request = rejected();
+      },
+    ],
+    [
+      'wrong submission',
+      (v: any) => {
+        v.request.submission.id = id(99);
+      },
+    ],
+    [
+      'wrong expected revision',
+      (v: any) => {
+        v.expectedRevision = 1;
+        v.acceptedRevision = 2;
+      },
+    ],
+    [
+      'future accepted revision',
+      (v: any) => {
+        v.acceptedRevision = 4;
+      },
+    ],
+    [
+      'missing accepted revision',
+      (v: any) => {
+        v.acceptedRevision = null;
+      },
+    ],
+    [
+      'accepted error code',
+      (v: any) => {
+        v.code = 'not_retryable';
+      },
+    ],
+    [
+      'unknown decision',
+      (v: any) => {
+        v.state = 'pending';
+      },
+    ],
+    [
+      'old current status',
+      (v: any) => {
+        v.request.submission.revision = 2;
+      },
+    ],
+    [
+      'retryable processing',
+      (v: any) => {
+        v.request.submission.retryAllowed = true;
+      },
+    ],
+    [
+      'unknown current error',
+      (v: any) => {
+        v.request.submission.errorCode = 'raw-provider-error';
+      },
+    ],
+  ] as const)(
+    'refuses %s without issuing proof or silently repeating POST',
+    async (_name, mutate) => {
+      const h = harness(),
+        body = structuredClone(reprocess());
+      mutate(body);
+      h.state.hook = (url, init) => (init.method === 'POST' ? json(url, body, 202) : undefined);
+      await expect(h.client.retrySubmission(id(21), { expectedRevision: 2 })).rejects.toMatchObject(
+        { code: 'invalid_response', uncertainSave: true, operationId: `${id(21)}:2` },
+      );
+      expect(posts(h)).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    [
+      'missing rejection code',
+      (v: any) => {
+        v.code = null;
+      },
+    ],
+    [
+      'accepted revision on rejection',
+      (v: any) => {
+        v.acceptedRevision = 3;
+      },
+    ],
+    [
+      'unknown rejection code',
+      (v: any) => {
+        v.code = 'denied';
+      },
+    ],
+    [
+      'unadvanced revision_changed',
+      (v: any) => {
+        v.code = 'revision_changed';
+      },
+    ],
+    [
+      'future expected revision',
+      (v: any) => {
+        v.expectedRevision = 3;
+      },
+    ],
+  ] as const)('decoder rejects %s in persisted outcome data', (_name, mutate) => {
+    const value = structuredClone(retryRejected());
+    mutate(value);
+    expect(() => decodeSubmissionReprocess(value)).toThrow();
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER, Infinity, '2'])(
+    'refuses expected revision %s before any network request',
+    async (expectedRevision) => {
+      const h = harness();
+      await expect(
+        h.client.retrySubmission(id(21), { expectedRevision: expectedRevision as number }),
+      ).rejects.toThrow();
+      await expect(
+        h.client.submissionRetryRequest(id(21), expectedRevision as number),
+      ).rejects.toThrow();
+      expect(h.fetcher).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses changed identifiers and extra mutation fields before dispatch', async () => {
+    const h = harness();
+    await expect(h.client.retrySubmission('../private', { expectedRevision: 2 })).rejects.toThrow();
+    await expect(
+      h.client.retrySubmission(id(21), { expectedRevision: 2, requestId: id(98) } as {
+        expectedRevision: number;
+      }),
+    ).rejects.toThrow();
+    expect(h.fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each(['accepted-409', 'rejected-202', 'accepted-200'] as const)(
+    'refuses the mismatched %s POST mapping',
+    async (kind) => {
+      const h = harness();
+      h.state.hook = (url, init) =>
+        init.method === 'POST'
+          ? json(
+              url,
+              kind === 'rejected-202' ? retryRejected() : reprocess(),
+              kind === 'accepted-409' ? 409 : kind === 'accepted-200' ? 200 : 202,
+            )
+          : undefined;
+      await expect(h.client.retrySubmission(id(21), { expectedRevision: 2 })).rejects.toMatchObject(
+        { code: 'invalid_response', uncertainSave: true },
+      );
+    },
+  );
+
+  it('preserves uncertainty for an ordinary future-revision 409 and absence after reload', async () => {
+    const h = harness();
+    h.state.hook = (url, init) =>
+      init.method === 'POST'
+        ? json(url, { error: { code: 'revision_changed', message: 'Future revision.' } }, 409)
+        : new URL(url).pathname.includes('/reprocess-requests/')
+          ? json(url, { error: { code: 'reprocess_request_not_found', message: 'Missing.' } }, 404)
+          : undefined;
+    await expect(h.client.retrySubmission(id(21), { expectedRevision: 2 })).rejects.toMatchObject({
+      uncertainSave: true,
+    });
+    await expect(h.client.submissionRetryRequest(id(21), 2)).rejects.toMatchObject({ status: 404 });
+    expect(posts(h)).toHaveLength(1);
+  });
+
+  it('recovers a lost retry reply through a fresh client lookup, without automatic POST or new identity', async () => {
+    const h = harness();
+    h.state.hook = (_url, init) => {
+      if (init.method === 'POST') throw Error('Lost synthetic reply');
+      return undefined;
+    };
+    await expect(h.client.retrySubmission(id(21), { expectedRevision: 2 })).rejects.toMatchObject({
+      uncertainSave: true,
+      operationId: `${id(21)}:2`,
+    });
+    expect(posts(h)).toHaveLength(1);
+    h.client.dispose();
+    h.state.hook = undefined;
+    const fresh = createAssignmentWorkClient({
+      expectedOrigin: origin,
+      fetch: h.fetcher,
+      now: () => h.state.now,
+    });
+    clients.push(fresh);
+    expect(
+      readVerifiedSubmissionRetry(await fresh.submissionRetryRequest(id(21), 2)).outcome,
+    ).toEqual(reprocess());
+    expect(posts(h)).toHaveLength(1);
+    expect(
+      readVerifiedSubmissionRetry(await fresh.retrySubmission(id(21), { expectedRevision: 2 }))
+        .outcome,
+    ).toEqual(reprocess());
+    expect(posts(h)).toHaveLength(2);
+    expect(posts(h).map(([, init]) => init?.body)).toEqual([
+      '{"expectedRevision":2}',
+      '{"expectedRevision":2}',
+    ]);
+  });
+
+  it('preserves the retry decision while its current status advances or arrives out of order', async () => {
+    const h = harness();
+    await h.client.retrySubmission(id(21), { expectedRevision: 2 });
+    h.state.reprocess.request.submission = status({
+      revision: 4,
+      phase: 'failed',
+      retryAllowed: true,
+      errorCode: 'retry_exhausted',
+    });
+    const newer = structuredClone(h.state.reprocess);
+    expect(
+      readVerifiedSubmissionRetry(await h.client.submissionRetryRequest(id(21), 2)).outcome,
+    ).toEqual(newer);
+    h.state.reprocess = reprocess();
+    expect(
+      readVerifiedSubmissionRetry(await h.client.submissionRetryRequest(id(21), 2)).outcome,
+    ).toEqual(newer);
+    h.state.outcome = captured();
+    const request = readVerifiedSubmissionRequest(await h.client.submissionRequest(id(20))).request;
+    expect(request.state).toBe('captured');
+    if (request.state !== 'captured') throw Error('Synthetic capture required');
+    expect(request.submission).toEqual(newer.request.submission);
+  });
+
+  it.each(['decision', 'code', 'same-revision-status', 'capture-identity'] as const)(
+    'rejects changed %s on the same durable retry key',
+    async (kind) => {
+      const h = harness();
+      if (kind === 'code') h.state.reprocess = retryRejected();
+      await h.client.submissionRetryRequest(id(21), 2);
+      if (kind === 'decision') h.state.reprocess = retryRejected('revision_changed');
+      if (kind === 'code') h.state.reprocess = retryRejected('retry_limit');
+      if (kind === 'same-revision-status') h.state.reprocess.request.submission.phase = 'queued';
+      if (kind === 'capture-identity') {
+        h.state.reprocess.request.submission.frozenAt = new Date(time - 1).toISOString();
+        h.state.reprocess.request.submission.revision++;
+      }
+      await expect(h.client.submissionRetryRequest(id(21), 2)).rejects.toMatchObject({
+        code:
+          kind === 'code' || kind === 'decision'
+            ? 'submission_retry_changed'
+            : 'submission_changed',
+      });
+    },
+  );
+
+  it.each([401, 403, 429, 500] as const)(
+    'retains dispatched intent on HTTP %s, invalidating revoked sessions',
+    async (code) => {
+      const h = harness();
+      h.state.hook = (url, init) =>
+        init.method === 'POST'
+          ? json(url, { error: { code: 'retry_unavailable', message: 'Unavailable.' } }, code)
+          : undefined;
+      await expect(h.client.retrySubmission(id(21), { expectedRevision: 2 })).rejects.toMatchObject(
+        { status: code, uncertainSave: true },
+      );
+      expect(posts(h)).toHaveLength(1);
+      if (code === 401 || code === 403)
+        await expect(h.client.submissionRetryRequest(id(21), 2)).rejects.toMatchObject({
+          code: 'session_invalidated',
+        });
+    },
+  );
+
+  it.each(['before', 'after'] as const)(
+    'verifies session authority %s dispatch and withholds revoked proofs',
+    async (when) => {
+      const h = harness();
+      let sent = false;
+      h.state.hook = (url, init) => {
+        if (init.method === 'POST') sent = true;
+        if (new URL(url).pathname === '/api/auth/session' && (when === 'before' || sent))
+          return json(url, { error: { code: 'session_expired', message: 'Launch again.' } }, 401);
+      };
+      await expect(h.client.retrySubmission(id(21), { expectedRevision: 2 })).rejects.toMatchObject(
+        { uncertainSave: when === 'after' },
+      );
+      expect(posts(h)).toHaveLength(when === 'after' ? 1 : 0);
+    },
+  );
+
+  it('refuses forged retry proofs and expires real proofs on time, disposal, or vault lock/reunlock', async () => {
+    const h = harness(),
+      token = await h.client.retrySubmission(id(21), { expectedRevision: 2 });
+    for (const forged of [{}, { outcome: reprocess() }, structuredClone(token)])
+      expect(() => readVerifiedSubmissionRetry(forged as VerifiedSubmissionRetry)).toThrow();
+    h.state.now += 60000;
+    expect(() => readVerifiedSubmissionRetry(token)).toThrow();
+    h.state.now = time;
+    const second = await h.client.submissionRetryRequest(id(21), 2);
+    await lockVault();
+    await unlockVault(passphrase);
+    expect(() => readVerifiedSubmissionRetry(second)).toThrow();
+    const third = await h.client.submissionRetryRequest(id(21), 2);
+    h.client.dispose();
+    expect(() => readVerifiedSubmissionRetry(third)).toThrow();
+  });
+
+  it('bounds retry responses and rejects redirects without releasing exact intent', async () => {
+    for (const kind of ['oversized', 'redirected'] as const) {
+      const h = harness();
+      h.state.hook = (url, init) => {
+        if (init.method !== 'POST') return;
+        const response = json(
+          url,
+          reprocess(),
+          202,
+          kind === 'oversized' ? { 'Content-Length': '16385' } : {},
+        );
+        if (kind === 'redirected') Object.defineProperty(response, 'redirected', { value: true });
+        return response;
+      };
+      await expect(h.client.retrySubmission(id(21), { expectedRevision: 2 })).rejects.toMatchObject(
+        {
+          uncertainSave: true,
+          code: kind === 'oversized' ? 'response_too_large' : 'redirect_refused',
+        },
+      );
+    }
+  });
+
+  it.each(['abort', 'timeout'] as const)(
+    'preserves retry uncertainty and cancels a stalled body on %s',
+    async (kind) => {
+      const h = harness(50),
+        started = deferred<void>(),
+        aborted = new AbortController(),
+        cancelled = vi.fn();
+      h.state.hook = (url, init) => {
+        if (init.method !== 'POST') return;
+        const response = new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"request":'));
+              started.resolve();
+            },
+            cancel: cancelled,
+          }),
+          { status: 202, headers: { 'content-type': 'application/json' } },
+        );
+        Object.defineProperty(response, 'url', { value: url });
+        return response;
+      };
+      vi.useFakeTimers();
+      const result = h.client.retrySubmission(
+        id(21),
+        { expectedRevision: 2 },
+        { signal: aborted.signal },
+      );
+      const assertion = expect(result).rejects.toMatchObject({
+        code: kind === 'abort' ? 'cancelled' : 'timeout',
+        uncertainSave: true,
+      });
+      await started.promise;
+      if (kind === 'abort') aborted.abort();
+      else await vi.advanceTimersByTimeAsync(51);
+      await assertion;
+      expect(cancelled).toHaveBeenCalledOnce();
+      expect(posts(h)).toHaveLength(1);
+    },
+  );
 });
 afterEach(async () => {
   for (const client of clients.splice(0)) client.dispose();

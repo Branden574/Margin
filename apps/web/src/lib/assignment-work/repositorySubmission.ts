@@ -1,6 +1,6 @@
 import type { VaultTransaction } from '../vault';
 import { canonical, repositoryError } from './mapping';
-import { decodeSubmissionRequest } from './submissionDecode';
+import { decodeSubmissionRequest, decodeSubmissionReprocess } from './submissionDecode';
 import type { SubmissionRequest } from './submissionTypes';
 import {
   MAX_LOCAL_SUBMISSION_REQUESTS,
@@ -63,7 +63,7 @@ function record(
   requestId: string,
 ): AssignmentSubmissionRecord {
   const row = object(value);
-  keys(row, ['schema', 'localDocumentId', 'request', 'outcome', 'barrier']);
+  keys(row, ['schema', 'localDocumentId', 'request', 'outcome', 'barrier', 'retry']);
   if (
     row.schema !== 1 ||
     row.localDocumentId !== binding.localDocumentId ||
@@ -87,12 +87,38 @@ function record(
       return invalid();
   }
   if (!row.barrier && !outcome) return invalid();
+  let retry: AssignmentSubmissionRecord['retry'];
+  if (row.retry !== undefined) {
+    const value = object(row.retry);
+    keys(value, ['expectedRevision', 'outcome']);
+    if (
+      outcome?.state !== 'captured' ||
+      !Number.isSafeInteger(value.expectedRevision) ||
+      Number(value.expectedRevision) < 1 ||
+      Number(value.expectedRevision) > outcome.submission.revision
+    )
+      return invalid();
+    retry = { expectedRevision: Number(value.expectedRevision) };
+    if (value.outcome !== undefined) {
+      try {
+        retry.outcome = decodeSubmissionReprocess(value.outcome);
+      } catch {
+        return invalid();
+      }
+      if (
+        retry.outcome.expectedRevision !== retry.expectedRevision ||
+        canonical(mergeSubmissionOutcome(outcome, retry.outcome.request)) !== canonical(outcome)
+      )
+        return invalid();
+    }
+  }
   return {
     schema: 1,
     localDocumentId: binding.localDocumentId,
     request,
     ...(outcome ? { outcome } : {}),
     barrier: row.barrier,
+    ...(retry ? { retry } : {}),
   };
 }
 /** The small bounded index and every indexed row are authenticated together. */

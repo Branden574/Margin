@@ -21,6 +21,8 @@ import {
   prepareSubmission,
   recordSubmissionOutcome,
   continueAssignmentDraft,
+  prepareSubmissionRetry,
+  recordSubmissionRetryOutcome,
 } from './repository';
 import { AssignmentRetryError, type AssignmentSnapshot } from './repositoryTypes';
 import { RequestScope } from './transport';
@@ -652,6 +654,34 @@ class Controller implements StudentWorkController {
           // Prepared locally does not imply dispatched. Preserve the exact request for explicit retry.
         }
       }
+      const retrySnapshot = await this.read(action);
+      const retryRecord = retrySnapshot.submission;
+      if (
+        retryRecord?.retry &&
+        !retryRecord.retry.outcome &&
+        retryRecord.outcome?.state === 'captured'
+      ) {
+        try {
+          const proof = await this.client.submissionRetryRequest(
+            retryRecord.outcome.submission.id,
+            retryRecord.retry.expectedRevision,
+            { signal: action.scope.controller.signal },
+          );
+          action.check();
+          const target = this.target();
+          await recordSubmissionRetryOutcome(
+            target.id,
+            target.revision,
+            proof,
+            action.scope.controller.signal,
+          );
+          await this.read(action);
+        } catch (reason) {
+          action.check();
+          if ((reason as AssignmentWorkClientError).status !== 404) throw reason;
+          // Absence is not a terminal result: an earlier dispatched command may still arrive.
+        }
+      }
     } catch (reason) {
       action.check();
       if (invalidates(reason)) throw reason;
@@ -773,6 +803,52 @@ class Controller implements StudentWorkController {
       );
       await this.read(action);
       await this.recover(action, readVerifiedSubmissionRequest(verified).verified);
+      this.publish({ phase: 'ready', submissionError: null });
+    });
+  retrySubmission = () =>
+    this.run('syncing', async (action) => {
+      let snapshot = await this.read(action);
+      let record = snapshot.submission;
+      if (record?.outcome?.state !== 'captured')
+        throw fail(
+          'submission_request_missing',
+          'Open the saved submission version before retrying preparation.',
+        );
+      const target = this.target();
+      if (!record.retry || record.retry.outcome) {
+        const proof = await this.client.submissionRequest(record.request.requestId, {
+          signal: action.scope.controller.signal,
+        });
+        action.check();
+        await prepareSubmissionRetry(
+          target.id,
+          target.revision,
+          proof,
+          action.scope.controller.signal,
+        );
+        snapshot = await this.read(action);
+        record = snapshot.submission;
+      }
+      if (!record?.retry || record.retry.outcome || record.outcome?.state !== 'captured')
+        throw fail(
+          'submission_retry_missing',
+          'The exact preparation retry could not be recovered.',
+        );
+      const proof = await this.client.retrySubmission(
+        record.outcome.submission.id,
+        { expectedRevision: record.retry.expectedRevision },
+        { signal: action.scope.controller.signal },
+      );
+      action.check();
+      await recordSubmissionRetryOutcome(
+        target.id,
+        target.revision,
+        proof,
+        action.scope.controller.signal,
+      );
+      const current = await this.read(action);
+      if (current.submission?.outcome?.state === 'captured')
+        this.publish({ submissionHistory: [current.submission.outcome.submission] });
       this.publish({ phase: 'ready', submissionError: null });
     });
 }

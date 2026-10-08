@@ -3,6 +3,7 @@ import type { PostgresIngestionRepository } from '../../../ingestion/postgres.js
 import type { ArtifactReader } from '../../../ingestion/types.js';
 import { bounded } from '../../../cloud/limits.js';
 import { SubmissionReplay } from './replay.js';
+import { terminalProcessingFailure } from './failures.js';
 import {
   SubmissionProcessingError,
   type MaterializationReceipt,
@@ -172,9 +173,12 @@ export class SubmissionMaterializationWorker {
         const completed = await this.repository.receipt(claim, signal).catch(() => null);
         check(signal);
         if (completed) return receipt(completed, claim, expected);
-        await this.repository
-          .retry(claim, Math.min(3600, 30 * 2 ** Math.min(claim.attempt - 1, 7)), signal)
-          .catch(() => {});
+        const terminal = terminalProcessingFailure(error);
+        if (terminal) await this.repository.fail(claim, terminal, signal).catch(() => {});
+        else
+          await this.repository
+            .retry(claim, Math.min(3600, 30 * 2 ** Math.min(claim.attempt - 1, 7)), signal)
+            .catch(() => {});
       }
       throw error;
     } finally {

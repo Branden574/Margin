@@ -309,6 +309,7 @@ function StudentWorkSession({ controller }: { controller: StudentWorkController 
         submit={() => void perform(() => controller.submit())}
         check={() => void perform(() => controller.checkSubmissionStatus())}
         continueDraft={() => void perform(() => controller.continueDraft())}
+        retry={() => void perform(() => controller.retrySubmission())}
       />
     </section>
   );

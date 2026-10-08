@@ -57,7 +57,18 @@ export interface MaterializationSummary {
   chunkCount: number;
   outputSha256: string;
 }
+export type ProcessingFailureCode =
+  | 'source_unavailable'
+  | 'snapshot_invalid'
+  | 'authority_revoked'
+  | 'retry_exhausted';
 export interface SubmissionProcessingRepository {
+  fail(
+    claim: SubmissionProcessingClaim,
+    code: ProcessingFailureCode,
+    signal?: AbortSignal,
+  ): Promise<void>;
+  settleStalled(signal?: AbortSignal): Promise<number>;
   claimNext(signal?: AbortSignal): Promise<SubmissionProcessingClaim | null>;
   prepare(
     claim: SubmissionProcessingClaim,

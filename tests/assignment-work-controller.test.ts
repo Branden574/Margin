@@ -10,6 +10,7 @@ import type { StudentWorkController } from '../apps/web/src/lib/assignment-work/
 import type {
   SubmissionInput,
   SubmissionRequest,
+  SubmissionReprocess,
 } from '../apps/web/src/lib/assignment-work/submissionTypes';
 import type {
   AppendOperation,
@@ -24,6 +25,7 @@ import {
   unlockVault,
   VAULT_DATABASE,
   vaultStatus,
+  vaultTransaction,
 } from '../apps/web/src/lib/vault';
 
 const origin = 'https://assignment.synthetic.test';
@@ -66,6 +68,12 @@ async function harness(options: Parameters<typeof createStudentWorkController>[0
     failAppend: false,
     submissionsConfigured: false,
     loseCaptureReply: false,
+    loseReprocessReply: false,
+    hideReprocessRequests: false,
+    rejectReprocess: false,
+    bareReprocessError: false,
+    reprocessRequests: new Map<number, SubmissionReprocess>(),
+    reprocessPosts: [] as number[],
     hideSubmissionRequests: false,
     rejectCapture: false,
     submissionRequests: new Map<string, SubmissionRequest>(),
@@ -196,6 +204,7 @@ async function harness(options: Parameters<typeof createStudentWorkController>[0
       }
     } else if (
       path === '/api/assignments/work/submissions' ||
+      path.startsWith('/api/assignments/work/submissions/') ||
       path.startsWith('/api/assignments/work/submission-requests/')
     ) {
       if (!state.submissionsConfigured) {
@@ -206,6 +215,57 @@ async function harness(options: Parameters<typeof createStudentWorkController>[0
             message: 'Synthetic submission service unconfigured',
           },
         };
+      } else if (path.includes('/reprocess')) {
+        const request = Array.from(state.submissionRequests.values()).find(
+          (r) => r.state === 'captured',
+        );
+        if (!request || request.state !== 'captured') throw new Error('Fixture capture required');
+        const expectedRevision =
+          method === 'POST'
+            ? (JSON.parse(String(init?.body)).expectedRevision as number)
+            : Number(path.split('/').at(-1));
+        let result = state.reprocessRequests.get(expectedRevision);
+        if (method === 'POST') {
+          state.reprocessPosts.push(expectedRevision);
+          if (!result && !state.bareReprocessError) {
+            const rejected =
+              state.rejectReprocess ||
+              expectedRevision !== request.submission.revision ||
+              !request.submission.retryAllowed;
+            if (!rejected)
+              Object.assign(request.submission, {
+                revision: expectedRevision + 1,
+                phase: 'processing',
+                retryAllowed: false,
+                errorCode: null,
+              });
+            result = {
+              request: structuredClone(request),
+              expectedRevision,
+              state: rejected ? 'rejected' : 'accepted',
+              acceptedRevision: rejected ? null : expectedRevision + 1,
+              code: rejected
+                ? expectedRevision === request.submission.revision
+                  ? 'not_retryable'
+                  : 'revision_changed'
+                : null,
+            };
+            state.reprocessRequests.set(expectedRevision, result);
+          }
+          if (state.loseReprocessReply) {
+            state.loseReprocessReply = false;
+            throw new TypeError('Synthetic reprocess reply lost');
+          }
+        }
+        if (!result || (method === 'GET' && state.hideReprocessRequests)) {
+          status = method === 'POST' ? 409 : 404;
+          value = {
+            error: { code: 'submission_reprocess_missing', message: 'Synthetic retry not found' },
+          };
+        } else {
+          status = method === 'GET' ? 200 : result.state === 'accepted' ? 202 : 409;
+          value = { ...result, request: structuredClone(request) };
+        }
       } else if (path.includes('/submission-requests/')) {
         const request = state.submissionRequests.get(path.split('/').at(-1)!);
         if (!request || state.hideSubmissionRequests) {
@@ -333,6 +393,171 @@ function edit(
 }
 const posts = (h: Awaited<ReturnType<typeof harness>>) =>
   h.state.requests.filter((r) => r.path.endsWith('/operations') && r.method === 'POST');
+
+async function failedSubmission(h: Awaited<ReturnType<typeof harness>>) {
+  h.state.submissionsConfigured = true;
+  await h.controller.open();
+  await h.controller.enqueue(edit(h.controller));
+  await h.controller.submit();
+  await h.controller.continueDraft();
+  const request = Array.from(h.state.submissionRequests.values())[0];
+  if (request.state !== 'captured') throw new Error('Expected capture');
+  Object.assign(request.submission, {
+    phase: 'failed',
+    revision: 2,
+    retryAllowed: true,
+    errorCode: 'retry_exhausted',
+  });
+  await h.controller.checkSubmissionStatus();
+  return request;
+}
+
+describe('durable preparation retry controller', () => {
+  it('reprocesses the same frozen version while newer draft edits remain independently editable', async () => {
+    const h = await harness();
+    const request = await failedSubmission(h);
+    const frozen = structuredClone(h.state.frozenOperations);
+    await h.controller.enqueue(edit(h.controller, 11, 'New draft', id(19)));
+    await h.controller.retrySubmission();
+    expect(h.state.reprocessPosts).toEqual([2]);
+    expect(h.state.captureRequests).toHaveLength(1);
+    expect(h.state.frozenOperations).toEqual(frozen);
+    expect(request.submission).toMatchObject({ frozenCursor: 1, revision: 3, phase: 'processing' });
+    expect(h.controller.getState()).toMatchObject({
+      submission: 'not-submitted',
+      submissionRecord: {
+        barrier: false,
+        retry: { expectedRevision: 2, outcome: { state: 'accepted' } },
+      },
+    });
+    await h.controller.enqueue(edit(h.controller, 12, 'Still editable', id(20)));
+    expect(h.controller.getState().view?.pending).toHaveLength(2);
+    await expect(h.controller.retrySubmission()).rejects.toMatchObject({
+      code: 'submission_not_retryable',
+    });
+    expect(h.state.reprocessPosts).toEqual([2]);
+  });
+
+  it('persists before dispatch and recovers a lost reply after encrypted reload without another POST', async () => {
+    const h = await harness();
+    await failedSubmission(h);
+    h.state.loseReprocessReply = true;
+    await expect(h.controller.retrySubmission()).rejects.toBeTruthy();
+    expect(h.controller.getState().submissionRecord?.retry).toEqual({ expectedRevision: 2 });
+    h.controller.dispose();
+    await lockVault();
+    await unlockVault(passphrase);
+    const fresh = h.anotherController();
+    await fresh.open();
+    expect(fresh.getState().submissionRecord?.retry).toMatchObject({
+      expectedRevision: 2,
+      outcome: { state: 'accepted', acceptedRevision: 3 },
+    });
+    expect(h.state.reprocessPosts).toEqual([2]);
+    expect(fresh.getState().submission).toBe('not-submitted');
+  });
+
+  it('retains an unknown tuple across newer status and absent lookup; explicit recovery sends the same tuple', async () => {
+    const h = await harness();
+    const request = await failedSubmission(h);
+    h.state.loseReprocessReply = true;
+    h.state.hideReprocessRequests = true;
+    await expect(h.controller.retrySubmission()).rejects.toBeTruthy();
+    Object.assign(request.submission, {
+      phase: 'failed',
+      revision: 4,
+      retryAllowed: true,
+      errorCode: 'retry_exhausted',
+    });
+    await h.controller.checkSubmissionStatus();
+    expect(h.controller.getState().submissionRecord?.retry).toEqual({ expectedRevision: 2 });
+    await h.controller.enqueue(edit(h.controller, 11, 'Draft during uncertainty', id(19)));
+    await h.controller.retrySubmission();
+    expect(h.state.reprocessPosts).toEqual([2, 2]);
+    expect(request.submission.revision).toBe(4);
+    expect(h.controller.getState().submissionRecord?.retry?.outcome).toMatchObject({
+      state: 'accepted',
+      acceptedRevision: 3,
+    });
+    await h.controller.retrySubmission();
+    expect(h.state.reprocessPosts).toEqual([2, 2, 4]);
+    expect(request.submission.revision).toBe(5);
+  });
+
+  it('a bare rejection cannot clear a saved retry, while its durable rejection can', async () => {
+    const h = await harness();
+    await failedSubmission(h);
+    h.state.bareReprocessError = true;
+    await expect(h.controller.retrySubmission()).rejects.toBeTruthy();
+    await h.controller.checkSubmissionStatus();
+    expect(h.controller.getState().submissionRecord?.retry).toEqual({ expectedRevision: 2 });
+    h.state.bareReprocessError = false;
+    h.state.rejectReprocess = true;
+    await h.controller.retrySubmission();
+    expect(h.controller.getState().submissionRecord?.retry?.outcome).toMatchObject({
+      state: 'rejected',
+      acceptedRevision: null,
+    });
+    expect(h.state.reprocessPosts).toEqual([2, 2]);
+    await expect(h.controller.retrySubmission()).rejects.toMatchObject({
+      code: 'submission_not_retryable',
+    });
+  });
+
+  it('two explicit tab retries coalesce on the same stored command and preserve one generation', async () => {
+    const h = await harness();
+    const request = await failedSubmission(h);
+    const another = h.anotherController();
+    await another.open();
+    const gate = h.gate(`/api/assignments/work/submissions/${request.submission.id}/reprocess`);
+    const first = h.controller.retrySubmission();
+    await gate.entered.promise;
+    const second = another.retrySubmission();
+    gate.release.resolve();
+    await Promise.all([first, second]);
+    expect(h.state.reprocessPosts.length).toBeGreaterThanOrEqual(1);
+    expect(h.state.reprocessPosts.every((revision) => revision === 2)).toBe(true);
+    expect(request.submission.revision).toBe(3);
+    expect(h.state.reprocessRequests.size).toBe(1);
+    expect(h.state.captureRequests).toHaveLength(1);
+    expect(another.getState().submissionRecord?.retry?.outcome?.state).toBe('accepted');
+  });
+
+  it('rejects an inconsistent encrypted retry checkpoint without making another network command', async () => {
+    const h = await harness();
+    await failedSubmission(h);
+    h.state.loseReprocessReply = true;
+    await expect(h.controller.retrySubmission()).rejects.toBeTruthy();
+    const record = h.controller.getState().submissionRecord!;
+    h.controller.dispose();
+    await vaultTransaction(async (tx) => {
+      tx.put(
+        'assignment-receipts',
+        `submission:${record.localDocumentId}:${record.request.requestId}`,
+        { ...record, retry: { expectedRevision: 999 } },
+      );
+    });
+    const fresh = h.anotherController();
+    await expect(fresh.open()).rejects.toMatchObject({ code: 'invalid_submission_record' });
+    expect(h.state.reprocessPosts).toEqual([2]);
+  });
+
+  it('revocation clears displayed retry details and never creates another retry', async () => {
+    const h = await harness();
+    await failedSubmission(h);
+    h.state.loseReprocessReply = true;
+    await expect(h.controller.retrySubmission()).rejects.toBeTruthy();
+    h.state.denied = true;
+    await expect(h.controller.checkSubmissionStatus()).rejects.toBeTruthy();
+    expect(h.controller.getState()).toMatchObject({
+      phase: 'invalidated',
+      submissionRecord: null,
+      submissionHistory: [],
+      view: null,
+    });
+    expect(h.state.reprocessPosts).toEqual([2]);
+  });
+});
 
 describe('immutable submission capture controller', () => {
   it('keeps normal editing usable when submission is unconfigured', async () => {

@@ -40,11 +40,33 @@ export type SubmissionRequest =
       state: 'rejected';
       code: 'cursor_changed' | 'attempt_exists';
     };
+export interface SubmissionReprocessInput {
+  expectedRevision: number;
+}
+export interface SubmissionReprocessRequest {
+  request: Extract<SubmissionRequest, { state: 'captured' }>;
+  expectedRevision: number;
+  state: 'accepted' | 'rejected';
+  acceptedRevision: number | null;
+  code: 'revision_changed' | 'not_retryable' | 'retry_limit' | null;
+}
 export interface SubmissionPage {
   submissions: SubmissionStatus[];
   nextCursor: string | null;
 }
 export interface AssignmentSubmissionService {
+  reprocess(
+    principal: SessionPrincipal,
+    submissionId: string,
+    value: unknown,
+    options?: SubmissionRequestOptions,
+  ): Promise<SubmissionReprocessRequest>;
+  reprocessRequest(
+    principal: SessionPrincipal,
+    submissionId: string,
+    expectedRevision: number,
+    options?: SubmissionRequestOptions,
+  ): Promise<SubmissionReprocessRequest>;
   capture(
     principal: SessionPrincipal,
     value: unknown,

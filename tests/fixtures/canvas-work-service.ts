@@ -4,6 +4,7 @@ import type {
   SubmissionInput,
   SubmissionRequest,
   SubmissionStatus,
+  SubmissionReprocessRequest,
 } from '../../apps/api/src/assignments/submissions/types';
 
 /** Synthetic browser fixture only. Never mount in an application or deploy as authentication. */
@@ -33,6 +34,8 @@ export async function canvasWorkFixture({
   const submissionRequests = new Map<string, SubmissionRequest>();
   const submissions: SubmissionStatus[] = [];
   const frozenOperations = new Map<string, CommittedOperation[]>();
+  const reprocessRequests = new Map<number, SubmissionReprocessRequest>();
+  const reprocessPosts: number[] = [];
   const state = {
     authorized: true,
     loseNextAcknowledgement: false,
@@ -40,6 +43,8 @@ export async function canvasWorkFixture({
     submissionsConfigured: false,
     loseNextCaptureAcknowledgement: false,
     hideSubmissionRequests: false,
+    loseNextReprocessAcknowledgement: false,
+    hideReprocessRequests: false,
     rejectNextCapture: null as 'cursor_changed' | 'attempt_exists' | null,
   };
   const json = (value: unknown, status = 200) => ({
@@ -55,6 +60,8 @@ export async function canvasWorkFixture({
     submissionRequests,
     submissions,
     frozenOperations,
+    reprocessRequests,
+    reprocessPosts,
     async handle(url: URL, method: string, body?: string) {
       if (!state.authorized)
         return json(
@@ -77,6 +84,7 @@ export async function canvasWorkFixture({
         });
       if (
         url.pathname === '/api/assignments/work/submissions' ||
+        url.pathname.startsWith('/api/assignments/work/submissions/') ||
         url.pathname.startsWith('/api/assignments/work/submission-requests/')
       ) {
         if (!state.submissionsConfigured)
@@ -86,6 +94,77 @@ export async function canvasWorkFixture({
             },
             503,
           );
+        if (url.pathname.includes('/reprocess')) {
+          const submission = submissions.find((row) => row.id === url.pathname.split('/')[5]);
+          const request = submission && submissionRequests.get(submission.requestId);
+          if (!request || request.state !== 'captured')
+            return json(
+              { error: { code: 'submission_missing', message: 'Unknown synthetic submission.' } },
+              404,
+            );
+          const expectedRevision =
+            method === 'POST'
+              ? (JSON.parse(body ?? '{}').expectedRevision as number)
+              : Number(url.pathname.split('/').at(-1));
+          let result = reprocessRequests.get(expectedRevision);
+          if (method === 'POST') {
+            reprocessPosts.push(expectedRevision);
+            if (expectedRevision > request.submission.revision)
+              return json(
+                { error: { code: 'revision_changed', message: 'Synthetic future revision.' } },
+                409,
+              );
+            if (!result) {
+              const code =
+                expectedRevision !== request.submission.revision
+                  ? 'revision_changed'
+                  : !request.submission.retryAllowed
+                    ? 'not_retryable'
+                    : null;
+              if (!code)
+                Object.assign(request.submission, {
+                  revision: expectedRevision + 1,
+                  phase: 'processing',
+                  retryAllowed: false,
+                  errorCode: null,
+                });
+              result = {
+                request: structuredClone(request),
+                expectedRevision,
+                state: code ? 'rejected' : 'accepted',
+                acceptedRevision: code ? null : expectedRevision + 1,
+                code,
+              };
+              reprocessRequests.set(expectedRevision, result);
+            }
+            if (state.loseNextReprocessAcknowledgement) {
+              state.loseNextReprocessAcknowledgement = false;
+              return json(
+                {
+                  error: {
+                    code: 'synthetic_retry_ack_unavailable',
+                    message: 'Synthetic interruption after durable retry.',
+                  },
+                },
+                503,
+              );
+            }
+          }
+          if (!result || (method === 'GET' && state.hideReprocessRequests))
+            return json(
+              {
+                error: {
+                  code: 'submission_reprocess_missing',
+                  message: 'Unknown synthetic retry.',
+                },
+              },
+              404,
+            );
+          return json(
+            { ...result, request },
+            method === 'GET' ? 200 : result.state === 'accepted' ? 202 : 409,
+          );
+        }
         if (url.pathname.startsWith('/api/assignments/work/submission-requests/')) {
           if (state.hideSubmissionRequests)
             return json(

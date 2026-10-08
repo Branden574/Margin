@@ -83,6 +83,8 @@ function fixture(count = 3, deadlineMs?: number) {
   const buffers: Buffer[] = [],
     contents: Array<{ entries: Array<{ annotation?: { text?: string } }> }> = [];
   const repository = {
+    fail: vi.fn(async () => undefined),
+    settleStalled: vi.fn(async () => 0),
     claimNext: vi.fn(async () => claim),
     prepare: vi.fn(async () => prepared),
     readBatch: vi.fn(async (_claim, _ticket, after: number): Promise<SubmissionOperationBatch> => {
@@ -128,6 +130,36 @@ afterEach(() => {
 });
 
 describe('bounded submission materialization worker', () => {
+  it.each([
+    ['snapshot_invalid', 'snapshot_invalid'],
+    ['source_content_mismatch', 'snapshot_invalid'],
+    ['authority_revoked', 'authority_revoked'],
+    ['source_changed', 'source_unavailable'],
+  ])(
+    'records terminal %s without scheduling another automatic attempt',
+    async (errorCode, publishedCode) => {
+      const f = fixture();
+      f.repository.prepare.mockRejectedValueOnce(new SubmissionProcessingError(errorCode));
+      await expect(f.worker.runOne()).rejects.toMatchObject({ code: errorCode });
+      expect(f.repository.fail).toHaveBeenCalledWith(
+        f.claim,
+        publishedCode,
+        expect.any(AbortSignal),
+      );
+      expect(f.repository.retry).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['submission_integrity', 'work_integrity', 'key_provider_unavailable'])(
+    'retries ambiguous %s instead of declaring a permanently invalid capture',
+    async (code) => {
+      const f = fixture();
+      f.repository.prepare.mockRejectedValueOnce(new SubmissionProcessingError(code));
+      await expect(f.worker.runOne()).rejects.toMatchObject({ code });
+      expect(f.repository.retry).toHaveBeenCalledWith(f.claim, 30, expect.any(AbortSignal));
+      expect(f.repository.fail).not.toHaveBeenCalled();
+    },
+  );
+
   it('replays a complete frozen prefix in bounded batches, stages encrypted inputs, and releases all plaintext buffers', async () => {
     const f = fixture(250);
     const result = await f.worker.runOne();
@@ -274,6 +306,7 @@ describe('bounded submission materialization worker', () => {
     expect(f.repository.stageChunk).not.toHaveBeenCalled();
     expect(f.repository.receipt).not.toHaveBeenCalled();
     expect(f.repository.retry).not.toHaveBeenCalled();
+    expect(f.repository.fail).not.toHaveBeenCalled();
     f.repository.claimNext.mockResolvedValueOnce(null as never);
     expect(await f.worker.runOne()).toBeNull();
   });
