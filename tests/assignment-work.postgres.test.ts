@@ -785,6 +785,7 @@ describe.skipIf(!available)(
             'margin_assignment_work_runtime',
             'margin_submission_runtime',
             'margin_submission_retention_guard',
+            'margin_submission_processor',
           ] as const
         ).flatMap((mixedRole) => [true, false].map((inherit) => ({ group, inherit, mixedRole }))),
       ),

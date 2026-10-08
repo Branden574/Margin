@@ -45,7 +45,8 @@ export async function withAssignmentRoleMembership(
     | 'margin_assignment_provisioner'
     | 'margin_assignment_work_runtime'
     | 'margin_submission_runtime'
-    | 'margin_submission_retention_guard',
+    | 'margin_submission_retention_guard'
+    | 'margin_submission_processor',
   inherit: boolean,
   check: (unsafe: PoolConfig) => Promise<void>,
 ) {
