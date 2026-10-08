@@ -234,7 +234,9 @@ export class AssignmentService {
       resourceDigest,
       (source) => this.sources().prepareAvailability(source),
     );
-    return { redirectPath: '/canvas/work' };
+    // Screen choice follows the verified enrollment only after author/resource authority
+    // has been established by bindResource. The URL itself confers no review permission.
+    return { redirectPath: enrollment.role === 'teacher' ? '/canvas/review' : '/canvas/work' };
   }
   async currentSelection(principal: SessionPrincipal) {
     const enrollment = await this.course(principal, 'teacher');

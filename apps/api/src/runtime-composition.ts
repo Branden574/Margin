@@ -146,7 +146,7 @@ export async function createCanvasRuntime(
       issueSession: (enrollment, request) => identity.issueLmsSession(enrollment, request),
       authenticateSession: (request) => identity.authenticateRequest(request),
       onVerifiedLaunch: (input) => assignments.captureVerifiedLaunch(input),
-      launchReturnPaths: ['/canvas/author', '/canvas/work'],
+      launchReturnPaths: ['/canvas/author', '/canvas/work', '/canvas/review'],
       resolveKey: resolveLmsKey,
     });
     return {

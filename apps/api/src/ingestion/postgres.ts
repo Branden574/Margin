@@ -136,6 +136,8 @@ export interface ReadyManifest {
   receipt: ArtifactReceipt;
   /** Opaque digest of the authenticated immutable database state; contains no plaintext metadata. */
   stateToken: string;
+  /** Authenticated ingestion plaintext size. Older custom adapters may omit it. */
+  plaintextBytes?: number;
   /** Present only when every page was authenticated by the inspected geometry envelope. */
   pageGeometry?: SourcePageGeometry[];
 }
@@ -311,9 +313,10 @@ export class PostgresIngestionRepository {
         'margin_submission_runtime',
         'margin_submission_retention_guard',
         'margin_submission_processor',
+        'margin_submission_reviewer',
       ].filter((g) => g !== group);
       const safe = await c.query<{ unsafe: boolean }>(
-        `SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,$1,'MEMBER') OR EXISTS(SELECT 1 FROM pg_roles other WHERE other.rolname=ANY($2::text[]) AND pg_has_role(current_user,other.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_ingestion','margin_identity','margin_lms','margin_sync','margin_assignments','margin_work','margin_submissions') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user`,
+        `SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,$1,'MEMBER') OR EXISTS(SELECT 1 FROM pg_roles other WHERE other.rolname=ANY($2::text[]) AND pg_has_role(current_user,other.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_ingestion','margin_identity','margin_lms','margin_sync','margin_assignments','margin_work','margin_submissions','margin_review') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user`,
         [group, groups],
       );
       if (!safe.rows[0] || safe.rows[0].unsafe)
@@ -921,6 +924,7 @@ export class PostgresIngestionRepository {
       identity: identity(r),
       receipt: object,
       stateToken: stateToken(r, j, stored, scan, source, pages),
+      plaintextBytes: expected.plaintextBytes,
       source,
       ...(pageGeometry ? { pageGeometry } : {}),
     };

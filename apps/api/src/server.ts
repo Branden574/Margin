@@ -27,6 +27,8 @@ import { AssignmentError } from './assignments/types.js';
 import { handleCanvasAssignmentReturn, isCanvasAssignmentReturnPath } from './assignment-return.js';
 import { handleSubmissions, isSubmissionPath } from './submission-http.js';
 import type { AssignmentSubmissionService } from './assignments/submissions/types.js';
+import { handleSubmissionReview, isSubmissionReviewPath } from './submission-review-http.js';
+import type { AssignmentReviewService } from './assignments/review/types.js';
 
 const MIB = 1024 * 1024;
 export interface LocalIdentity {
@@ -59,6 +61,8 @@ export interface ApiOptions {
   assignmentWorkService?: AssignmentWorkService;
   /** Explicit opt-in; capture alone does not confirm delivery to Canvas. */
   assignmentSubmissionService?: AssignmentSubmissionService;
+  /** Explicit read-only author-teacher review; never implies Canvas delivery. */
+  assignmentReviewService?: AssignmentReviewService;
   keyEncryptionKey?: Buffer;
   keyManagementProvider?: KeyManagementProvider;
   tls?: { key: Buffer; cert: Buffer };
@@ -192,7 +196,8 @@ export function createApi(options: ApiOptions) {
   if (
     (options.assignmentService ||
       options.assignmentWorkService ||
-      options.assignmentSubmissionService) &&
+      options.assignmentSubmissionService ||
+      options.assignmentReviewService) &&
     (!options.identityService || !options.lmsService)
   )
     throw new Error('Canvas assignments require authenticated identity and LMS launch services.');
@@ -429,6 +434,7 @@ export function createApi(options: ApiOptions) {
           assignmentsConfigured: Boolean(options.assignmentService),
           assignmentWorkConfigured: Boolean(options.assignmentWorkService),
           assignmentSubmissionsConfigured: Boolean(options.assignmentSubmissionService),
+          assignmentReviewConfigured: Boolean(options.assignmentReviewService),
         });
         return;
       }
@@ -473,6 +479,10 @@ export function createApi(options: ApiOptions) {
       limit(`user:${identity.tenantId}:${identity.userId}`, options.requestsPerMinute ?? 1200);
       if (path === '/api/assignments' || path.startsWith('/api/assignments/')) {
         routeName = '/api/assignments/:action';
+        if (isSubmissionReviewPath(path)) {
+          await handleSubmissionReview(req, res, options.assignmentReviewService, principal);
+          return;
+        }
         if (isSubmissionPath(path)) {
           await handleSubmissions(
             req,

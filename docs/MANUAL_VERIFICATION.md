@@ -227,3 +227,17 @@ Used the existing encrypted workspace in the normally trusted in-app HTTPS brows
 - Checked the recovered panel at 390×844: document width 390, panel left 14 and width 362; copy and status action stayed within the viewport. Restored normal viewport and ordinary development API. Existing documents were retained.
 
 Screenshots: `.local/manual-checks/preparation-failed.jpg`, `preparation-uncertain.jpg`, `preparation-reloaded.jpg`, `preparation-recovered.jpg` and `preparation-mobile.jpg`. This walkthrough verifies real browser interaction with a synthetic transport and encrypted local recovery. Multi-tab races, terminal rejection, processor/database behavior and revoked authority have separate automated checks; no live Canvas or full product manual pass is claimed.
+
+## Author-only frozen teacher review — October 8, 2026
+
+Used the normally trusted in-app HTTPS browser and existing unlocked vault, with `tests/fixtures/canvas-review-service.ts` temporarily mounted on loopback. The fixture has 22 synthetic capture references and a two-page PDF; no real school, roster or Canvas account participated.
+
+- Opened the separate teacher route and verified the preserved PDF, ordered highlight/text/comment layer and student comment. The deleted entry was absent. Toggling **Student annotations** removed/restored the overlay.
+- Navigated both PDF pages, checked each page's distinct answer/comments, zoomed in and restored fit width. Selecting another submission replaced its answer and reset to page one. Preparing and failed captures removed the document and showed explicit preparation states.
+- Navigated history from 20 references to the remaining two and back. Locked the vault and confirmed review content disappeared; authorized unlock performed a fresh review load.
+- At a 390×844 viewport, document client/scroll widths both measured 375 px with a 15 px vertical scrollbar; document controls stayed within the viewport and page navigation displayed the second-page answer. Restored the original viewport.
+- Deliberately damaged one chunk response. Margin displayed a verification error with zero PDF canvases. Explicit **Try again** restored only the selected submission.
+- Revoked the selected synthetic submission while leaving the teacher assignment context accessible. The periodic selected-snapshot check removed all PDF content and displayed **This synthetic submission is no longer available**. A separate HTTPS read still returned the author-only assignment context with status 200. The final fixture reported only GET requests.
+- Stopped the fixture, restored the ordinary API and returned the preview to unlocked Teacher Home. Existing local documents were retained. Earlier source hot replacement logged one duplicate `createRoot` development warning; no new runtime error appeared in the stable post-reload review walkthrough. Remote browser tests separately assert no page errors for the stable workflow.
+
+Screenshots: `.local/manual-checks/teacher-review-desktop.jpg`, `teacher-review-mobile.jpg`, `teacher-review-corrupt.jpg`, `teacher-review-revoked.jpg`. These are actual manual interactions using a synthetic transport. Real database encryption/authority, HTTP boundaries and race cases have separate automated tests. They do not establish a live Canvas integration, editable teacher feedback, device qualification, whole-product manual coverage or production scale.

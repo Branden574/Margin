@@ -17,7 +17,10 @@ export function usePdf(blob: Blob) {
     void blob
       .arrayBuffer()
       .then((data) => {
-        if (stopped) return;
+        if (stopped) {
+          new Uint8Array(data).fill(0);
+          return;
+        }
         task = getDocument({
           data,
           disableAutoFetch: true,

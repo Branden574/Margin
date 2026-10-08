@@ -6,7 +6,7 @@ import { fail, type Snapshot } from './authority.js';
 export async function authenticate(
   kms: KeyManagementProvider,
   s: Snapshot,
-): Promise<{ decoded: Decoded; bytes: number }> {
+): Promise<{ decoded: Decoded; bytes: number; frozenAt: string }> {
   const decoded = await decodeManifest(kms, s.assignment, s.work, s.receipt);
   if (!decoded.completion || canonical(s.pages) !== canonical(decoded.completion.pages))
     throw fail('submission_integrity');
@@ -73,7 +73,7 @@ export async function authenticate(
       decoded.source.scanReceiptId !== a.scan_receipt_id
     )
       throw fail('submission_integrity');
-    return { decoded, bytes: prefix.bytes };
+    return { decoded, bytes: prefix.bytes, frozenAt: status.frozenAt };
   } catch {
     throw fail('submission_integrity');
   } finally {

@@ -522,10 +522,12 @@ describe.skipIf(!available)(
     it('binds only a signed assignment resource and reserves one private pending copy-on-write workspace per student', async () => {
       const assignment = await service.create(teacherSession, input());
       await select(assignment.id);
-      await service.captureVerifiedLaunch({
-        principal: studentSession,
-        launch: launch(studentSession, false, assignment.id, 'student-work-resource'),
-      });
+      expect(
+        await service.captureVerifiedLaunch({
+          principal: studentSession,
+          launch: launch(studentSession, false, assignment.id, 'student-work-resource'),
+        }),
+      ).toEqual({ redirectPath: '/canvas/work' });
       expect((await service.currentAssignment(studentSession))?.id).toBe(assignment.id);
       const work = await Promise.all([
         service.reserveStudentWork(studentSession),
@@ -555,6 +557,28 @@ describe.skipIf(!available)(
       const other = await service.reserveStudentWork(peerSession);
       expect(other.id).not.toBe(work[0].id);
       expect(other.documentId).not.toBe(work[0].documentId);
+    });
+    it('routes only the currently authorized author teacher to read-only review after binding a signed resource', async () => {
+      const assignment = await service.create(teacherSession, input());
+      await select(assignment.id);
+      const currentTeacher = await session(teacher, 'teacher');
+      expect(
+        await service.captureVerifiedLaunch({
+          principal: currentTeacher,
+          launch: launch(currentTeacher, false, assignment.id, 'teacher-review-resource'),
+        }),
+      ).toEqual({ redirectPath: '/canvas/review' });
+      expect((await service.currentAssignment(currentTeacher))?.id).toBe(assignment.id);
+      await expect(service.reserveStudentWork(currentTeacher)).rejects.toMatchObject({
+        code: 'course_access_denied',
+      });
+      expect(
+        (
+          await admin.query('SELECT 1 FROM margin_assignments.student_work WHERE user_id=$1', [
+            teacher,
+          ])
+        ).rowCount,
+      ).toBe(0);
     });
     it('does not reserve without a bound launch or remap an existing Canvas resource/session to another assignment', async () => {
       const fresh = await session(student, 'student');
@@ -701,6 +725,20 @@ describe.skipIf(!available)(
         expect(await repository.get(coTeacher, enrollment, record.id)).toBeNull();
         await select(record.id);
         expect(await repository.get(coTeacher, enrollment, record.id)).toBeNull();
+        await expect(
+          service.captureVerifiedLaunch({
+            principal: coTeacher,
+            launch: launch(coTeacher, false, record.id, 'other-teacher-review'),
+          }),
+        ).rejects.toMatchObject({ code: 'assignment_unavailable' });
+        expect(
+          (
+            await admin.query(
+              'SELECT 1 FROM margin_assignments.launch_bindings WHERE session_id=$1',
+              [coTeacher.sessionId],
+            )
+          ).rowCount,
+        ).toBe(0);
       } finally {
         await admin.query(
           "UPDATE margin_identity.memberships SET role='student' WHERE user_id=$1",

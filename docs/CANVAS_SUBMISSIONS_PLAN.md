@@ -1,6 +1,6 @@
 # Canvas submission capture and remaining delivery plan
 
-**Status: capture, internal materialization and preparation recovery implemented, October 8, 2026.** Margin can preserve one immutable assignment submission version in its own encrypted database, recover the exact request and display its student history. A separately composed internal worker authenticates the retained source and reconstructs the captured annotations. Capture is opt-in; its public state reflects processing or a durable preparation failure: no Canvas sender or acknowledgement exists, and the default API composition does not configure capture or the worker. The UI says **Preparing submission. Not submitted to Canvas yet.** This is partial progress on C11–C12 and immutable history for C19, not a completed Canvas submission journey. Teacher review, grades, feedback, rubrics, rosters, resubmission and restricted assessment rendering remain separate work.
+**Status: capture, internal materialization, preparation recovery and author-only frozen review implemented, October 8, 2026.** Margin can preserve one immutable assignment submission version in its own encrypted database, recover the exact request and display its student history. A separately composed internal worker authenticates the retained source and reconstructs the captured annotations. Capture is opt-in; its public state reflects processing or a durable preparation failure: no Canvas sender or acknowledgement exists, and the default API composition does not configure capture or the worker. The UI says **Preparing submission. Not submitted to Canvas yet.** This is partial progress on C11–C12 and immutable history for C19, not a completed Canvas submission journey. The separate teacher review route reads completed frozen captures. Grades, editable teacher feedback, rubrics, verified roster names, resubmission and restricted assessment rendering remain separate work.
 
 ## Implemented boundary
 
@@ -133,8 +133,32 @@ Before completing the next checkpoints:
 
 1. Connect the implemented materializer only after scheduling, operator alerting, abandoned-chunk retention and deployed-provider qualification are complete. Expand process-crash, retention, concurrency and resource measurements beyond local fixtures.
 2. Capture durable verified service authorization, implement scoped token exchange and qualified delivery/reconciliation. Test lost acknowledgements, duplicate delivery, 401/403/429/5xx, immutable timestamps and unchanged existing grades. Unknown provider outcomes must remain uncertain.
-3. Implement authorized author-teacher read-only review of retained attempts, then feedback/grades as separate features. Test peer/course/tenant/role/revocation boundaries before exposing any review bytes.
+3. Compose the implemented author-teacher read-only review service with dedicated credentials and trusted providers. Complete editable feedback, verified roster names, rubrics and grades as separate features. Preserve tested peer/course/tenant/role/revocation boundaries.
 4. Run an authorized real Canvas teacher/student/resource/line-item journey: visible SpeedGrader content, exact attempt/receipt identity and duplicate behavior. Register reachable HTTPS/JWKS/review targets and verify institution scopes. Synthetic fixtures cannot establish this result.
 5. Complete real provider/storage/scanner composition, retention operations, deployment/recovery and load qualification. No 100,000-user readiness claim follows from this checkpoint.
 
-Capture and internal annotation materialization are implemented locally; provider delivery and teacher review remain future checkpoints. Production/bootstrap gates stay closed until their requirements are met. This document does not authorize infrastructure or institution changes.
+Capture, internal annotation materialization and author-only frozen review are implemented locally; provider delivery and editable feedback/grading remain future checkpoints. Production/bootstrap gates stay closed until their requirements are met. This document does not authorize infrastructure or institution changes.
+
+## Author-only frozen review — October 8, 2026
+
+A verified assignment resource launch now sends the assignment author to `/canvas/review` after the existing signed resource binding succeeds. Students still enter `/canvas/work`. A teacher role, a same-course enrollment, a local teacher-view toggle or a supplied submission ID cannot grant review access. The current author must retain the exact organization, installation version, course, identity mapping, session and assignment resource scope.
+
+[Migration 012](../infra/migrations/012-submission-review.sql) introduces dedicated `margin_submission_reviewer` credentials and read policies. The [review service](../apps/api/src/assignments/review/service.ts) authenticates the original capture and v1 completion manifest, exact encrypted chunk seals and inspected source. It reads no mutable annotation or operation table. Pending, failed, partial and previous-generation output cannot supply review content. Original student browser-session retirement does not itself revoke a retained capture; current durable student/source authority still applies. Provider work occurs outside final authority-locking transactions, with bounded admission, deadlines, cancellation and late-buffer cleanup. Existing encrypted v1 bytes are unchanged.
+
+The new read-only HTTP routes require a current verified teacher session and explicit service configuration:
+
+| Route                                                                         | Result                                    |
+| ----------------------------------------------------------------------------- | ----------------------------------------- |
+| `GET /api/assignments/review`                                                 | Current author-bound assignment context   |
+| `GET /api/assignments/review/submissions?after=<id>`                          | Up to 20 preserved capture summaries      |
+| `GET /api/assignments/review/submissions/:id`                                 | Authenticated completed snapshot metadata |
+| `GET /api/assignments/review/submissions/:id/chunks/:index?pin=<snapshotPin>` | One exact canonical annotation chunk      |
+| `GET /api/assignments/review/submissions/:id/source?pin=<snapshotPin>`        | Exact approved source PDF                 |
+
+The immutable completion digest is a consistency pin, not an access credential. Every read independently rechecks authority. Responses are no-store; no route changes submissions, grades, feedback or the student draft. Review readiness is separate from Canvas confirmation.
+
+The browser authenticates chunk lengths, canonical bytes, per-chunk and aggregate hashes, identity, contiguous descriptors, annotation ordering, revision totals, tombstones and source digest. It fetches the selected snapshot again before display, then rechecks selected-submission authority every 30 seconds while visible and on visibility return. Failed checks clear the view; superseded checks cannot clear a replacement selection. Vault lock, session expiry/replacement, selection changes and unmount abort work and discard retained view references. No teacher plaintext is written to local storage.
+
+The viewer includes submission-reference pagination, previous/next submission, page navigation, bounded zoom, a student annotation toggle, comments and PDF/annotation text. It does not invent student names or roster data. Rendering limits are explicit: 32 MiB annotation bytes, 50 MiB PDF, 5,000 visible annotations per page, 25 comments per inspector page and the first 100 text annotations in the optional transcript. Larger saved captures are preserved and show a limitation instead of silently rendering an incomplete overlay. PDF geometry must match the authenticated snapshot. Editable feedback/grades remain unavailable.
+
+This is a local implementation with real PostgreSQL and synthetic browser transport evidence, not a live Canvas or SpeedGrader pass. Default API composition deliberately remains unconfigured until real installation/identity/source/provider services are connected. The v1 capture fingerprint currently includes selected database rows: future schema additions to pinned tables require a versioned stable projection or migration before rollout. JavaScript strings, objects and PDF worker internals rely on garbage collection; buffer erasure is not a guarantee of full process-memory erasure.
