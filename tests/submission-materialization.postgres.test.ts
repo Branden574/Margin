@@ -218,8 +218,10 @@ describe('durable immutable submission materialization', () => {
   }, 20000);
 
   it('reads long frozen prefixes in bounded batches and preserves later draft work', async () => {
+    const startedAt = performance.now();
     const { fixture, claim, manifest } = await captured(101);
     await f.workApi.append(fixture.studentP, f.operation(fixture, manifest.pages[0].id));
+    const processingAt = performance.now();
     const prepared = await processor.prepare(claim, f.reader, f.storage);
     const replay = new SubmissionReplay(prepared.replay);
     const first = await processor.readBatch(claim, prepared.ticket, 0);
@@ -240,7 +242,14 @@ describe('durable immutable submission materialization', () => {
     }
     expect(replay.summary().annotationCount).toBe(101);
     await processor.complete(claim, prepared.ticket, replay.summary());
-  }, 30000);
+    // Diagnostic phase costs only, not a production service-level assertion.
+    console.info('Materialization boundary timing (ms)', {
+      appendAndCapture: Math.round(processingAt - startedAt),
+      processing: Math.round(performance.now() - processingAt),
+    });
+    // This boundary case commits 102 real append-service requests before processing.
+    // Shared Linux runners need room for durable commits; production deadlines are unchanged.
+  }, 120000);
   it.each(['teacher', 'installation', 'target', 'grant'] as const)(
     'rejects current %s authority revoked before publication',
     async (kind) => {

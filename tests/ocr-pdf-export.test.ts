@@ -6,7 +6,8 @@ import { createCanvas } from '@napi-rs/canvas';
 import { describe, expect, it } from 'vitest';
 import { PDFDocument, PDFName, PDFNumber, PDFString, StandardFonts, degrees, rgb } from 'pdf-lib';
 import type { OcrPageRecord } from '@margin/core';
-import { getDocument, type PDFDocumentProxy, type TextItem } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { getDocument, type PDFDocumentProxy } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import type { TextItem } from 'pdfjs-dist/types/src/display/api';
 import { addOcrTextLayer } from '../apps/web/src/editor/ocrPdfExport';
 import { extractPdfPage } from '../apps/web/src/editor/pdf';
 import { removeNativeOcrOverlap } from '../apps/web/src/editor/ocrExportNative';
@@ -123,6 +124,8 @@ describe('saved OCR becomes an invisible, Unicode-searchable PDF layer', () => {
       'b85c38ecea8a7cfb39c24e395a4007474fa5a4fc864f6ee33309eb4948d232d5',
     );
   });
+  // Each integration case embeds a font and renders four canvases; shared CI runners
+  // need room for cold PDF/font initialization without changing product deadlines.
   it.each([0, 90, 180, 270])(
     'preserves rendered pixels, native text, crop and word geometry at rotation %i',
     async (rotation) => {
@@ -167,7 +170,8 @@ describe('saved OCR becomes an invisible, Unicode-searchable PDF layer', () => {
           ];
           actual.forEach((n, index) => expect(n).toBeCloseTo(expected[index], 3));
         }
-        expect(await pixels(after, 1)).toEqual(await pixels(before, 1));
+        // Buffer.equals compares every RGBA byte without a deep object walk per pixel.
+        expect((await pixels(after, 1)).equals(await pixels(before, 1))).toBe(true);
         const nativeBefore = await (await before.getPage(2)).getTextContent();
         const nativeAfter = await (await after.getPage(2)).getTextContent();
         const withoutFontIds = (items: typeof nativeAfter.items) =>
@@ -178,7 +182,7 @@ describe('saved OCR becomes an invisible, Unicode-searchable PDF layer', () => {
           });
         expect(withoutFontIds(nativeAfter.items)).toEqual(withoutFontIds(nativeBefore.items));
         expect(Object.values(nativeAfter.styles)).toEqual(Object.values(nativeBefore.styles));
-        expect(await pixels(after, 2)).toEqual(await pixels(before, 2));
+        expect((await pixels(after, 2)).equals(await pixels(before, 2))).toBe(true);
       } finally {
         await close(before);
         await close(after);
@@ -186,6 +190,7 @@ describe('saved OCR becomes an invisible, Unicode-searchable PDF layer', () => {
       expect(await original.arrayBuffer()).toEqual(originalBytes);
       expect(records).toEqual(recordsBefore);
     },
+    15_000,
   );
   it('retains searchable content when the exported page is extracted afterward', async () => {
     const source = await fixture(180);
