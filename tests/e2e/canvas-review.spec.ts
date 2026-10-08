@@ -13,7 +13,7 @@ async function install(page: Page) {
 }
 async function open(page: Page) {
   await page.goto('/canvas/review');
-  await unlockWorkspace(page);
+  await unlockWorkspace(page, '.canvas-review');
   await expect(page.getByRole('heading', { name: 'Synthetic literature review' })).toBeVisible();
   await expect(page.locator('svg.review-annotation-layer text')).toContainText([
     'The familiar voice makes the scene feel hopeful.',
@@ -85,7 +85,7 @@ test('review navigation, history pagination, preparation states and lock reopen'
   await page.getByRole('button', { name: 'Lock workspace', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Unlock workspace', exact: true })).toBeVisible();
   await expect(page.locator('.review-annotation-layer')).toHaveCount(0);
-  await unlockWorkspace(page);
+  await unlockWorkspace(page, '.canvas-review');
   await expect(page.locator('.review-annotation-layer')).toBeVisible();
   expect(fixture.requests.every((request) => request.method === 'GET')).toBe(true);
 });
