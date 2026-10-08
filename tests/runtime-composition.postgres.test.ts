@@ -24,6 +24,10 @@ import {
 } from '../apps/api/src/runtime-composition';
 import { createApi } from '../apps/api/src/server';
 import { LocalKeyProvider } from '../apps/api/src/encryption';
+import { LocalEncryptedArtifactRepository } from '../apps/api/src/local-artifacts';
+import { PostgresAssignmentSubmissionService } from '../apps/api/src/assignments/submissions';
+import { PostgresSubmissionProcessor } from '../apps/api/src/assignments/submissions/processing';
+import { PostgresAssignmentReviewService } from '../apps/api/src/assignments/review';
 import {
   AssignmentDeepLinkSigner,
   PostgresAssignmentRepository,
@@ -65,6 +69,9 @@ const lookupKey = randomBytes(32),
   identityKey = randomBytes(32);
 const keys = new LocalKeyProvider(randomBytes(32), 'synthetic-composition-key');
 const artifacts = runtimeFixtureArtifacts(keys);
+let activeArtifacts: typeof artifacts.repository | LocalEncryptedArtifactRepository =
+  artifacts.repository;
+let fixtureScanner: SourceScanner;
 let directory: string,
   socket: string,
   origin: string,
@@ -130,12 +137,64 @@ const discovery = async (input: string | URL) => {
 };
 const dependencies = () => ({
   keys,
-  artifacts: artifacts.repository,
+  artifacts: activeArtifacts,
   sources,
   signer,
   oidcTests: { testFetch: discovery },
   resolveLmsKey: () => platformKeys,
 });
+function submissionConfig(captureEnabled = true): CanvasRuntimeConfig {
+  const base = config();
+  return {
+    ...base,
+    authentication: 'lti-only',
+    identity: {
+      applicationOrigin: origin,
+      sessionSecret: Buffer.from(sessionKey),
+      identityHmacKey: Buffer.from(identityKey),
+    },
+    submissions: {
+      captureEnabled,
+      databases: {
+        capture: database('compose_capture'),
+        processor: database('compose_processor'),
+        reviewer: database('compose_reviewer'),
+        sourceReader: database('compose_source_reader'),
+      },
+    },
+  };
+}
+function ltiDependencies() {
+  const { oidcTests, ...rest } = dependencies();
+  void oidcTests;
+  return rest;
+}
+function useArtifacts(repository: typeof activeArtifacts) {
+  activeArtifacts = repository;
+  sources = new IngestionAssignmentSourceGateway(ingest, reader, repository);
+  worker = new StudentWorkProvisioningWorker(workerRepository, reader, repository);
+  scanner = new SourceInspectionWorker(inspector, repository, fixtureScanner);
+}
+function serveRuntime() {
+  const api = createApi({
+    ...runtime.apiServices,
+    dataDirectory: join(directory, 'filestore'),
+    keyManagementProvider: keys,
+    tls,
+    requestsPerMinute: 5000,
+    logger: () => {},
+  });
+  delegate = api.listeners('request')[0] as RequestListener;
+}
+async function replaceRuntime(input: CanvasRuntimeConfig) {
+  delegate = undefined;
+  await runtime.close();
+  runtime = await createCanvasRuntime(
+    input,
+    input.authentication === 'lti-only' ? ltiDependencies() : dependencies(),
+  );
+  serveRuntime();
+}
 interface Reply {
   status: number;
   headers: import('node:http').IncomingHttpHeaders;
@@ -377,7 +436,7 @@ async function teacherSource(f: Fixture, inspect = true) {
     plaintextBytes: body.length,
     plaintextSha256: hash(body),
   });
-  const receipt = await artifacts.repository.put(reserved.identity, body, metadata, body.length);
+  const receipt = await activeArtifacts.put(reserved.identity, body, metadata, body.length);
   await ingest.stageConfirmed(teacher.principal, reserved.identity.artifactId, receipt);
   if (inspect) expect(await scanner.runOne()).toMatchObject({ status: 'ready' });
   return { teacher, reserved };
@@ -496,6 +555,10 @@ describe.skipIf(!available)(
         '006-assignment-work.sql',
         '007-assignment-work-runtime.sql',
         '008-authorization-plan-cache.sql',
+        '009-submissions.sql',
+        '010-submission-materialization.sql',
+        '011-submission-outcomes.sql',
+        '012-submission-review.sql',
       ])
         await admin.query(
           readFileSync(new URL('../infra/migrations/' + migration, import.meta.url), 'utf8'),
@@ -509,6 +572,10 @@ describe.skipIf(!available)(
         ['compose_reader', 'margin_ingestion_reader'],
         ['compose_inspector', 'margin_ingestion_inspector'],
         ['compose_worker', 'margin_assignment_provisioner'],
+        ['compose_capture', 'margin_submission_runtime'],
+        ['compose_processor', 'margin_submission_processor'],
+        ['compose_reviewer', 'margin_submission_reviewer'],
+        ['compose_source_reader', 'margin_ingestion_reader'],
       ])
         await admin.query(
           `CREATE ROLE ${login} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; GRANT ${role} TO ${login}`,
@@ -522,7 +589,7 @@ describe.skipIf(!available)(
       const pdf = await PDFDocument.create();
       pdf.addPage([612, 792]).drawText('Synthetic composition worksheet');
       body = Buffer.from(await pdf.save());
-      const fixtureScanner: SourceScanner = {
+      fixtureScanner = {
         async inspect(bytes) {
           if (!Buffer.from(bytes).equals(body))
             throw new Error('The synthetic scanner accepts only the known fixture.');
@@ -569,15 +636,7 @@ describe.skipIf(!available)(
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
       origin = `https://127.0.0.1:${(server.address() as { port: number }).port}`;
       runtime = await createCanvasRuntime(config(), dependencies());
-      const api = createApi({
-        ...runtime.apiServices,
-        dataDirectory: join(directory, 'filestore'),
-        keyManagementProvider: keys,
-        tls,
-        requestsPerMinute: 5000,
-        logger: () => {},
-      });
-      delegate = api.listeners('request')[0] as RequestListener;
+      serveRuntime();
     }, 30_000);
     afterEach(async () => {
       vi.restoreAllMocks();
@@ -679,7 +738,217 @@ describe.skipIf(!available)(
       expect(health.json).toMatchObject({
         assignmentsConfigured: true,
         assignmentWorkConfigured: true,
+        assignmentSubmissionsConfigured: false,
+        assignmentReviewConfigured: false,
       });
+      expect(runtime.materializeSubmission).toBeUndefined();
+      expect(runtime.apiServices.assignmentSubmissionService).toBeUndefined();
+      expect(runtime.apiServices.assignmentReviewService).toBeUndefined();
+      const unconfigured = await json('/api/assignments/work/submissions', fresh, {
+        requestId: randomUUID(),
+        expectedCursor: 1,
+      });
+      expect(unconfigured.status).toBe(503);
+      expect(unconfigured.json.error.code).toBe('submission_unconfigured');
+    });
+    it('captures and reviews the frozen prefix through signed LTI-only HTTPS launches after a filesystem-backed restart', async () => {
+      const rootDirectory = join(directory, 'submission-artifacts');
+      const network = vi
+        .spyOn(globalThis, 'fetch')
+        .mockRejectedValue(
+          new Error('No external identity or Canvas transport belongs in this synthetic journey.'),
+        );
+      let store = new LocalEncryptedArtifactRepository({
+        rootDirectory,
+        keyManagementProvider: keys,
+      });
+      useArtifacts(store);
+      try {
+        await replaceRuntime(submissionConfig());
+        const health = await request('/api/health');
+        expect(health.json).toMatchObject({
+          authentication: 'lti-session',
+          assignmentSubmissionsConfigured: true,
+          assignmentReviewConfigured: true,
+        });
+        const login = await request('/api/auth/login');
+        expect(login.status).toBe(503);
+        expect(login.headers.location).toBeUndefined();
+        expect(login.json.error.code).toBe('oidc_unconfigured');
+        const f = await provisioned(),
+          document = f.manifest.work.document;
+        const operation = {
+          documentId: document.documentId,
+          versionId: document.versionId,
+          pageId: document.pages[0].id,
+          annotationId: randomUUID(),
+          operationId: randomUUID(),
+          baseRevision: 0,
+          kind: 'put',
+          annotation: {
+            type: 'text',
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 24,
+            text: 'Frozen student answer',
+            color: '#123456',
+            strokeWidth: 2,
+            opacity: 1,
+            rotation: 0,
+          },
+        };
+        expect(
+          (await json('/api/assignments/work/operations', f.student, operation)).json.receipt
+            .cursor,
+        ).toBe(1);
+        const captureInput = { requestId: randomUUID(), expectedCursor: 1 };
+        const capture = await json('/api/assignments/work/submissions', f.student, captureInput);
+        expect(capture.status, capture.text).toBe(202);
+        expect(capture.json.request).toMatchObject({
+          ...captureInput,
+          state: 'captured',
+          submission: { frozenCursor: 1, revision: 1, phase: 'processing', confirmedAt: null },
+        });
+        const submissionId = capture.json.request.submission.id;
+        const later = await json('/api/assignments/work/operations', f.student, {
+          ...operation,
+          operationId: randomUUID(),
+          baseRevision: 1,
+          annotation: { ...operation.annotation, text: 'Later mutable draft answer' },
+        });
+        expect(later.status, later.text).toBe(200);
+        expect(later.json.receipt.cursor).toBe(2);
+        // Reopen both the service graph and ciphertext store before processing. No in-memory
+        // artifact map or live browser launch is required to recover the retained capture.
+        delegate = undefined;
+        await runtime.close();
+        await store.close();
+        store = new LocalEncryptedArtifactRepository({
+          rootDirectory,
+          keyManagementProvider: keys,
+        });
+        useArtifacts(store);
+        await replaceRuntime(submissionConfig());
+        expect(await runtime.materializeSubmission!()).toMatchObject({
+          submissionId,
+          state: 'materialized',
+          frozenCursor: 1,
+          chunkCount: 1,
+        });
+        expect(await runtime.materializeSubmission!()).toBeNull();
+        delegate = undefined;
+        await runtime.close();
+        await store.close();
+        store = new LocalEncryptedArtifactRepository({
+          rootDirectory,
+          keyManagementProvider: keys,
+        });
+        useArtifacts(store);
+        await replaceRuntime(submissionConfig());
+        const launch = await complete(f.f, await begin(f.f), f.assignmentId, {
+          sub: f.f.teacherSubject,
+          [LTI_CLAIM + 'roles']: ['http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor'],
+        });
+        expect(launch.headers.location).toBe(origin + '/canvas/review');
+        const teacher = await session(launch);
+        const headers = { cookie: teacher.cookie };
+        const context = await request('/api/assignments/review', { headers });
+        expect(context.status, context.text).toBe(200);
+        expect(context.json).toMatchObject({
+          assignment: { id: f.assignmentId },
+          mode: 'author-only',
+        });
+        const history = await request('/api/assignments/review/submissions', { headers });
+        expect(history.status, history.text).toBe(200);
+        expect(history.json.submissions).toEqual([
+          expect.objectContaining({
+            id: submissionId,
+            frozenCursor: 1,
+            revision: 2,
+            preparation: 'ready',
+          }),
+        ]);
+        const path = '/api/assignments/review/submissions/' + submissionId;
+        const snapshot = await request(path, { headers });
+        expect(snapshot.status, snapshot.text).toBe(200);
+        expect(snapshot.json).toMatchObject({
+          documentId: document.documentId,
+          versionId: document.versionId,
+          annotationCount: 1,
+          source: { sha256: hash(body), bytes: body.length, mimeType: 'application/pdf' },
+        });
+        expect(snapshot.json.chunks).toHaveLength(1);
+        const pin = '?pin=' + snapshot.json.snapshotPin;
+        const chunk = await request(path + '/chunks/0' + pin, { headers });
+        expect(chunk.status, chunk.text).toBe(200);
+        expect(hash(chunk.bytes)).toBe(snapshot.json.chunks[0].sha256);
+        expect(hash(chunk.bytes)).toBe(snapshot.json.outputSha256);
+        expect(chunk.json.entries).toEqual([
+          expect.objectContaining({
+            annotationId: operation.annotationId,
+            latestCursor: 1,
+            annotation: expect.objectContaining({ text: 'Frozen student answer' }),
+          }),
+        ]);
+        expect(chunk.text).not.toContain('Later mutable draft answer');
+        const source = await request(path + '/source' + pin, { headers });
+        expect(source.status, source.text).toBe(200);
+        expect(source.bytes).toEqual(body);
+        expect(source.headers['cache-control']).toBe('no-store');
+        expect((await request(path + '/chunks/0?pin=' + '0'.repeat(64), { headers })).status).toBe(
+          409,
+        );
+        expect((await request(path, { headers: { cookie: f.student.cookie } })).status).toBe(403);
+        const retained = await request(
+          '/api/assignments/work/submission-requests/' + captureInput.requestId,
+          {
+            headers: { cookie: f.student.cookie },
+          },
+        );
+        expect(retained.json.request.submission).toMatchObject({
+          id: submissionId,
+          frozenCursor: 1,
+          revision: 2,
+          phase: 'processing',
+          confirmedAt: null,
+        });
+        const draft = await request('/api/assignments/work/operations?afterCursor=0&limit=10', {
+          headers: { cookie: f.student.cookie },
+        });
+        expect(draft.json.operations).toHaveLength(2);
+        expect(draft.json.operations[1].annotation.text).toBe('Later mutable draft answer');
+        expect(network).not.toHaveBeenCalled();
+      } finally {
+        delegate = undefined;
+        await runtime.close();
+        await store.close();
+        useArtifacts(artifacts.repository);
+        await replaceRuntime(config());
+        network.mockRestore();
+      }
+    }, 60_000);
+    it('keeps capture explicitly disabled even when the local processing and review graph is configured', async () => {
+      try {
+        await replaceRuntime(submissionConfig(false));
+        const f = await provisioned();
+        const response = await json('/api/assignments/work/submissions', f.student, {
+          requestId: randomUUID(),
+          expectedCursor: 0,
+        });
+        expect(response.status).toBe(503);
+        expect(response.json.error.code).toBe('submission_unconfigured');
+        expect(await runtime.materializeSubmission!()).toBeNull();
+        expect(
+          (
+            await admin.query('SELECT count(*) FROM margin_submissions.attempts WHERE work_id=$1', [
+              f.manifest.work.id,
+            ])
+          ).rows[0].count,
+        ).toBe('0');
+      } finally {
+        await replaceRuntime(config());
+      }
     });
     it('rejects tampered signatures, launch replay and unprovisioned subject mappings', async () => {
       const f = await seed();
@@ -867,6 +1136,87 @@ describe.skipIf(!available)(
       expect(own.close()).toBe(result);
       for (const close of closes) expect(close).toHaveBeenCalledTimes(1);
       expect(() => own.publicJwks()).toThrow('closed');
+      expect(artifacts.destroyed).toBe(false);
+    });
+    it('aborts and drains an admitted submission worker before closing its repositories and refuses new work', async () => {
+      const own = await createCanvasRuntime(submissionConfig(), ltiDependencies());
+      let entered!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const claim = vi
+        .spyOn(PostgresSubmissionProcessor.prototype, 'claimNext')
+        .mockImplementation(async (signal) => {
+          entered();
+          await new Promise<void>((_, reject) => {
+            signal!.addEventListener(
+              'abort',
+              () => reject(new Error('synthetic claim interrupted')),
+              { once: true },
+            );
+          });
+          return null;
+        });
+      const closes = [
+        vi.spyOn(PostgresSubmissionProcessor.prototype, 'close'),
+        vi.spyOn(PostgresAssignmentSubmissionService.prototype, 'close'),
+        vi.spyOn(PostgresAssignmentReviewService.prototype, 'close'),
+      ];
+      const running = own.materializeSubmission!();
+      const settled = running.then(
+        () => 'fulfilled',
+        () => 'rejected',
+      );
+      await started;
+      const closing = own.close();
+      expect(own.close()).toBe(closing);
+      await closing;
+      expect(await settled).toBe('rejected');
+      for (const close of closes) expect(close).toHaveBeenCalledTimes(1);
+      await expect(own.materializeSubmission!()).rejects.toThrow('closed');
+      expect(claim).toHaveBeenCalledTimes(1);
+      expect(artifacts.destroyed).toBe(false);
+    });
+    it('cleans the partially constructed submission graph when reviewer transport is unsafe', async () => {
+      const input = submissionConfig();
+      input.submissions!.databases.reviewer = { host: 'synthetic-invalid.test', ssl: false };
+      const closes = [
+        vi.spyOn(PostgresLmsRepository.prototype, 'close'),
+        vi.spyOn(PostgresIdentityRepository.prototype, 'close'),
+        vi.spyOn(PostgresAssignmentRepository.prototype, 'close'),
+        vi.spyOn(PostgresAssignmentWorkService.prototype, 'close'),
+        vi.spyOn(PostgresIngestionRepository.prototype, 'close'),
+        vi.spyOn(PostgresAssignmentSubmissionService.prototype, 'close'),
+        vi.spyOn(PostgresSubmissionProcessor.prototype, 'close'),
+      ];
+      await expect(createCanvasRuntime(input, ltiDependencies())).rejects.toThrow('TLS');
+      for (const close of closes) expect(close).toHaveBeenCalledTimes(1);
+      expect(artifacts.destroyed).toBe(false);
+      expect(input.identity.sessionSecret).toEqual(sessionKey);
+    });
+    it('continues all submission cleanup after one owned processor reports failure', async () => {
+      const own = await createCanvasRuntime(submissionConfig(), ltiDependencies());
+      const original = PostgresSubmissionProcessor.prototype.close;
+      vi.spyOn(PostgresSubmissionProcessor.prototype, 'close').mockImplementation(async function (
+        this: PostgresSubmissionProcessor,
+      ) {
+        await original.call(this);
+        throw new Error('synthetic processor cleanup failure');
+      });
+      const closes = [
+        vi.spyOn(PostgresAssignmentReviewService.prototype, 'close'),
+        vi.spyOn(PostgresAssignmentSubmissionService.prototype, 'close'),
+        vi.spyOn(PostgresIngestionRepository.prototype, 'close'),
+        vi.spyOn(PostgresAssignmentWorkService.prototype, 'close'),
+        vi.spyOn(PostgresIdentityRepository.prototype, 'close'),
+      ];
+      const closing = own.close();
+      await expect(closing).rejects.toMatchObject({
+        errors: [expect.objectContaining({ message: 'synthetic processor cleanup failure' })],
+      });
+      expect(own.close()).toBe(closing);
+      for (const close of closes) expect(close).toHaveBeenCalledTimes(1);
+      await expect(own.materializeSubmission!()).rejects.toThrow('closed');
       expect(artifacts.destroyed).toBe(false);
     });
   },

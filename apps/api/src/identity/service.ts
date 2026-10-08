@@ -13,6 +13,7 @@ import { discoverProvider, secureUrl, type OidcTestOptions } from './oidc.js';
 import {
   IdentityError,
   type IdentityConfig,
+  type LtiIdentityConfig,
   type IdentityRepository,
   type SessionPrincipal,
 } from './types.js';
@@ -64,6 +65,7 @@ export const clearIdentityCookies = () => [
 export const clearLoginCookie = () => cookie(LOGIN_COOKIE, '', 0);
 
 export class IdentityService {
+  readonly authenticationMode: 'oidc' | 'lti-only';
   readonly applicationOrigin: string;
   readonly callbackPath: string;
   private readonly sessionSeconds: number;
@@ -71,20 +73,31 @@ export class IdentityService {
   private readonly loginSeconds: number;
   private readonly returnPaths: Set<string>;
   private readonly crypto;
+  private readonly oidc: { config: IdentityConfig; provider: oidc.Configuration } | null;
   constructor(
-    private readonly config: IdentityConfig,
+    config: IdentityConfig | LtiIdentityConfig,
     private readonly repository: IdentityRepository,
-    private readonly provider: oidc.Configuration,
+    provider: oidc.Configuration | null,
     private readonly federation?: IdentityFederation,
   ) {
     const origin = secureUrl(config.applicationOrigin, 'Application origin');
     if (origin.origin !== config.applicationOrigin)
       throw new Error('Application origin must be an exact HTTPS origin.');
-    const redirect = secureUrl(config.redirectUri, 'OIDC redirect URI');
-    if (redirect.origin !== origin.origin || redirect.pathname !== '/api/auth/callback')
-      throw new Error('OIDC redirect must be the same-origin /api/auth/callback endpoint.');
+    if (provider === null) {
+      if (typeof federation?.authorizeLmsSession !== 'function')
+        throw new Error('LTI-only identity requires a current LMS session authorizer.');
+      this.oidc = null;
+      this.authenticationMode = 'lti-only';
+    } else {
+      if (!('redirectUri' in config)) throw new Error('OIDC provider configuration is required.');
+      const redirect = secureUrl(config.redirectUri, 'OIDC redirect URI');
+      if (redirect.origin !== origin.origin || redirect.pathname !== '/api/auth/callback')
+        throw new Error('OIDC redirect must be the same-origin /api/auth/callback endpoint.');
+      this.oidc = { config, provider };
+      this.authenticationMode = 'oidc';
+    }
     this.applicationOrigin = origin.origin;
-    this.callbackPath = redirect.pathname;
+    this.callbackPath = '/api/auth/callback';
     this.sessionSeconds = boundedInteger(
       config.sessionMaxAgeSeconds ?? 3600,
       300,
@@ -97,7 +110,12 @@ export class IdentityService {
       this.sessionSeconds,
       'Idle timeout',
     );
-    this.loginSeconds = boundedInteger(config.loginMaxAgeSeconds ?? 300, 60, 600, 'Login lifetime');
+    this.loginSeconds = boundedInteger(
+      this.oidc?.config.loginMaxAgeSeconds ?? 300,
+      60,
+      600,
+      'Login lifetime',
+    );
     this.returnPaths = new Set(config.allowedReturnPaths ?? ['/']);
     if (!this.returnPaths.size || this.returnPaths.size > 32)
       throw new Error('Configure between one and 32 return paths.');
@@ -119,11 +137,20 @@ export class IdentityService {
     if (config.identityHmacKey.byteLength !== 32)
       throw new Error('Identity HMAC key must contain exactly 32 random bytes.');
     if (
-      (config.mfaAcrValues?.length ?? 0) > 16 ||
-      config.mfaAcrValues?.some((value) => !value || value.length > 200)
+      (this.oidc?.config.mfaAcrValues?.length ?? 0) > 16 ||
+      this.oidc?.config.mfaAcrValues?.some((value) => !value || value.length > 200)
     )
       throw new Error('Invalid MFA ACR configuration.');
     this.crypto = createCookieCrypto(config.sessionSecret, origin.origin);
+  }
+  private requireOidc() {
+    if (!this.oidc)
+      throw new IdentityError(
+        503,
+        'oidc_unconfigured',
+        'Separate sign-in is not configured. Open this workspace through its LMS activity.',
+      );
+    return this.oidc;
   }
   requireSameOrigin(request: IdentityRequest, mutation = false): void {
     const origin = request.headers.origin;
@@ -141,6 +168,7 @@ export class IdentityService {
   async startLogin(
     input: { returnTo?: string; organizationId?: string } = {},
   ): Promise<LoginResult> {
+    const { config, provider } = this.requireOidc();
     const returnTo = input.returnTo ?? [...this.returnPaths][0];
     if (!this.returnPaths.has(returnTo))
       throw new IdentityError(400, 'invalid_return_path', 'This return location is not allowed.');
@@ -151,7 +179,7 @@ export class IdentityService {
     const verifier = oidc.randomPKCECodeVerifier();
     const expiresAt = Date.now() + this.loginSeconds * 1000;
     const parameters: Record<string, string> = {
-      redirect_uri: this.config.redirectUri,
+      redirect_uri: config.redirectUri,
       scope: 'openid',
       state,
       nonce,
@@ -160,11 +188,10 @@ export class IdentityService {
       response_mode: 'query',
       max_age: '300',
     };
-    if (this.config.mfaAcrValues?.length)
-      parameters.acr_values = this.config.mfaAcrValues.join(' ');
+    if (config.mfaAcrValues?.length) parameters.acr_values = config.mfaAcrValues.join(' ');
     await this.repository.reserveLogin(tokenHash(state), expiresAt);
     return {
-      location: oidc.buildAuthorizationUrl(this.provider, parameters).href,
+      location: oidc.buildAuthorizationUrl(provider, parameters).href,
       cookies: [
         cookie(
           LOGIN_COOKIE,
@@ -186,6 +213,7 @@ export class IdentityService {
     callback: URL,
     cookieHeader?: string,
   ): Promise<LoginResult & { principal: SessionPrincipal }> {
+    const { config, provider } = this.requireOidc();
     if (
       callback.origin !== this.applicationOrigin ||
       callback.pathname !== this.callbackPath ||
@@ -221,7 +249,7 @@ export class IdentityService {
       );
     let claims: oidc.IDToken | undefined;
     try {
-      const tokens = await oidc.authorizationCodeGrant(this.provider, callback, {
+      const tokens = await oidc.authorizationCodeGrant(provider, callback, {
         expectedState: transaction.state,
         expectedNonce: transaction.nonce,
         pkceCodeVerifier: transaction.verifier,
@@ -242,11 +270,11 @@ export class IdentityService {
       typeof claims.sub !== 'string' ||
       !claims.sub ||
       claims.sub.length > 255 ||
-      claims.iss !== this.config.issuerUrl
+      claims.iss !== config.issuerUrl
     )
       throw new IdentityError(401, 'oidc_verification_failed', 'Sign-in could not be verified.');
     const identity = await this.repository.findIdentity(
-      identityLookupKey(this.config.identityHmacKey, claims.iss, claims.sub),
+      identityLookupKey(config.identityHmacKey, claims.iss, claims.sub),
     );
     if (!identity?.memberships.length)
       throw new IdentityError(
@@ -265,8 +293,7 @@ export class IdentityService {
         'organization_required',
         'Sign in for an organization in which you have active membership.',
       );
-    const mfa =
-      typeof claims.acr === 'string' && (this.config.mfaAcrValues ?? []).includes(claims.acr);
+    const mfa = typeof claims.acr === 'string' && (config.mfaAcrValues ?? []).includes(claims.acr);
     if (privileged.has(membership.role) && !mfa)
       throw new IdentityError(
         403,
@@ -369,6 +396,16 @@ export class IdentityService {
         'Your session expired or was revoked. Sign in again; local work is unchanged.',
       );
     if (
+      !this.oidc &&
+      (principal.authenticationMethod !== 'lti' ||
+        !['student', 'teacher', 'viewer'].includes(principal.role))
+    )
+      throw new IdentityError(
+        403,
+        'lti_session_required',
+        'Open this workspace through a current permitted LMS launch.',
+      );
+    if (
       principal.authenticationMethod === 'lti' &&
       (!this.federation || !(await this.federation.authorizeLmsSession(principal)))
     )
@@ -449,4 +486,26 @@ export async function createIdentityService(
   if (Buffer.from(config.sessionSecret).equals(Buffer.from(config.identityHmacKey)))
     throw new Error('Session and identity lookup secrets must be independent keys.');
   return new IdentityService(config, repository, await discoverProvider(config, tests), federation);
+}
+
+/** Verified LTI sessions only. This does not verify launches, provision identities, or discover OIDC. */
+export async function createLtiIdentityService(
+  config: LtiIdentityConfig,
+  repository: IdentityRepository,
+  federation: IdentityFederation,
+): Promise<IdentityService> {
+  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0')
+    throw new Error('Identity startup refuses globally disabled TLS certificate verification.');
+  if (typeof federation?.authorizeLmsSession !== 'function')
+    throw new Error('LTI-only identity requires a current LMS session authorizer.');
+  if (
+    !(config.sessionSecret instanceof Uint8Array) ||
+    !(config.identityHmacKey instanceof Uint8Array) ||
+    config.sessionSecret.byteLength !== 32 ||
+    config.identityHmacKey.byteLength !== 32
+  )
+    throw new Error('Identity secrets must contain exactly 32 random bytes.');
+  if (Buffer.from(config.sessionSecret).equals(Buffer.from(config.identityHmacKey)))
+    throw new Error('Session and identity lookup secrets must be independent keys.');
+  return new IdentityService(config, repository, null, federation);
 }

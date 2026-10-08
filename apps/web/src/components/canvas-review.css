@@ -186,7 +186,7 @@
   color: #49683f;
 }
 .review-preparation.is-failed {
-  color: var(--accent);
+  color: var(--accent-hover);
 }
 [data-theme='dark'] .review-preparation.is-ready {
   color: #b2cba8;

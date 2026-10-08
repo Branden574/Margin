@@ -241,3 +241,15 @@ Used the normally trusted in-app HTTPS browser and existing unlocked vault, with
 - Stopped the fixture, restored the ordinary API and returned the preview to unlocked Teacher Home. Existing local documents were retained. Earlier source hot replacement logged one duplicate `createRoot` development warning; no new runtime error appeared in the stable post-reload review walkthrough. Remote browser tests separately assert no page errors for the stable workflow.
 
 Screenshots: `.local/manual-checks/teacher-review-desktop.jpg`, `teacher-review-mobile.jpg`, `teacher-review-corrupt.jpg`, `teacher-review-revoked.jpg`. These are actual manual interactions using a synthetic transport. Real database encryption/authority, HTTP boundaries and race cases have separate automated tests. They do not establish a live Canvas integration, editable teacher feedback, device qualification, whole-product manual coverage or production scale.
+
+## Canvas-only account controls — October 8, 2026
+
+Used the existing unlocked in-app workspace and trusted HTTPS origin. A temporary loopback fixture supplied only synthetic account/health/session responses; it did not expose document routes, access a school account or validate a Canvas launch. Real identity/CSRF/LMS checks have separate automated HTTPS/PostgreSQL evidence.
+
+- In Settings, **Check account connection** displayed **Signed in through Canvas · teacher**, active sessions and the existing revoke/sign-out controls. No standalone OIDC sign-in form appeared.
+- Revoked the synthetic secondary session. Its row and action disappeared while the current session remained.
+- Changed the fixture to expired-session responses and checked again. Session controls disappeared and the page instructed opening the assignment through its Canvas activity. No OIDC sign-in form or stale session list remained.
+- Stopped the fixture and restored the ordinary API. The first check overlapped startup and reported an empty JSON response; checking again after an HTTPS health response succeeded and showed the normal local-only account message. The surfaced parsing error prompted a narrow friendly-error/retry correction, covered by a new remote browser scenario.
+- Returned to unlocked Teacher Home with all 21 existing documents retained. No local browser test runner was used and no real account was revoked.
+
+Screenshots: `.local/manual-checks/lti-account-settings.jpg` and `lti-account-expired.jpg`. These demonstrate the synthetic browser controls and recovery instructions, not a configured institution connection or a whole-product manual pass.

@@ -1,5 +1,11 @@
 export * from './types.js';
-export { createIdentityService, IdentityService, SESSION_COOKIE, LOGIN_COOKIE } from './service.js';
+export {
+  createIdentityService,
+  createLtiIdentityService,
+  IdentityService,
+  SESSION_COOKIE,
+  LOGIN_COOKIE,
+} from './service.js';
 export type {
   AuthenticatedRequest,
   IdentityRequest,

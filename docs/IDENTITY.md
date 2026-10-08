@@ -2,6 +2,12 @@
 
 This increment implements a real, configurable OpenID Connect backend-for-frontend and PostgreSQL session repository. It does not provision an identity provider, register a Cognito/Google/Microsoft application, seed production accounts, deploy AWS resources, or change the encrypted local vault. The existing optional API can select OIDC sessions instead of development bearer tokens. Its document storage remains the encrypted local filesystem, and ordinary uploads remain quarantined. This identity module alone does not make that API a production document service or establish 100,000-user capacity.
 
+## Canvas without a separate OIDC provider
+
+`createLtiIdentityService(config, repository, federation)` creates the same secure session/CSRF boundary using `LtiIdentityConfig`: the exact HTTPS application origin, independent 32-byte session and identity keys, and optional session lifetime/return-path settings. It requires a current LMS session authorizer and performs no OIDC discovery. The [Canvas composition factory](RUNTIME_COMPOSITION.md) selects it only with explicit `authentication: 'lti-only'`.
+
+This mode accepts only persisted sessions explicitly marked `lti`, with student, teacher or viewer roles, and rechecks the registered installation, identity link, course and enrollment on each authenticated request. Standalone OIDC login/callback fail with `oidc_unconfigured`; existing OIDC or legacy-method cookies are refused. Signed LTI verification and operator-provisioned identities remain mandatory. The HTTP health response labels this mode `lti-session`; it does not claim OIDC configuration. The ordinary development entry point does not yet select this mode.
+
 ## Integration
 
 The pinned API dependencies are `openid-client` 6.8.8 and `pg` 8.23.1. Import from `apps/api/src/identity/index.ts`:

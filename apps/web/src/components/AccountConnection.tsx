@@ -21,7 +21,7 @@ interface SessionSummary {
 
 /** Explicit account connection. Existing local documents are never silently adopted. */
 export function AccountConnection() {
-  const [mode, setMode] = useState<'unchecked' | 'local' | 'oidc'>('unchecked');
+  const [mode, setMode] = useState<'unchecked' | 'local' | 'oidc' | 'lti'>('unchecked');
   const [session, setSession] = useState<AccountSession | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [organization, setOrganization] = useState('');
@@ -42,7 +42,11 @@ export function AccountConnection() {
       setSessions([]);
       if (path === '/api/auth/session') return null;
     }
-    const result = await response.json();
+    const result = await response.json().catch(() => {
+      throw new Error(
+        'The account service is temporarily unavailable. Try checking the connection again.',
+      );
+    });
     if (!response.ok)
       throw new Error(
         result?.error?.message ?? 'The account service could not complete this request.',
@@ -67,13 +71,18 @@ export function AccountConnection() {
   function check() {
     void run(async () => {
       const health = await request('/api/health');
-      if (health?.authentication !== 'oidc-session') {
+      if (!['oidc-session', 'lti-session'].includes(health?.authentication)) {
         setMode('local');
         setSession(null);
         setSessions([]);
         return;
       }
-      setMode('oidc');
+      const lti = health.authentication === 'lti-session';
+      setMode(lti ? 'lti' : 'oidc');
+      if (lti) {
+        setSession(null);
+        setSessions([]);
+      }
       const current = await request('/api/auth/session');
       setSession(current);
       setSessions(current ? (await request('/api/auth/sessions')).sessions : []);
@@ -83,7 +92,11 @@ export function AccountConnection() {
     <section className="settings-section">
       <div className="settings-intro">
         <h2>Organization account</h2>
-        <p>Connect through your school’s identity provider.</p>
+        <p>
+          {mode === 'lti'
+            ? 'Your Canvas activity connects your organization account.'
+            : 'Connect through your school’s identity provider.'}
+        </p>
       </div>
       <div className="settings-controls">
         <p className="field-note">
@@ -127,9 +140,17 @@ export function AccountConnection() {
             </button>
           </form>
         ) : null}
+        {mode === 'lti' && !session ? (
+          <p role="status">
+            Open an assignment from its Canvas activity to connect your organization account.
+          </p>
+        ) : null}
         {session ? (
           <>
-            <p role="status">Signed in · {session.role.replaceAll('_', ' ')}</p>
+            <p role="status">
+              {mode === 'lti' ? 'Signed in through Canvas' : 'Signed in'} ·{' '}
+              {session.role.replaceAll('_', ' ')}
+            </p>
             <p className="field-note">
               Organization: {session.organizationId}. Session expires{' '}
               {new Date(session.expiresAt).toLocaleString()}.

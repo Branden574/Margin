@@ -426,7 +426,11 @@ export function createApi(options: ApiOptions) {
         send(200, {
           status: 'ok',
           mode: 'encrypted-local',
-          authentication: options.identityService ? 'oidc-session' : 'local-bearer',
+          authentication: options.identityService
+            ? options.identityService.authenticationMode === 'lti-only'
+              ? 'lti-session'
+              : 'oidc-session'
+            : 'local-bearer',
           transport: insecureTest ? 'synthetic-test' : 'tls',
           scanningConfigured: Boolean(options.inspectDocument),
           synchronizationConfigured: Boolean(options.syncService),

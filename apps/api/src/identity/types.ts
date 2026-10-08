@@ -56,22 +56,26 @@ export interface IdentityRepository {
   revokeOwnedSession(sessionHash: string, targetSessionId: string, now: number): Promise<boolean>;
 }
 
-export interface IdentityConfig {
-  issuerUrl: string;
-  clientId: string;
-  /** Confidential BFF client credential. Never exposed to the browser. */
-  clientSecret: string;
+/** Session settings for verified LMS launches, without an unrelated OIDC provider. */
+export interface LtiIdentityConfig {
   applicationOrigin: string;
-  redirectUri: string;
   /** Independent secret for encrypted login cookies and CSRF derivation; exactly 32 bytes. */
   sessionSecret: Uint8Array;
   /** Stable, separately managed HMAC key for pseudonymous issuer/subject lookup; exactly 32 bytes. */
   identityHmacKey: Uint8Array;
   allowedReturnPaths?: readonly string[];
-  /** Exact HTTPS origins for IdP endpoints hosted away from its issuer origin. */
-  allowedProviderOrigins?: readonly string[];
   sessionMaxAgeSeconds?: number;
   idleTimeoutSeconds?: number;
+}
+
+export interface IdentityConfig extends LtiIdentityConfig {
+  issuerUrl: string;
+  clientId: string;
+  /** Confidential BFF client credential. Never exposed to the browser. */
+  clientSecret: string;
+  redirectUri: string;
+  /** Exact HTTPS origins for IdP endpoints hosted away from its issuer origin. */
+  allowedProviderOrigins?: readonly string[];
   loginMaxAgeSeconds?: number;
   /** Exact signed ACR values the configured issuer guarantees represent MFA. Empty denies privileged login. */
   mfaAcrValues?: readonly string[];
