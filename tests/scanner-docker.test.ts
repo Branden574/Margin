@@ -1,7 +1,17 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:net';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   createDockerScannerExecutor,
@@ -135,7 +145,7 @@ type Journal = {
   phase: string;
   id?: string;
 };
-let base: string, directory: string, socketPath: string, socket: Server;
+let base: string, directory: string, executablePath: string, socketPath: string, socket: Server;
 let executor: DockerScannerExecutor | undefined, latest: Journal | undefined;
 let containers: Map<string, Container>, calls: string[][], daemon: boolean;
 let onCreate: (() => void | Promise<void>) | undefined;
@@ -152,7 +162,7 @@ const answer = (value: unknown, exitCode = 0) => ({
 });
 async function create() {
   executor = await createDockerScannerExecutor({
-    executable: process.execPath,
+    executable: executablePath,
     socketPath,
     stateDirectory: directory,
   });
@@ -171,6 +181,10 @@ beforeEach(async () => {
   durability.failedDirectory = undefined;
   base = await realpath(await mkdtemp('/tmp/margin-dkr-'));
   directory = join(base, 'state');
+  executablePath = join(base, 'mock-docker');
+  // Commands are mocked; own the executable metadata too. CI's Node toolcache
+  // permissions/owner need not satisfy the real scanner's stricter trust policy.
+  await writeFile(executablePath, '#!/bin/sh\nexit 1\n', { mode: 0o700, flag: 'wx' });
   socketPath = join(base, 'daemon.sock');
   socket = createServer();
   await new Promise<void>((resolve) => socket.listen(socketPath, resolve));
@@ -188,7 +202,7 @@ beforeEach(async () => {
   };
   command.mockReset();
   command.mockImplementation(async (executable, raw, options = {}) => {
-    expect(executable).toBe(await realpath(process.execPath));
+    expect(executable).toBe(executablePath);
     expect(raw.slice(0, 2)).toEqual(['--host', 'unix://' + socketPath]);
     const args = [...raw.slice(2)];
     calls.push(args);
@@ -264,6 +278,13 @@ afterEach(async () => {
   await rm(base, { recursive: true, force: true });
 });
 
+it('rejects a group-writable executable before commands or durable state are created', async () => {
+  await chmod(executablePath, 0o720);
+  await expect(create()).rejects.toMatchObject({ code: 'ownership' });
+  expect(command).not.toHaveBeenCalled();
+  await expect(stat(directory)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
 it('journals before create, verifies image and container before stdin, and confirms removal before returning', async () => {
   const worker = await create();
   await worker.ready(signal());
@@ -305,7 +326,7 @@ it('refuses admission when the new journal directory cannot be made durable, the
 
 it('refuses concurrent executors and never treats a stale host PID as permission to remove a lock', async () => {
   await create();
-  const options = { executable: process.execPath, socketPath, stateDirectory: directory };
+  const options = { executable: executablePath, socketPath, stateDirectory: directory };
   await expect(createDockerScannerExecutor(options)).rejects.toMatchObject({ code: 'busy' });
   const owned = await readFile(join(directory, '.executor-lock/owner.json'));
   await writeFile(
