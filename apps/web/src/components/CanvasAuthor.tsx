@@ -8,6 +8,7 @@ import {
   FileText,
   Loader2,
   LockKeyhole,
+  Upload,
 } from 'lucide-react';
 import { Brand } from './Brand';
 import { Modal } from './Modal';
@@ -29,6 +30,10 @@ import {
 } from '../lib/assignment-author/draft';
 import { createVaultGuard, lockVault, onBeforeVaultLock, onVaultLock } from '../lib/vault';
 import { getPreferences } from '../lib/storage';
+import {
+  AuthorUploadController,
+  type AuthorUploadState,
+} from '../lib/assignment-author/upload-controller';
 import './canvas-author.css';
 
 const labels: Record<AuthorTool, string> = {
@@ -89,6 +94,14 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
   const [localError, setLocalError] = useState('');
   const [cancelPrompt, setCancelPrompt] = useState(false);
   const [discardPrompt, setDiscardPrompt] = useState(false);
+  const [upload, setUpload] = useState<AuthorUploadState>({
+    busy: false,
+    stage: 'idle',
+    error: '',
+    paused: false,
+  });
+  const uploader = useRef<AuthorUploadController | null>(null),
+    fileInput = useRef<HTMLInputElement>(null);
   const alive = useRef(true),
     current = useRef<AuthorContext | null>(null),
     draft = useRef<AuthorDraftValue>(empty()),
@@ -214,9 +227,11 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
   }, [client, showFailure]);
   useEffect(() => {
     const offBefore = onBeforeVaultLock(async () => {
+      uploader.current?.cancel();
       await flush();
     });
     const offLock = onVaultLock(() => {
+      uploader.current?.dispose();
       client.dispose();
       current.current = null;
     });
@@ -249,6 +264,44 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
     );
     return () => clearTimeout(timeout);
   }, [context]);
+  useEffect(() => {
+    if (!context) return;
+    let controller: AuthorUploadController;
+    try {
+      controller = new AuthorUploadController(
+        context,
+        client,
+        (next) => {
+          if (alive.current) setUpload(next);
+        },
+        async () => {
+          const refreshed = await client.sources();
+          readAuthorContext(context);
+          if (alive.current && current.current === context) {
+            setPages([refreshed]);
+            setPageIndex(0);
+          }
+        },
+        () => {
+          if (alive.current) {
+            setUnavailable(true);
+            setError(
+              'The teacher selection or workspace changed. Reopen assignment setup from Canvas. Your encrypted upload and draft are kept.',
+            );
+          }
+        },
+      );
+    } catch (reason) {
+      showFailure(reason);
+      return;
+    }
+    uploader.current = controller;
+    void controller.restore();
+    return () => {
+      controller.dispose();
+      if (uploader.current === controller) uploader.current = null;
+    };
+  }, [client, context, showFailure]);
 
   async function perform(run: () => Promise<void>) {
     if (action.current) return;
@@ -343,6 +396,27 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
   const frozen = busy || unavailable || conflict || value.phase !== 'editing';
   const page = pages[pageIndex];
   const source = value.form.source;
+  const uploadStatus = upload.task?.upload?.status;
+  const uploadTerminal = uploadStatus === 'ready' || uploadStatus === 'rejected';
+  const uploadLabel = upload.busy
+    ? {
+        saving: 'Saving encrypted recovery copy…',
+        reserving: 'Preparing upload…',
+        checking: 'Checking upload status…',
+        sending: 'Uploading PDF…',
+        idle: 'Opening upload…',
+      }[upload.stage]
+    : uploadStatus === 'quarantined'
+      ? 'Waiting for document checks'
+      : uploadStatus === 'ready'
+        ? 'Document ready'
+        : uploadStatus === 'rejected'
+          ? 'Document rejected'
+          : upload.task
+            ? upload.paused
+              ? 'Transfer paused — recovery copy saved'
+              : 'Upload saved — ready to resume'
+            : 'PDF · up to 100 MB';
   return (
     <main className="canvas-author app-shell">
       <header className="canvas-author-header">
@@ -351,7 +425,7 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
           Canvas <span aria-hidden="true">/</span> Assignment setup
         </span>
         <div className="canvas-author-header-actions">
-          <button className="button secondary" disabled={busy} onClick={goBack}>
+          <button className="button secondary" disabled={busy || upload.busy} onClick={goBack}>
             <ArrowLeft size={15} />
             Workspace
           </button>
@@ -429,6 +503,90 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
                   the assignment.
                 </p>
                 <div
+                  className="canvas-author-upload"
+                  role="group"
+                  aria-label="Upload an assignment document"
+                  aria-busy={upload.busy}
+                >
+                  <input
+                    ref={fileInput}
+                    type="file"
+                    accept="application/pdf,.pdf"
+                    hidden
+                    disabled={frozen || upload.busy || (!!upload.task && !uploadTerminal)}
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      event.target.value = '';
+                      if (file && !frozen && !upload.busy) void uploader.current?.start(file);
+                    }}
+                  />
+                  <div className="canvas-author-upload-heading">
+                    <div className="canvas-author-upload-summary">
+                      <strong>{upload.task?.intent.metadata.name ?? 'Add a document'}</strong>
+                      <p role="status">
+                        {upload.busy && <Loader2 size={13} className="spin" aria-hidden="true" />}
+                        {uploadLabel}
+                      </p>
+                    </div>
+                    {(!upload.task || uploadTerminal) && (
+                      <button
+                        className="button secondary"
+                        disabled={frozen || upload.busy}
+                        onClick={() => fileInput.current?.click()}
+                      >
+                        <Upload size={14} aria-hidden="true" />
+                        {upload.task ? 'Upload another PDF' : 'Upload PDF'}
+                      </button>
+                    )}
+                  </div>
+                  {upload.task && !uploadTerminal && (
+                    <p className="canvas-author-upload-note">
+                      {uploadStatus === 'quarantined'
+                        ? 'This PDF becomes available only after document checks finish. Check its status to continue.'
+                        : 'The original PDF and request are saved encrypted on this device. You can cancel the transfer and resume it here.'}
+                    </p>
+                  )}
+                  {uploadStatus === 'ready' && (
+                    <p className="canvas-author-upload-note">
+                      Choose this document from the approved list below.
+                    </p>
+                  )}
+                  {uploadStatus === 'rejected' && (
+                    <p className="canvas-author-upload-note">
+                      This PDF cannot be used for an assignment. You can choose another file.
+                    </p>
+                  )}
+                  {upload.error && (
+                    <p className="canvas-author-upload-error" role="alert">
+                      {upload.error}
+                    </p>
+                  )}
+                  {(upload.busy || (upload.task && (!uploadTerminal || !!upload.error))) && (
+                    <div className="canvas-author-upload-actions">
+                      {upload.busy ? (
+                        <button
+                          className="button secondary"
+                          onClick={() => uploader.current?.cancel()}
+                        >
+                          Cancel transfer
+                        </button>
+                      ) : (
+                        <button
+                          className="button secondary"
+                          disabled={busy || unavailable || conflict}
+                          onClick={() => void uploader.current?.resume()}
+                        >
+                          {uploadStatus === 'quarantined' || uploadStatus === 'ready'
+                            ? 'Check upload status'
+                            : upload.error
+                              ? 'Retry saved upload'
+                              : 'Resume saved upload'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <div
                   className="canvas-author-source-list"
                   role="group"
                   aria-label="Approved documents"
@@ -470,8 +628,7 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
                       <FileText size={27} aria-hidden="true" />
                       <h3>No approved documents yet</h3>
                       <p>
-                        Ask your administrator to prepare a document for this course, then reopen
-                        assignment setup.
+                        Upload a PDF above. It will appear here after document checks approve it.
                       </p>
                     </div>
                   )}
@@ -595,7 +752,7 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
               <div className="canvas-author-footer-actions">
                 <button
                   className="button secondary"
-                  disabled={busy || (value.phase !== 'editing' && !confirmed)}
+                  disabled={busy || upload.busy || (value.phase !== 'editing' && !confirmed)}
                   onClick={() => setCancelPrompt(true)}
                 >
                   Cancel selection
@@ -603,7 +760,7 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
                 {value.phase === 'created' && confirmed ? (
                   <button
                     className="button primary"
-                    disabled={busy || conflict}
+                    disabled={busy || upload.busy || conflict}
                     onClick={() => void finish(false)}
                   >
                     Return to Canvas
@@ -614,6 +771,7 @@ function AuthorSession({ client }: { client: AssignmentAuthorClient }) {
                     className="button primary"
                     disabled={
                       busy ||
+                      upload.busy ||
                       conflict ||
                       (value.phase === 'editing' &&
                         (!source || !value.form.title.trim() || !value.form.allowedTools.length))

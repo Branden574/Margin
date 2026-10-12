@@ -15,6 +15,8 @@ import {
   StudentWorkProvisioningWorker,
 } from './assignments/provisioning/index.js';
 import { createApi } from './server.js';
+import { TeacherSourceUploadService } from './ingestion/upload.js';
+import { acquireCanvasRuntimeAdmission } from './canvas-local/maintenance.js';
 
 async function stopHttp(server: ReturnType<typeof createApi>) {
   // Stop new connections first; give active responses a bounded chance to finish.
@@ -57,8 +59,16 @@ export async function startCanvasLocalApi(
     })());
   try {
     options.signal?.throwIfAborted();
-    await assertCanvasDatabaseReady(config.databases, { signal: options.signal });
-    options.signal?.throwIfAborted();
+    const admission = await acquireCanvasRuntimeAdmission(config.databases.identity, {
+      signal: options.signal,
+    });
+    cleanups.push(() => admission.close());
+    const startup = AbortSignal.any([
+      admission.signal,
+      ...(options.signal ? [options.signal] : []),
+    ]);
+    await assertCanvasDatabaseReady(config.databases, { signal: startup });
+    startup.throwIfAborted();
     const keys = new LocalKeyProvider(config.secrets.wrapping, config.wrappingKeyId);
     cleanups.push(() => keys.close());
     const artifacts = new LocalEncryptedArtifactRepository({
@@ -70,6 +80,8 @@ export async function startCanvasLocalApi(
     cleanups.push(() => ingestion.close());
     const reader = new PostgresIngestionRepository(config.databases.sourceReader, keys, 'reader');
     cleanups.push(() => reader.close());
+    const sourceUploads = new TeacherSourceUploadService(ingestion, artifacts);
+    cleanups.push(() => sourceUploads.close());
     const signer = new AssignmentDeepLinkSigner(
       config.toolSigning.kid,
       config.toolSigning.privateKeyPem.toString('utf8'),
@@ -101,6 +113,7 @@ export async function startCanvasLocalApi(
     const provisioningWorker = new StudentWorkProvisioningWorker(provisioner, reader, artifacts);
     const server = createApi({
       ...runtime.apiServices,
+      sourceUploadService: sourceUploads,
       dataDirectory: config.dataDirectory,
       keyManagementProvider: keys,
       tls: config.tls,
@@ -108,7 +121,7 @@ export async function startCanvasLocalApi(
     });
     // Snapshot all secret buffers before releasing the loader's copies. Node's TLS context owns its key.
     loaded.dispose();
-    options.signal?.throwIfAborted();
+    startup.throwIfAborted();
     await new Promise<void>((resolve, reject) => {
       const failed = (error: Error) => {
         server.off('listening', ready);
@@ -124,6 +137,7 @@ export async function startCanvasLocalApi(
     });
     // Registered before worker cleanup so startup exceptions also close the listener.
     cleanups.push(() => stopHttp(server));
+    startup.throwIfAborted();
     const workers = startCanvasLocalWorkers(
       [
         { name: 'provision', run: (signal) => provisioningWorker.runOne(signal) },
@@ -139,10 +153,17 @@ export async function startCanvasLocalApi(
       if (results.some((result) => result.status === 'rejected'))
         throw new Error('Local Canvas requests or workers could not finish closing.');
     });
+    const lostAdmission = () => {
+      void close().catch(() => {});
+    };
+    admission.signal.addEventListener('abort', lostAdmission, { once: true });
+    cleanups.push(() => admission.signal.removeEventListener('abort', lostAdmission));
+    startup.throwIfAborted();
     return {
       origin: `https://${config.listener.host}:${config.listener.port}`,
       applicationOrigin: config.applicationOrigin,
       publicJwks: () => runtime.publicJwks(),
+      signal: admission.signal,
       close,
     };
   } catch (error) {

@@ -136,6 +136,7 @@ interface FunctionContract {
   language: string;
   stable: string;
   definer: boolean;
+  config: string[];
   args: string[];
   defaults: string[];
 }
@@ -144,6 +145,9 @@ interface TriggerContract {
   name: string;
   function: string;
   type: number;
+  constraint: boolean;
+  deferrable: boolean;
+  initiallyDeferred: boolean;
 }
 interface PolicyContract {
   table: string;
@@ -177,6 +181,10 @@ async function schemaContract() {
         language: /LANGUAGE (\w+)/.exec(header)![1],
         stable: /\bSTABLE\b/.test(header) ? 's' : /\bIMMUTABLE\b/.test(header) ? 'i' : 'v',
         definer: /SECURITY DEFINER/.test(header),
+        config: Array.from(
+          header.matchAll(/\bSET (\w+)\s*=\s*('(?:[^']|'')*'|\w+)/g),
+          (setting) => `${setting[1]}=${setting[2].replace(/^'|'$/g, '').replaceAll("''", "'")}`,
+        ),
         args: args
           .map((a) => a.trim().split(/\s+/)[1])
           .map((t) => ({ boolean: 'bool', integer: 'int4' })[t] ?? t),
@@ -191,17 +199,21 @@ async function schemaContract() {
       });
     }
     for (const match of sql.matchAll(
-      /^CREATE TRIGGER (\w+) BEFORE ([A-Z ]+) ON (margin_\w+\.\w+) FOR EACH ROW EXECUTE FUNCTION (margin_\w+\.\w+)\(\)/gm,
+      /^CREATE (CONSTRAINT )?TRIGGER (\w+) (BEFORE|AFTER) ([A-Z ]+) ON (margin_\w+\.\w+) (DEFERRABLE INITIALLY DEFERRED )?FOR EACH ROW EXECUTE FUNCTION (margin_\w+\.\w+)\(\)/gm,
     ))
       triggers.push({
-        name: match[1],
-        table: match[3],
-        function: match[4],
+        name: match[2],
+        table: match[5],
+        function: match[7],
+        constraint: Boolean(match[1]),
+        deferrable: Boolean(match[6]),
+        initiallyDeferred: Boolean(match[6]),
         type:
-          3 |
-          (match[2].includes('INSERT') ? 4 : 0) |
-          (match[2].includes('DELETE') ? 8 : 0) |
-          (match[2].includes('UPDATE') ? 16 : 0),
+          1 |
+          (match[3] === 'BEFORE' ? 2 : 0) |
+          (match[4].includes('INSERT') ? 4 : 0) |
+          (match[4].includes('DELETE') ? 8 : 0) |
+          (match[4].includes('UPDATE') ? 16 : 0),
       });
     for (const match of sql.matchAll(
       /^CREATE POLICY (\w+) ON (margin_\w+\.\w+)(?: AS (RESTRICTIVE|PERMISSIVE))? FOR (SELECT|INSERT|UPDATE|DELETE|ALL) TO (margin_\w+(?:\s*,\s*margin_\w+)*)/gm,
@@ -217,10 +229,10 @@ async function schemaContract() {
       });
   }
   if (
-    tables.size !== 38 ||
-    functions.size !== 34 ||
-    triggers.length !== 8 ||
-    policies.length !== 177
+    tables.size !== 39 ||
+    functions.size !== 36 ||
+    triggers.length !== 10 ||
+    policies.length !== 182
   )
     throw Error('Incomplete fixed migration contract');
   return { tables, functions, triggers, policies };
@@ -333,6 +345,15 @@ const columns = {
     prior_error_code: 'text',
     state: 'text',
   },
+  'margin_ingestion.upload_reservations': {
+    artifact_id: 'uuid',
+    organization_id: 'uuid',
+    owner_id: 'uuid',
+    installation_id: 'uuid',
+    course_id: 'uuid',
+    plaintext_bytes: 'int8',
+    created_at: 'timestamptz',
+  },
 };
 async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaContract>>) {
   const roles = (
@@ -407,7 +428,7 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
       f.stable !== expected.stable ||
       f.definer !== expected.definer ||
       f.unsafe ||
-      JSON.stringify(f.config) !== JSON.stringify(['search_path=pg_catalog']) ||
+      JSON.stringify(f.config) !== JSON.stringify(expected.config) ||
       JSON.stringify(f.args) !== JSON.stringify(expected.args) ||
       JSON.stringify(defaults) !== JSON.stringify(expected.defaults) ||
       (f.definer && f.owner !== 'margin_submission_retention_guard')
@@ -422,8 +443,11 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
       type: number;
       enabled: string;
       conditional: boolean;
+      constraint_trigger: boolean;
+      deferrable: boolean;
+      initially_deferred: boolean;
     }>(
-      `SELECT n.nspname||'.'||t.relname AS table,g.tgname AS name,pn.nspname||'.'||p.proname AS function,g.tgtype AS type,g.tgenabled AS enabled,g.tgqual IS NOT NULL OR g.tgnargs<>0 OR cardinality(g.tgattr::smallint[])>0 AS conditional FROM pg_trigger g JOIN pg_class t ON t.oid=g.tgrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_proc p ON p.oid=g.tgfoid JOIN pg_namespace pn ON pn.oid=p.pronamespace WHERE n.nspname=ANY($1) AND NOT g.tgisinternal`,
+      `SELECT n.nspname||'.'||t.relname AS table,g.tgname AS name,pn.nspname||'.'||p.proname AS function,g.tgtype AS type,g.tgenabled AS enabled,g.tgqual IS NOT NULL OR g.tgnargs<>0 OR cardinality(g.tgattr::smallint[])>0 AS conditional,g.tgconstraint<>0 AS constraint_trigger,g.tgdeferrable AS deferrable,g.tginitdeferred AS initially_deferred FROM pg_trigger g JOIN pg_class t ON t.oid=g.tgrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_proc p ON p.oid=g.tgfoid JOIN pg_namespace pn ON pn.oid=p.pronamespace WHERE n.nspname=ANY($1) AND NOT g.tgisinternal`,
       [schemas],
     )
   ).rows;
@@ -437,6 +461,9 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
             t.name === e.name &&
             t.function === e.function &&
             t.type === e.type &&
+            t.constraint_trigger === e.constraint &&
+            t.deferrable === e.deferrable &&
+            t.initially_deferred === e.initiallyDeferred &&
             t.enabled === 'O' &&
             !t.conditional,
         ),
@@ -570,7 +597,8 @@ export async function assertCanvasDatabaseReady(
       check = 'installation';
       const manifest = (
         await client.query(
-          'SELECT position,name,sha256 FROM margin_local.migrations ORDER BY position LIMIT 13',
+          'SELECT position,name,sha256 FROM margin_local.migrations ORDER BY position LIMIT $1',
+          [expectedManifest.length + 1],
         )
       ).rows;
       if (JSON.stringify(manifest) !== JSON.stringify(expectedManifest))

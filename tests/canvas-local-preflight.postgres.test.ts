@@ -313,21 +313,36 @@ describe.skipIf(!available)(
       );
     });
 
-    it('rejects migration hash drift and recovers after operator repair', async () => {
-      const original = (
-        await admin.query('SELECT sha256 FROM margin_local.migrations WHERE position=12')
-      ).rows[0].sha256;
-      try {
-        await admin.query(
-          "UPDATE margin_local.migrations SET sha256=repeat('0',64) WHERE position=12",
-        );
-        await rejects(config(), 'identity', 'installation');
-      } finally {
-        await admin.query('UPDATE margin_local.migrations SET sha256=$1 WHERE position=12', [
-          original,
-        ]);
-      }
-      await expect(assertCanvasDatabaseReady(config())).resolves.toBeUndefined();
+    it.each([12, 13])(
+      'rejects migration %i hash drift and recovers after operator repair',
+      async (position) => {
+        const original = (
+          await admin.query('SELECT sha256 FROM margin_local.migrations WHERE position=$1', [
+            position,
+          ])
+        ).rows[0].sha256;
+        try {
+          await admin.query(
+            "UPDATE margin_local.migrations SET sha256=repeat('0',64) WHERE position=$1",
+            [position],
+          );
+          await rejects(config(), 'identity', 'installation');
+        } finally {
+          await admin.query('UPDATE margin_local.migrations SET sha256=$1 WHERE position=$2', [
+            original,
+            position,
+          ]);
+        }
+        await expect(assertCanvasDatabaseReady(config())).resolves.toBeUndefined();
+      },
+    );
+
+    it('rejects an appended migration beyond the complete expected manifest', async () => {
+      await altered(
+        "INSERT INTO margin_local.migrations(position,name,sha256) VALUES(14,'014-unexpected.sql',repeat('0',64))",
+        'DELETE FROM margin_local.migrations WHERE position=14',
+        () => rejects(config(), 'identity', 'installation'),
+      );
     });
 
     it('rejects missing forced row security on a critical table', async () => {
@@ -350,6 +365,63 @@ describe.skipIf(!available)(
       await altered(
         'ALTER TABLE margin_sync.operations DISABLE TRIGGER retain_submission_operations',
         'ALTER TABLE margin_sync.operations ENABLE TRIGGER retain_submission_operations',
+        () => rejects(config(), 'identity', 'schema'),
+      );
+    });
+
+    it.each([
+      ['margin_ingestion.upload_reservations', 'protect_upload_capacity'],
+      ['margin_sync.documents', 'enforce_upload_accounting'],
+    ])('rejects disabled source intake trigger %s.%s', async (table, name) => {
+      await altered(
+        `ALTER TABLE ${table} DISABLE TRIGGER ${name}`,
+        `ALTER TABLE ${table} ENABLE TRIGGER ${name}`,
+        () => rejects(config(), 'identity', 'schema'),
+      );
+    });
+
+    it.each([
+      'CREATE TRIGGER enforce_upload_accounting AFTER INSERT ON margin_sync.documents FOR EACH ROW EXECUTE FUNCTION margin_ingestion.enforce_upload_accounting()',
+      'CREATE CONSTRAINT TRIGGER enforce_upload_accounting AFTER INSERT ON margin_sync.documents DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION margin_ingestion.enforce_upload_accounting()',
+      'CREATE CONSTRAINT TRIGGER enforce_upload_accounting AFTER INSERT ON margin_sync.documents NOT DEFERRABLE FOR EACH ROW EXECUTE FUNCTION margin_ingestion.enforce_upload_accounting()',
+    ])('rejects accounting timing/constraint drift %#', async (replacement) => {
+      const remove = 'DROP TRIGGER enforce_upload_accounting ON margin_sync.documents; ';
+      await altered(
+        remove + replacement,
+        remove +
+          'CREATE CONSTRAINT TRIGGER enforce_upload_accounting AFTER INSERT ON margin_sync.documents DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION margin_ingestion.enforce_upload_accounting()',
+        () => rejects(config(), 'identity', 'schema'),
+      );
+    });
+
+    it.each(['RESET lock_timeout', "SET lock_timeout='0'"])(
+      'rejects weakening the database quota lock bound with %s',
+      async (change) => {
+        await altered(
+          `ALTER FUNCTION margin_ingestion.protect_upload_capacity() ${change}`,
+          "ALTER FUNCTION margin_ingestion.protect_upload_capacity() SET lock_timeout='2s'",
+          () => rejects(config(), 'identity', 'schema'),
+        );
+      },
+    );
+
+    it('rejects altered source capacity logic even with unchanged function properties', async () => {
+      const original = (
+        await admin.query(
+          "SELECT pg_get_functiondef('margin_ingestion.protect_upload_capacity()'::regprocedure) AS definition",
+        )
+      ).rows[0].definition as string;
+      await altered(
+        "CREATE OR REPLACE FUNCTION margin_ingestion.protect_upload_capacity() RETURNS trigger LANGUAGE plpgsql VOLATILE SECURITY INVOKER SET search_path=pg_catalog SET lock_timeout='2s' AS $$ BEGIN RETURN NEW; END $$",
+        original,
+        () => rejects(config(), 'identity', 'schema'),
+      );
+    });
+
+    it('requires forced RLS on source capacity accounting', async () => {
+      await altered(
+        'ALTER TABLE margin_ingestion.upload_reservations NO FORCE ROW LEVEL SECURITY',
+        'ALTER TABLE margin_ingestion.upload_reservations FORCE ROW LEVEL SECURITY',
         () => rejects(config(), 'identity', 'schema'),
       );
     });

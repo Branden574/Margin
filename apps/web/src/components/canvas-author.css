@@ -77,6 +77,54 @@
 .canvas-author-source-list {
   border-top: 1px solid var(--border);
 }
+.canvas-author-upload {
+  padding: 16px 0 20px;
+  border-top: 1px solid var(--border);
+}
+.canvas-author-upload-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.canvas-author-upload-summary {
+  min-width: 0;
+  flex: 1;
+}
+.canvas-author-upload-summary strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.canvas-author-upload-summary p {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  font-size: 11px;
+}
+.canvas-author-upload-note {
+  margin-top: 10px;
+  font-size: 11px !important;
+  max-width: 58ch;
+}
+.canvas-author-upload-error {
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+.canvas-author-upload-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .canvas-author-upload .spin {
+    animation: none;
+  }
+}
+:root[data-motion='reduced'] .canvas-author-upload .spin {
+  animation: none;
+}
 .canvas-author-source {
   display: flex;
   align-items: center;

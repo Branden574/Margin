@@ -13,6 +13,14 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { Client, type ClientConfig } from 'pg';
 import { readProtectedFile } from './protected-files.js';
+import { acquireCanvasMaintenance, assertCanvasDatabaseQuiet } from './maintenance.js';
+import { createCanvasUpgradeBackup, type CanvasUpgradeBackup } from './upgrade-backup.js';
+import {
+  reviewedMigration013,
+  upgradeObjects,
+  assertUpgradeObjects,
+  assertUpgradePolicies,
+} from './upgrade-contract.js';
 
 const execute = promisify(execFile);
 export const CANVAS_MIGRATIONS = [
@@ -28,6 +36,7 @@ export const CANVAS_MIGRATIONS = [
   '010-submission-materialization.sql',
   '011-submission-outcomes.sql',
   '012-submission-review.sql',
+  '013-teacher-source-intake.sql',
 ] as const;
 export const CANVAS_DATABASE_ROLES = {
   identity: 'margin_identity_runtime',
@@ -79,9 +88,9 @@ function assertLocalEnvironment() {
     fail('Local Canvas setup requires POSIX ownership and no-follow filesystem support.');
 }
 const manifestDirectory = new URL('../../../../infra/migrations/', import.meta.url);
-export async function migrationManifest() {
+export async function migrationManifest(through: number = CANVAS_MIGRATIONS.length) {
   return Promise.all(
-    CANVAS_MIGRATIONS.map(async (name, index) => ({
+    CANVAS_MIGRATIONS.slice(0, through).map(async (name, index) => ({
       position: index + 1,
       name,
       sha256: sha(await readFile(new URL(name, manifestDirectory))),
@@ -184,7 +193,10 @@ async function inspectApiTls(tls: { keyFile: string; certFile: string }) {
 function dbUrl(user: string, password: string, postgresPort: number) {
   return `postgresql://${user}:${password}@127.0.0.1:${postgresPort}/margin_canvas`;
 }
-async function operator(root: string, database = 'margin_canvas'): Promise<Client> {
+async function operatorConfiguration(
+  root: string,
+  database = 'margin_canvas',
+): Promise<ClientConfig> {
   const raw = await privateFile(join(root, 'operator', 'database.url'), 8192);
   const url = new URL(raw.toString().trim());
   raw.fill(0);
@@ -212,7 +224,10 @@ async function operator(root: string, database = 'margin_canvas'): Promise<Clien
     url.username !== 'margin_canvas_operator'
   )
     fail('The separate operator credential is invalid.');
-  const client = new Client(config);
+  return config;
+}
+async function operator(root: string, database = 'margin_canvas'): Promise<Client> {
+  const client = new Client(await operatorConfiguration(root, database));
   try {
     await client.connect();
     return client;
@@ -221,11 +236,15 @@ async function operator(root: string, database = 'margin_canvas'): Promise<Clien
     throw error;
   }
 }
-async function ledger(client: Client, instanceId: string) {
+async function ledger(
+  client: Client,
+  instanceId: string,
+  expected?: Awaited<ReturnType<typeof migrationManifest>>,
+) {
   const actual = await client.query(
     'SELECT position,name,sha256 FROM margin_local.migrations ORDER BY position',
   );
-  const expected = await migrationManifest();
+  expected ??= await migrationManifest();
   if (JSON.stringify(actual.rows) !== JSON.stringify(expected))
     fail(
       'Migration history differs from the exact installed Canvas migrations. No migrations were reapplied.',
@@ -246,6 +265,15 @@ async function ledger(client: Client, instanceId: string) {
     fail(
       'Canvas row-level security policies differ from their installed contract. No policies were changed.',
     );
+}
+async function supportedLedger(client: Client, instanceId: string): Promise<12 | 13> {
+  const count = (
+    await client.query('SELECT count(*)::integer AS count FROM margin_local.migrations')
+  ).rows[0]?.count;
+  if (count !== 12 && count !== 13)
+    fail('Only exact local Canvas migration versions 12 and 13 are supported.');
+  await ledger(client, instanceId, await migrationManifest(count));
+  return count;
 }
 const policyInventory = `SELECT n.nspname||'.'||t.relname AS table_name,p.polname AS name,
   ARRAY(SELECT r.rolname::text FROM pg_roles r WHERE r.oid=ANY(p.polroles) ORDER BY r.rolname) AS roles,
@@ -372,7 +400,7 @@ export async function startCanvasLocal(rootDirectory: string) {
         client = await operator(root);
       try {
         await serverIdentity(client, saved.dataDirectory, saved.systemIdentifier);
-        await ledger(client, saved.instanceId);
+        await supportedLedger(client, saved.instanceId);
       } finally {
         await client.end();
       }
@@ -392,12 +420,122 @@ export async function stopCanvasLocal(rootDirectory: string) {
     const client = await operator(root);
     try {
       await serverIdentity(client, saved.dataDirectory, saved.systemIdentifier);
-      await ledger(client, saved.instanceId);
+      await supportedLedger(client, saved.instanceId);
     } finally {
       await client.end();
     }
     await command('pg_ctl', ['-D', saved.dataDirectory, '-m', 'smart', '-w', '-t', '30', 'stop']);
     return true;
+  });
+}
+
+/** Explicit additive maintenance only. Existing protected files and encrypted artifacts are never rewritten. */
+export async function upgradeCanvasLocal(rootDirectory: string): Promise<{
+  from: 12 | 13;
+  to: 13;
+  changed: boolean;
+  reconciled: boolean;
+  backup?: CanvasUpgradeBackup;
+}> {
+  assertLocalEnvironment();
+  const root = await canonicalRoot(rootDirectory, false);
+  return locked(root, async () => {
+    const saved = await receipt(root);
+    if (!(await running(saved.dataDirectory)))
+      fail(
+        'Start the owned Canvas PostgreSQL cluster, then stop the API and workers before upgrading.',
+      );
+    const migration = await reviewedMigration013();
+    const expected = await migrationManifest();
+    if (expected.length !== 13 || expected[12].sha256 !== migration.sha256)
+      fail('The reviewed Canvas migration manifest is inconsistent.');
+    let client = await operator(root);
+    client.on('error', () => {});
+    let backup: CanvasUpgradeBackup | undefined;
+    try {
+      await serverIdentity(client, saved.dataDirectory, saved.systemIdentifier);
+      await acquireCanvasMaintenance(client);
+      const version = await supportedLedger(client, saved.instanceId);
+      if (version === 13) return { from: 13, to: 13, changed: false, reconciled: false };
+      // A backup is accepted only after all legacy runtime sessions have stopped and the exact old baseline passed.
+      backup = await createCanvasUpgradeBackup(
+        root,
+        await operatorConfiguration(root),
+        saved,
+        expected.slice(0, 12),
+      );
+      await assertCanvasDatabaseQuiet(client);
+      let commitAttempted = false;
+      const deadline = setTimeout(() => {
+        void client.end().catch(() => {});
+      }, 30000);
+      deadline.unref();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          "SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='8s'; SET LOCAL idle_in_transaction_session_timeout='10s'; SET LOCAL synchronous_commit='on'",
+        );
+        await client.query(
+          'LOCK TABLE margin_local.migrations,margin_local.policy_contract IN EXCLUSIVE MODE',
+        );
+        await ledger(client, saved.instanceId, expected.slice(0, 12));
+        const beforePolicies = (await policySnapshot(client)).rows;
+        const beforeObjects = await upgradeObjects(client);
+        await client.query(migration.sql);
+        assertUpgradeObjects(beforeObjects, await upgradeObjects(client));
+        assertUpgradePolicies(beforePolicies, (await policySnapshot(client)).rows);
+        await client.query(
+          'INSERT INTO margin_local.migrations(position,name,sha256) VALUES($1,$2,$3)',
+          [migration.position, migration.name, migration.sha256],
+        );
+        // The old contract remains immutable unless the entire reviewed migration commits.
+        await client.query('DELETE FROM margin_local.policy_contract');
+        await client.query(
+          'INSERT INTO margin_local.policy_contract(table_name,name,roles,command,permissive,using_expression,check_expression) ' +
+            policyInventory,
+          [policySchemas],
+        );
+        await ledger(client, saved.instanceId, expected);
+        commitAttempted = true;
+        await client.query('COMMIT');
+      } catch (error) {
+        if (!commitAttempted) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw new CanvasBootstrapError(
+            'Canvas upgrade was not committed. The private backup and original files were preserved.',
+            { cause: error },
+          );
+        }
+        // COMMIT can succeed while its acknowledgement is lost. Never replay DDL based on that exception.
+        clearTimeout(deadline);
+        await client.end().catch(() => {});
+        client = await operator(root);
+        client.on('error', () => {});
+        try {
+          await serverIdentity(client, saved.dataDirectory, saved.systemIdentifier);
+          const actual = await supportedLedger(client, saved.instanceId);
+          if (actual === 13) return { from: 12, to: 13, changed: true, reconciled: true, backup };
+          fail(
+            'Canvas upgrade did not commit; exact migration 12 and its policy contract remain intact. The private backup was preserved.',
+          );
+        } catch (reconciliation) {
+          if (
+            reconciliation instanceof CanvasBootstrapError &&
+            reconciliation.message.startsWith('Canvas upgrade did not commit')
+          )
+            throw reconciliation;
+          throw new CanvasBootstrapError(
+            'Canvas upgrade commit outcome could not be verified. Do not replay or restore automatically; inspect the protected installation and backup.',
+            { cause: reconciliation },
+          );
+        }
+      } finally {
+        clearTimeout(deadline);
+      }
+      return { from: 12, to: 13, changed: true, reconciled: false, backup };
+    } finally {
+      await client.end().catch(() => {});
+    }
   });
 }
 async function stopAfterFailedStart(
@@ -424,8 +562,13 @@ async function stopAfterFailedStart(
     );
   }
 }
-export async function bootCanvasLocal(options: CanvasBootstrapOptions) {
+export async function bootCanvasLocal(
+  options: CanvasBootstrapOptions,
+  tests?: { installThrough: 12 },
+) {
   assertLocalEnvironment();
+  if (tests && (process.env.NODE_ENV !== 'test' || tests.installThrough !== 12))
+    fail('Historical initialization is available only to disposable test fixtures.');
   port(options.postgresPort);
   port(options.apiPort);
   if (options.postgresPort === options.apiPort)
@@ -451,6 +594,7 @@ export async function bootCanvasLocal(options: CanvasBootstrapOptions) {
     const root = await canonicalRoot(options.rootDirectory, true);
     const entries = await readdir(root);
     if (entries.includes('bootstrap.json')) {
+      if (tests) fail('Historical test initialization requires a fresh disposable root.');
       const saved = await receipt(root),
         config = JSON.parse((await privateFile(saved.configPath)).toString());
       if (
@@ -653,7 +797,8 @@ export async function bootCanvasLocal(options: CanvasBootstrapOptions) {
             "CREATE SCHEMA margin_local; REVOKE ALL ON SCHEMA margin_local FROM PUBLIC; CREATE TABLE margin_local.installation(id integer PRIMARY KEY CHECK(id=1),instance_id uuid NOT NULL,schema_version integer NOT NULL CHECK(schema_version=1)); CREATE TABLE margin_local.migrations(position integer PRIMARY KEY,name text UNIQUE NOT NULL,sha256 text NOT NULL CHECK(sha256 ~ '^[a-f0-9]{64}$'),applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); REVOKE ALL ON ALL TABLES IN SCHEMA margin_local FROM PUBLIC",
           );
           await client.query('INSERT INTO margin_local.installation VALUES(1,$1,1)', [instanceId]);
-          for (const migration of await migrationManifest()) {
+          const installedManifest = await migrationManifest(tests?.installThrough);
+          for (const migration of installedManifest) {
             const sql = await readFile(new URL(migration.name, manifestDirectory), 'utf8');
             if (
               (sql.match(/^BEGIN;\s*$/gm) || []).length !== 1 ||
@@ -687,7 +832,7 @@ export async function bootCanvasLocal(options: CanvasBootstrapOptions) {
               `CREATE ROLE ${login} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${passwords[name]}'; GRANT ${role} TO ${login}; GRANT USAGE ON SCHEMA margin_local TO ${role}; GRANT SELECT ON ALL TABLES IN SCHEMA margin_local TO ${role}`,
             );
           }
-          await ledger(client, instanceId);
+          await ledger(client, instanceId, installedManifest);
         } finally {
           await client.end();
         }

@@ -2,6 +2,8 @@ import type {
   AuthorAssignment,
   AuthorDraft,
   AuthorSource,
+  AuthorUpload,
+  AuthorUploadIntent,
 } from '../../apps/web/src/lib/assignment-author/types';
 
 /** Synthetic HTTP fixture only. Never deploy or use as an authentication provider. */
@@ -21,6 +23,10 @@ export function canvasAuthorFixture() {
     failNextCreate: 0,
     sourceAvailable: true,
     returned: false,
+    loseNextReserveResponse: false,
+    loseNextContentResponse: false,
+    failNextContentBeforeStore: false,
+    uploadsConfigured: true,
   };
   const sources: AuthorSource[] = Array.from({ length: 6 }, (_, index) => ({
     documentId: id(10 + index),
@@ -34,6 +40,10 @@ export function canvasAuthorFixture() {
   const received: Array<AuthorDraft & { requestId: string }> = [];
   const assignments = new Map<string, { request: string; assignment: AuthorAssignment }>();
   const returns: Array<{ assignmentId: string; csrfToken: string }> = [];
+  const uploads = new Map<string, { intent: AuthorUploadIntent; upload: AuthorUpload }>();
+  const uploadRequests: AuthorUploadIntent[] = [],
+    transfers: string[] = [],
+    statusReads: string[] = [];
   const json = (value: unknown, status = 200) => ({
     status,
     contentType: 'application/json',
@@ -47,6 +57,25 @@ export function canvasAuthorFixture() {
     received,
     assignments,
     returns,
+    uploads,
+    uploadRequests,
+    transfers,
+    statusReads,
+    approveUpload() {
+      for (const entry of uploads.values()) {
+        if (entry.upload.status !== 'quarantined') continue;
+        entry.upload.status = 'ready';
+        sources.unshift({
+          documentId: entry.upload.id,
+          versionId: entry.intent.requestId,
+          name: entry.intent.metadata.name,
+          pageCount: 1,
+          bytes: entry.intent.plaintextBytes,
+          inspection: 'approved',
+          availability: 'not-checked',
+        });
+      }
+    },
     async handle(url: URL, method: string, body?: string) {
       if (!state.authorized)
         return error('session_revoked', 'The synthetic teacher session was revoked.', 401);
@@ -75,6 +104,68 @@ export function canvasAuthorFixture() {
           sources: url.searchParams.has('after') ? sources.slice(5) : sources.slice(0, 5),
           nextCursor: url.searchParams.has('after') ? null : 'synthetic-page-2',
         });
+      if (url.pathname === '/api/assignments/source-uploads' && method === 'POST') {
+        if (!state.uploadsConfigured)
+          return error(
+            'source_upload_unconfigured',
+            'Document uploads are not configured. Your saved file is kept.',
+            503,
+          );
+        const intent = JSON.parse(body ?? '{}') as AuthorUploadIntent;
+        uploadRequests.push(structuredClone(intent));
+        const previous = uploads.get(intent.requestId);
+        if (previous && JSON.stringify(previous.intent) !== JSON.stringify(intent))
+          return error('source_request_mismatch', 'The original upload request changed.', 409);
+        const entry = previous ?? {
+          intent: structuredClone(intent),
+          upload: {
+            id: id(500 + uploads.size),
+            requestId: intent.requestId,
+            status: 'pending' as const,
+          },
+        };
+        uploads.set(intent.requestId, entry);
+        if (state.loseNextReserveResponse) {
+          state.loseNextReserveResponse = false;
+          return error(
+            'source_request_interrupted',
+            'The upload reservation could not be confirmed.',
+            409,
+          );
+        }
+        return json(
+          { upload: entry.upload, duplicate: !!previous },
+          ['pending', 'quarantined'].includes(entry.upload.status) ? 202 : 200,
+        );
+      }
+      const uploadPath = /^\/api\/assignments\/source-uploads\/([^/]+)(\/content)?$/.exec(
+        url.pathname,
+      );
+      if (uploadPath) {
+        const entry = [...uploads.values()].find((row) => row.upload.id === uploadPath[1]);
+        if (!entry) return error('source_unavailable', 'The upload is unavailable.', 404);
+        if (method === 'GET' && !uploadPath[2]) {
+          statusReads.push(entry.upload.id);
+          return json({ upload: entry.upload });
+        }
+        if (method === 'PUT' && uploadPath[2]) {
+          transfers.push(body ?? '');
+          if (state.failNextContentBeforeStore) {
+            state.failNextContentBeforeStore = false;
+            return error('source_upload_interrupted', 'The transfer could not be confirmed.', 409);
+          }
+          const duplicate = entry.upload.status !== 'pending';
+          if (!duplicate) entry.upload.status = 'quarantined';
+          if (state.loseNextContentResponse) {
+            state.loseNextContentResponse = false;
+            return error('source_upload_interrupted', 'The transfer could not be confirmed.', 409);
+          }
+          return json(
+            { upload: entry.upload, duplicate },
+            ['pending', 'quarantined'].includes(entry.upload.status) ? 202 : 200,
+          );
+        }
+      }
       if (url.pathname === '/api/assignments' && method === 'POST') {
         const input = JSON.parse(body ?? '{}') as AuthorDraft & { requestId: string };
         received.push(structuredClone(input));

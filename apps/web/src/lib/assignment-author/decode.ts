@@ -1,6 +1,7 @@
 import { id as workId, object as workObject } from '../assignment-work/decode';
 import {
   AuthorClientError,
+  MAX_AUTHOR_UPLOAD_BYTES,
   authorTools,
   type AuthorAssignment,
   type AuthorDraft,
@@ -8,6 +9,9 @@ import {
   type AuthorSource,
   type AuthorSourcePage,
   type AuthorContext,
+  type AuthorUpload,
+  type AuthorUploadIntent,
+  type AuthorUploadResult,
 } from './types';
 export function id(value: unknown): string {
   try {
@@ -199,4 +203,40 @@ export function decodeAuthorAssignment(value: unknown): AuthorAssignment {
     policy: policy(a.policy),
     createdAt,
   };
+}
+export function uploadIntent(value: unknown): AuthorUploadIntent {
+  const row = object(value, ['requestId', 'metadata', 'plaintextBytes', 'plaintextSha256']);
+  const metadata = object(row.metadata, ['name', 'mimeType']);
+  const name = text(metadata.name, 240);
+  if (
+    metadata.mimeType !== 'application/pdf' ||
+    /[\u0000-\u001f\u007f]/.test(name) ||
+    typeof row.plaintextSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(row.plaintextSha256)
+  )
+    return invalid();
+  return {
+    requestId: id(row.requestId),
+    metadata: { name, mimeType: 'application/pdf' },
+    plaintextBytes: number(row.plaintextBytes, 1, MAX_AUTHOR_UPLOAD_BYTES),
+    plaintextSha256: row.plaintextSha256,
+  };
+}
+export function upload(value: unknown): AuthorUpload {
+  const row = object(value, ['id', 'requestId', 'status']);
+  if (!['pending', 'quarantined', 'ready', 'rejected'].includes(row.status as string))
+    return invalid();
+  return {
+    id: id(row.id),
+    requestId: id(row.requestId),
+    status: row.status as AuthorUpload['status'],
+  };
+}
+export function uploadResult(value: unknown): AuthorUploadResult {
+  const row = object(value, ['upload', 'duplicate']);
+  if (typeof row.duplicate !== 'boolean') return invalid();
+  return { upload: upload(row.upload), duplicate: row.duplicate };
+}
+export function uploadStatus(value: unknown): AuthorUpload {
+  return upload(object(value, ['upload']).upload);
 }

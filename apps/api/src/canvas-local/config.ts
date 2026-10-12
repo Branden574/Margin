@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { createPrivateKey, createPublicKey, X509Certificate } from 'node:crypto';
 import { sep } from 'node:path';
 import type { PoolConfig } from 'pg';
+import { strictJson } from '../strict-json.js';
 import {
   absolutePath,
   CanvasLocalConfigError,
@@ -27,34 +28,6 @@ export const CANVAS_DATABASE_PURPOSES = [
 export type CanvasDatabasePurpose = (typeof CANVAS_DATABASE_PURPOSES)[number];
 const SECRET_PURPOSES = ['wrapping', 'session', 'identity', 'lms', 'resource'] as const;
 type SecretPurpose = (typeof SECRET_PURPOSES)[number];
-/** JSON.parse alone silently accepts duplicate keys, including escaped spellings. */
-function strictJson(text: string): unknown {
-  const parsed: unknown = JSON.parse(text);
-  const scopes: Array<Set<string> | null> = [];
-  for (let index = 0; index < text.length; index++) {
-    const character = text[index];
-    if (character === '{' || character === '[') {
-      scopes.push(character === '{' ? new Set() : null);
-      if (scopes.length > 16) throw new Error();
-    } else if (character === '}' || character === ']') scopes.pop();
-    else if (character === '"') {
-      const start = index++;
-      while (index < text.length && text[index] !== '"') {
-        if (text[index] === '\\') index++;
-        index++;
-      }
-      let after = index + 1;
-      while (/\s/.test(text[after] ?? '') && after < text.length) after++;
-      if (text[after] === ':') {
-        const key = JSON.parse(text.slice(start, index + 1)) as string,
-          keys = scopes.at(-1);
-        if (!keys || keys.has(key)) throw new Error();
-        keys.add(key);
-      }
-    }
-  }
-  return parsed;
-}
 export interface CanvasLocalConfiguration {
   schema: 1;
   applicationOrigin: string;

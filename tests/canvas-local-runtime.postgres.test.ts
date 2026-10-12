@@ -143,6 +143,54 @@ describe.skipIf(!available)(
       runtime = undefined;
     });
 
+    it('loses runtime admission when its dedicated database connection dies and closes the listener and pools', async () => {
+      runtime = await startCanvasLocalApi(saved.configPath);
+      const active = runtime;
+      expect((await get('/api/health')).status).toBe(200);
+      const sessions = (
+        await admin.query(
+          "SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND application_name='margin-canvas-runtime-admission'",
+        )
+      ).rows;
+      expect(sessions).toHaveLength(1);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let lost!: () => void;
+      const aborted = new Promise<void>((resolve, reject) => {
+        lost = resolve;
+        active.signal.addEventListener('abort', lost, { once: true });
+        timer = setTimeout(
+          () => reject(new Error('Runtime admission loss was not observed.')),
+          5000,
+        );
+      });
+      try {
+        expect(
+          (await admin.query('SELECT pg_terminate_backend($1) AS terminated', [sessions[0].pid]))
+            .rows[0].terminated,
+        ).toBe(true);
+        await aborted;
+        expect(active.signal.aborted).toBe(true);
+        await active.close();
+        await expect(get('/api/health')).rejects.toBeDefined();
+        expect(
+          (
+            await admin.query(
+              "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid()",
+            )
+          ).rows[0].count,
+        ).toBe('0');
+      } finally {
+        clearTimeout(timer);
+        active.signal.removeEventListener('abort', lost);
+        await active.close();
+        runtime = undefined;
+      }
+      runtime = await startCanvasLocalApi(saved.configPath);
+      expect((await get('/api/health')).status).toBe(200);
+      await runtime.close();
+      runtime = undefined;
+    });
+
     it('refuses migration drift before opening the listener and can recover after operator repair', async () => {
       const old = (await admin.query('SELECT sha256 FROM margin_local.migrations WHERE position=1'))
         .rows[0].sha256;

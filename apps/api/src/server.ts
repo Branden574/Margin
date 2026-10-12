@@ -29,6 +29,9 @@ import { handleSubmissions, isSubmissionPath } from './submission-http.js';
 import type { AssignmentSubmissionService } from './assignments/submissions/types.js';
 import { handleSubmissionReview, isSubmissionReviewPath } from './submission-review-http.js';
 import type { AssignmentReviewService } from './assignments/review/types.js';
+import { handleSourceUploads, isSourceUploadPath } from './source-upload-http.js';
+import { IngestionError } from './ingestion/types.js';
+import type { SourceUploadService } from './ingestion/upload.js';
 
 const MIB = 1024 * 1024;
 export interface LocalIdentity {
@@ -63,6 +66,8 @@ export interface ApiOptions {
   assignmentSubmissionService?: AssignmentSubmissionService;
   /** Explicit read-only author-teacher review; never implies Canvas delivery. */
   assignmentReviewService?: AssignmentReviewService;
+  /** Teacher-owned source intake; uploads remain quarantined until independent inspection. */
+  sourceUploadService?: SourceUploadService;
   keyEncryptionKey?: Buffer;
   keyManagementProvider?: KeyManagementProvider;
   tls?: { key: Buffer; cert: Buffer };
@@ -197,7 +202,8 @@ export function createApi(options: ApiOptions) {
     (options.assignmentService ||
       options.assignmentWorkService ||
       options.assignmentSubmissionService ||
-      options.assignmentReviewService) &&
+      options.assignmentReviewService ||
+      options.sourceUploadService) &&
     (!options.identityService || !options.lmsService)
   )
     throw new Error('Canvas assignments require authenticated identity and LMS launch services.');
@@ -439,6 +445,7 @@ export function createApi(options: ApiOptions) {
           assignmentWorkConfigured: Boolean(options.assignmentWorkService),
           assignmentSubmissionsConfigured: Boolean(options.assignmentSubmissionService),
           assignmentReviewConfigured: Boolean(options.assignmentReviewService),
+          sourceUploadsConfigured: Boolean(options.sourceUploadService),
         });
         return;
       }
@@ -483,6 +490,14 @@ export function createApi(options: ApiOptions) {
       limit(`user:${identity.tenantId}:${identity.userId}`, options.requestsPerMinute ?? 1200);
       if (path === '/api/assignments' || path.startsWith('/api/assignments/')) {
         routeName = '/api/assignments/:action';
+        if (isSourceUploadPath(path)) {
+          await handleSourceUploads(req, res, options.sourceUploadService, principal, async () => {
+            const fresh = await options.identityService!.authenticateRequest(req);
+            options.identityService!.verifyCsrf(req, fresh);
+            return fresh.principal;
+          });
+          return;
+        }
         if (isSubmissionReviewPath(path)) {
           await handleSubmissionReview(req, res, options.assignmentReviewService, principal);
           return;
@@ -1036,7 +1051,8 @@ export function createApi(options: ApiOptions) {
         error instanceof ApiError ||
         error instanceof IdentityError ||
         error instanceof SyncError ||
-        error instanceof AssignmentError;
+        error instanceof AssignmentError ||
+        error instanceof IngestionError;
       if (!expected)
         logger({ event: 'api_error', correlationId, code: 'integrity_or_service_failure' });
       if (expected && error.status === 429) res.setHeader('Retry-After', '60');

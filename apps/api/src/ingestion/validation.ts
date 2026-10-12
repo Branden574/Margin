@@ -2,6 +2,7 @@ import type { ArtifactReceipt } from '../cloud/types.js';
 import {
   IngestionError,
   type SourceReservationInput,
+  type SourceUploadInput,
   type InspectionReport,
   type SourcePageGeometry,
 } from './types.js';
@@ -57,6 +58,31 @@ function text(v: unknown, max: number): string {
   if (typeof v !== 'string' || v.length < 1 || v.length > max || /[\u0000-\u001f\u007f]/.test(v))
     throw new IngestionError(400, 'invalid_ingestion', 'Invalid bounded metadata.');
   return v;
+}
+function exactObject(value: unknown, keys: string[]): Record<string, unknown> {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
+    Object.keys(value).length !== keys.length ||
+    !keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+  )
+    throw new IngestionError(400, 'invalid_ingestion', 'Exact source upload fields are required.');
+  return value as Record<string, unknown>;
+}
+export function uploadReservation(value: unknown): SourceUploadInput {
+  const v = exactObject(value, ['requestId', 'metadata', 'plaintextBytes', 'plaintextSha256']);
+  const metadata = exactObject(v.metadata, ['name', 'mimeType']);
+  const name = text(metadata.name, 240);
+  if (metadata.mimeType !== 'application/pdf' || !name.trim())
+    throw new IngestionError(400, 'invalid_ingestion', 'A named source PDF is required.');
+  return {
+    requestId: id(v.requestId),
+    metadata: { name, mimeType: 'application/pdf' },
+    plaintextBytes: bytes(v.plaintextBytes),
+    plaintextSha256: digest(v.plaintextSha256),
+  };
 }
 export function reservation(v: SourceReservationInput): SourceReservationInput {
   if (!v || v.metadata?.mimeType !== 'application/pdf')

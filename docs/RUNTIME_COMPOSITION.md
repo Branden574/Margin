@@ -56,3 +56,9 @@ The signed journey covers teacher Deep Linking launch, authenticated assignment 
 The added journey authenticates the frozen answer after restart, excludes a later draft edit, checks exact hashes/source/pins and role boundaries, and still reports no Canvas confirmation. It also covers disabled capture, omitted pipeline services and cleanup failures. These are backend integration checks with synthetic launches and a generated source, not a restarted database process, a machine-power-loss test or a live platform connection.
 
 This is backend integration evidence. It does not establish browser Canvas framing/cookie behavior, connected author/student screens, production storage permissions, a scanner deployment, a scheduler, a live Canvas installation, recovery operations or 100,000-user capacity. New-source intake, environment-driven bootstrap and production deployment remain separate gates.
+
+## Teacher intake in the explicit local composition
+
+`startCanvasLocalApi` separately owns the ingestion upload coordinator and composes it into `createApi` as `sourceUploadService`. The generic runtime factory does not silently construct a storage uploader or inspector. The local entry point applies the same LTI/CSRF/current-course authorization used by authoring, uses encrypted local artifacts, and leaves new PDFs quarantined until real inspection. Migration 013 and its database-enforced accounting are required. See [teacher intake](INGESTION.md#teacher-pdf-uploads) and [explicit database upgrade](CANVAS_LOCAL_STARTUP.md#explicit-database-upgrade).
+
+The local runtime holds a database admission lease during startup and operation. Operator upgrades require exclusive maintenance and no other database clients; losing runtime admission starts orderly HTTP/worker shutdown. This mechanism coordinates the participating local processes, not arbitrary older binaries or distributed production deployments.

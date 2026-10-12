@@ -2,6 +2,7 @@ import { RequestScope, Transport } from '../assignment-work/transport';
 import { AssignmentWorkClientError, REQUEST_TIMEOUT_MS } from '../assignment-work/types';
 import { object } from '../assignment-work/decode';
 import * as decode from './decode';
+import { AuthorUploadTransport } from './upload-transport';
 import {
   AuthorClientError,
   type AssignmentAuthorClient,
@@ -10,6 +11,8 @@ import {
   type AuthorAssignment,
   type AuthorSession,
   type RequestOptions,
+  MAX_AUTHOR_UPLOAD_BYTES,
+  type AuthorUploadIntent,
 } from './types';
 export { AuthorClientError } from './types';
 export type * from './types';
@@ -43,6 +46,7 @@ const identity = (s: AuthorSession) =>
   ]);
 class Client implements AssignmentAuthorClient {
   private readonly transport: Transport;
+  private readonly uploadTransport: AuthorUploadTransport;
   private readonly origin: string;
   private readonly now: () => number;
   private readonly timeout: number;
@@ -87,6 +91,10 @@ class Client implements AssignmentAuthorClient {
       );
     this.origin = parsed.origin;
     this.transport = new Transport(this.origin, d.fetch ?? globalThis.fetch.bind(globalThis));
+    this.uploadTransport = new AuthorUploadTransport(
+      this.origin,
+      d.fetch ?? globalThis.fetch.bind(globalThis),
+    );
     this.now = d.now ?? Date.now;
     this.timeout = d.timeoutMs ?? REQUEST_TIMEOUT_MS;
     if (
@@ -163,6 +171,7 @@ class Client implements AssignmentAuthorClient {
           'selection_changed',
           'selection_expired',
           'session_expired',
+          'source_session_changed',
         ].includes(e.code)
       )
         this.dispose();
@@ -259,6 +268,60 @@ class Client implements AssignmentAuthorClient {
       const response = await this.transport.request(scope, path, 200);
       const result = decode.sources(await this.transport.json(scope, response, 16384));
       if (after !== undefined && result.nextCursor === after) decode.invalid();
+      await this.verify(scope);
+      return result;
+    });
+  }
+  reserveUpload(intent: AuthorUploadIntent, options: RequestOptions = {}) {
+    const snapshot = decode.uploadIntent(intent);
+    return this.run(options, async (scope) => {
+      this.bound();
+      const { session } = await this.verify(scope);
+      const response = await this.transport.request(
+        scope,
+        '/api/assignments/source-uploads',
+        [200, 202],
+        JSON.stringify(snapshot),
+        session.csrfToken,
+      );
+      const result = decode.uploadResult(await this.transport.json(scope, response, 16384));
+      if (result.upload.requestId !== snapshot.requestId) return decode.invalid();
+      await this.verify(scope);
+      return result;
+    });
+  }
+  uploadStatus(id: string, options: RequestOptions = {}) {
+    const checked = decode.id(id);
+    return this.run(options, async (scope) => {
+      this.bound();
+      await this.verify(scope);
+      const response = await this.transport.request(
+        scope,
+        `/api/assignments/source-uploads/${checked}`,
+        200,
+      );
+      const result = decode.uploadStatus(await this.transport.json(scope, response, 16384));
+      if (result.id !== checked) return decode.invalid();
+      await this.verify(scope);
+      return result;
+    });
+  }
+  uploadContent(id: string, content: Blob, options: RequestOptions = {}) {
+    const checked = decode.id(id);
+    if (
+      !(content instanceof Blob) ||
+      content.type !== 'application/pdf' ||
+      content.size < 1 ||
+      content.size > MAX_AUTHOR_UPLOAD_BYTES
+    )
+      throw new AuthorClientError('invalid_upload', 'Choose a PDF up to 100 MB.');
+    return this.run(options, async (scope) => {
+      this.bound();
+      const { session } = await this.verify(scope);
+      const result = decode.uploadResult(
+        await this.uploadTransport.put(scope, checked, content, session.csrfToken),
+      );
+      if (result.upload.id !== checked) return decode.invalid();
       await this.verify(scope);
       return result;
     });

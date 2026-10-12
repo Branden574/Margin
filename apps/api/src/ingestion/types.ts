@@ -7,6 +7,9 @@ import type {
 export type IngestionStatus = 'pending' | 'quarantined' | 'ready' | 'rejected';
 export const SOURCE_CATALOG_PAGE_SIZE = 5;
 export const SOURCE_CATALOG_TIMEOUT_MS = 25_000;
+/** Reservations are durable capacity claims; revoked/rejected sources are not reclaimed yet. */
+export const SOURCE_UPLOAD_COUNT_LIMIT = 100;
+export const SOURCE_UPLOAD_BYTE_LIMIT = 512 * 1024 * 1024;
 export interface SourceCatalogPosition {
   documentId: string;
   versionId: string;
@@ -23,6 +26,19 @@ export interface SourceReservation {
   identity: ArtifactIdentity;
   status: IngestionStatus;
   duplicate: boolean;
+}
+/** Identity and course scope are supplied only by the authenticated server session. */
+export interface SourceUploadInput {
+  requestId: string;
+  metadata: ArtifactMetadata;
+  plaintextBytes: number;
+  plaintextSha256: string;
+}
+/** Server-only storage contract. Do not expose expected hashes or storage identities as a receipt. */
+export interface SourceUploadDetails {
+  identity: ArtifactIdentity;
+  status: IngestionStatus;
+  expected: SourceUploadInput;
 }
 export interface InspectionClaim {
   identity: ArtifactIdentity;

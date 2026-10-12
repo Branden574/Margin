@@ -25,6 +25,8 @@ import {
 import { createApi } from '../apps/api/src/server';
 import { LocalKeyProvider } from '../apps/api/src/encryption';
 import { LocalEncryptedArtifactRepository } from '../apps/api/src/local-artifacts';
+import { artifactPath } from '../apps/api/src/cloud/envelope';
+import { TeacherSourceUploadService } from '../apps/api/src/ingestion/upload';
 import { PostgresAssignmentSubmissionService } from '../apps/api/src/assignments/submissions';
 import { PostgresSubmissionProcessor } from '../apps/api/src/assignments/submissions/processing';
 import { PostgresAssignmentReviewService } from '../apps/api/src/assignments/review';
@@ -38,6 +40,7 @@ import { createCookieCrypto } from '../apps/api/src/identity/crypto';
 import { PostgresLmsRepository, lmsLookupDigest } from '../apps/api/src/lms';
 import {
   IngestionAssignmentSourceGateway,
+  IngestionAssignmentSourceCatalog,
   PostgresIngestionRepository,
   SourceInspectionWorker,
   type SourceScanner,
@@ -88,6 +91,7 @@ let runtime: CanvasRuntime,
 let sources: IngestionAssignmentSourceGateway,
   scanner: SourceInspectionWorker,
   worker: StudentWorkProvisioningWorker;
+let sourceUploads: TeacherSourceUploadService | undefined;
 let signer: AssignmentDeepLinkSigner,
   platformPrivate: CryptoKey,
   platformKeys: ReturnType<typeof createLocalJWKSet>,
@@ -139,6 +143,7 @@ const dependencies = () => ({
   keys,
   artifacts: activeArtifacts,
   sources,
+  sourceCatalog: new IngestionAssignmentSourceCatalog(ingest),
   signer,
   oidcTests: { testFetch: discovery },
   resolveLmsKey: () => platformKeys,
@@ -178,6 +183,7 @@ function useArtifacts(repository: typeof activeArtifacts) {
 function serveRuntime() {
   const api = createApi({
     ...runtime.apiServices,
+    sourceUploadService: sourceUploads,
     dataDirectory: join(directory, 'filestore'),
     keyManagementProvider: keys,
     tls,
@@ -204,7 +210,7 @@ interface Reply {
 }
 function request(
   path: string,
-  options: { method?: string; body?: string; headers?: Record<string, string> } = {},
+  options: { method?: string; body?: string | Buffer; headers?: Record<string, string> } = {},
 ): Promise<Reply> {
   return new Promise((resolve, reject) => {
     const req = httpsRequest(
@@ -266,7 +272,7 @@ function json(path: string, who: Session, value: unknown) {
     },
   });
 }
-async function seed() {
+async function seed(sourceShell = true) {
   const f = {
     org: randomUUID(),
     installation: randomUUID(),
@@ -332,10 +338,11 @@ async function seed() {
       [f.installation, f.org, f.course, user, role],
     );
   }
+  if (!sourceShell) return f;
   const client = await admin.connect();
   try {
     await client.query('BEGIN');
-    // Fixture administration supplies the currently absent teacher intake bridge; no fake upload API.
+    // Legacy prepared-source fixtures only. The HTTPS intake journey opts out of this seeding.
     await client.query(
       "INSERT INTO margin_sync.documents(organization_id,id,owner_id,current_version_id,audience) VALUES($1,$2,$3,$4,'teachers')",
       [f.org, f.documentId, f.teacher, f.versionId],
@@ -441,7 +448,7 @@ async function teacherSource(f: Fixture, inspect = true) {
   if (inspect) expect(await scanner.runOne()).toMatchObject({ status: 'ready' });
   return { teacher, reserved };
 }
-const assignmentInput = (f: Fixture) => ({
+const assignmentInput = (f: { documentId: string; versionId: string }) => ({
   requestId: randomUUID(),
   documentId: f.documentId,
   versionId: f.versionId,
@@ -559,6 +566,7 @@ describe.skipIf(!available)(
         '010-submission-materialization.sql',
         '011-submission-outcomes.sql',
         '012-submission-review.sql',
+        '013-teacher-source-intake.sql',
       ])
         await admin.query(
           readFileSync(new URL('../infra/migrations/' + migration, import.meta.url), 'utf8'),
@@ -655,6 +663,7 @@ describe.skipIf(!available)(
           }),
         );
       const results = await Promise.allSettled([
+        sourceUploads?.close(),
         runtime?.close(),
         ingest?.close(),
         reader?.close(),
@@ -751,6 +760,222 @@ describe.skipIf(!available)(
       expect(unconfigured.status).toBe(503);
       expect(unconfigured.json.error.code).toBe('submission_unconfigured');
     });
+    it('composes a signed teacher HTTPS upload through real PostgreSQL quarantine, filesystem restart, known-fixture inspection, discovery and assignment creation', async () => {
+      const rootDirectory = join(directory, 'teacher-upload-artifacts');
+      const network = vi
+        .spyOn(globalThis, 'fetch')
+        .mockRejectedValue(
+          new Error('This signed synthetic journey has no live Canvas or identity transport.'),
+        );
+      let store = new LocalEncryptedArtifactRepository({
+        rootDirectory,
+        keyManagementProvider: keys,
+      });
+      useArtifacts(store);
+      sourceUploads = new TeacherSourceUploadService(ingest, store);
+      try {
+        await replaceRuntime(submissionConfig());
+        // Only institution/user enrollment fixtures are installed. No prepared document, artifact,
+        // object receipt, source approval or geometry is supplied by administration for this journey.
+        const f = await seed(false);
+        expect(
+          (
+            await admin.query(
+              'SELECT count(*) FROM margin_sync.documents WHERE organization_id=$1',
+              [f.org],
+            )
+          ).rows[0].count,
+        ).toBe('0');
+        const teacher = await session(await complete(f, await begin(f, true)));
+        expect(teacher.principal).toMatchObject({
+          userId: f.teacher,
+          organizationId: f.org,
+          role: 'teacher',
+          authenticationMethod: 'lti',
+        });
+        const requested = {
+          requestId: randomUUID(),
+          metadata: { name: 'Signed teacher uploaded fixture.pdf', mimeType: 'application/pdf' },
+          plaintextBytes: body.length,
+          plaintextSha256: hash(body),
+        };
+        const reserved = await json('/api/assignments/source-uploads', teacher, requested);
+        expect(reserved.status, reserved.text).toBe(202);
+        expect(reserved.json).toEqual({
+          upload: { id: expect.any(String), requestId: requested.requestId, status: 'pending' },
+          duplicate: false,
+        });
+        const path = '/api/assignments/source-uploads/' + reserved.json.upload.id;
+        const headers = { cookie: teacher.cookie };
+        const details = await ingest.uploadDetails(teacher.principal, reserved.json.upload.id);
+        expect(details).not.toBeNull();
+        const source = {
+          ...f,
+          documentId: details!.identity.documentId,
+          versionId: details!.identity.versionId,
+        };
+        expect(
+          (
+            await admin.query(
+              'SELECT owner_id,origin FROM margin_sync.documents WHERE organization_id=$1 AND id=$2',
+              [f.org, source.documentId],
+            )
+          ).rows[0],
+        ).toEqual({ owner_id: f.teacher, origin: 'lms-source' });
+        expect((await request('/api/assignments/sources', { headers })).json.sources).toEqual([]);
+        const upload = () =>
+          request(path + '/content', {
+            method: 'PUT',
+            body,
+            headers: {
+              ...headers,
+              origin,
+              'x-csrf-token': teacher.csrf,
+              'content-type': 'application/pdf',
+            },
+          });
+        const stored = await upload();
+        expect(stored.status, stored.text).toBe(202);
+        expect(stored.json).toEqual({
+          upload: { ...reserved.json.upload, status: 'quarantined' },
+          duplicate: false,
+        });
+        const status = await request(path, { headers });
+        expect(status.status, status.text).toBe(200);
+        expect(status.json).toEqual({ upload: stored.json.upload });
+        expect(status.headers['cache-control']).toBe('no-store');
+        expect((await request('/api/assignments/sources', { headers })).json.sources).toEqual([]);
+        const premature = await json('/api/assignments', teacher, assignmentInput(source));
+        expect(premature.status, premature.text).toBe(409);
+        expect(premature.json.error.code).toBe('source_not_ready');
+        expect(
+          (
+            await admin.query(
+              'SELECT count(*) FROM margin_ingestion.inspection_receipts r JOIN margin_ingestion.artifacts a USING(artifact_id) WHERE a.organization_id=$1',
+              [f.org],
+            )
+          ).rows[0].count,
+        ).toBe('0');
+        const objectPath = join(rootDirectory, artifactPath(details!.identity));
+        const ciphertext = readFileSync(objectPath);
+        expect(ciphertext.includes(body)).toBe(false);
+        const savedReceipt = (
+          await admin.query(
+            'SELECT ciphertext,nonce,tag,wrapped_key FROM margin_ingestion.storage_receipts WHERE artifact_id=$1',
+            [reserved.json.upload.id],
+          )
+        ).rows[0];
+
+        // Recreate the actual service graph, ingestion pool and ciphertext adapter. The verified
+        // teacher cookie, reservation identity and exact stored receipt must survive the restart.
+        delegate = undefined;
+        await sourceUploads.close();
+        await runtime.close();
+        await store.close();
+        await ingest.close();
+        ingest = new PostgresIngestionRepository(database('compose_ingest'), keys, 'runtime');
+        store = new LocalEncryptedArtifactRepository({
+          rootDirectory,
+          keyManagementProvider: keys,
+        });
+        useArtifacts(store);
+        sourceUploads = new TeacherSourceUploadService(ingest, store);
+        await replaceRuntime(submissionConfig());
+        const retriedReservation = await json(
+          '/api/assignments/source-uploads',
+          teacher,
+          requested,
+        );
+        expect(retriedReservation.status, retriedReservation.text).toBe(202);
+        expect(retriedReservation.json).toEqual({ ...stored.json, duplicate: true });
+        const retry = await upload();
+        expect(retry.status, retry.text).toBe(202);
+        expect(retry.json).toEqual({ ...stored.json, duplicate: true });
+        expect(readFileSync(objectPath)).toEqual(ciphertext);
+        expect(
+          (
+            await admin.query(
+              'SELECT ciphertext,nonce,tag,wrapped_key FROM margin_ingestion.storage_receipts WHERE artifact_id=$1',
+              [reserved.json.upload.id],
+            )
+          ).rows[0],
+        ).toEqual(savedReceipt);
+        expect(
+          (
+            await admin.query(
+              'SELECT count(*) FROM margin_ingestion.upload_reservations WHERE organization_id=$1',
+              [f.org],
+            )
+          ).rows[0].count,
+        ).toBe('1');
+
+        // This is explicitly NOT a real malware scanner. The injected inspector accepts only
+        // the exact generated fixture bytes, then the actual worker stores authenticated geometry.
+        const inspect = vi.spyOn(fixtureScanner, 'inspect');
+        const inspected = await scanner.runOne();
+        expect(inspected).toMatchObject({ status: 'ready' });
+        expect(
+          (
+            await admin.query(
+              'SELECT artifact_id,verdict FROM margin_ingestion.inspection_receipts WHERE id=$1',
+              [inspected!.id],
+            )
+          ).rows[0],
+        ).toEqual({ artifact_id: reserved.json.upload.id, verdict: 'ready' });
+        expect(inspect).toHaveBeenCalledOnce();
+        const ready = await request(path, { headers });
+        expect(ready.json.upload).toEqual({ ...reserved.json.upload, status: 'ready' });
+        const discovered = await request('/api/assignments/sources', { headers });
+        expect(discovered.status, discovered.text).toBe(200);
+        expect(discovered.json).toEqual({
+          sources: [
+            {
+              documentId: source.documentId,
+              versionId: source.versionId,
+              name: requested.metadata.name,
+              pageCount: 1,
+              bytes: body.length,
+              inspection: 'approved',
+              availability: 'not-checked',
+            },
+          ],
+          nextCursor: null,
+        });
+        const created = await json(
+          '/api/assignments',
+          teacher,
+          assignmentInput({ ...source, ...discovered.json.sources[0] }),
+        );
+        expect(created.status, created.text).toBe(201);
+        expect(created.json.assignment.title).toBe(assignmentInput(source).title);
+        expect(created.json.assignment).not.toHaveProperty('source');
+        expect(created.json.assignment).not.toHaveProperty('documentId');
+        const assignment = (
+          await admin.query(
+            'SELECT source_document_id,source_version_id,created_by,course_id FROM margin_assignments.assignments WHERE id=$1',
+            [created.json.assignment.id],
+          )
+        ).rows[0];
+        expect(assignment).toEqual({
+          source_document_id: source.documentId,
+          source_version_id: source.versionId,
+          created_by: f.teacher,
+          course_id: f.course,
+        });
+        expect((await request('/api/documents', { headers })).status).toBe(403);
+        expect(network).not.toHaveBeenCalled();
+      } finally {
+        delegate = undefined;
+        await sourceUploads?.close();
+        sourceUploads = undefined;
+        await runtime.close();
+        await store.close();
+        useArtifacts(artifacts.repository);
+        await replaceRuntime(config());
+        network.mockRestore();
+      }
+    }, 60_000);
+
     it('captures and reviews the frozen prefix through signed LTI-only HTTPS launches after a filesystem-backed restart', async () => {
       const rootDirectory = join(directory, 'submission-artifacts');
       const network = vi

@@ -9,9 +9,13 @@ import { canonical } from '../sync/validation.js';
 import {
   IngestionError,
   SOURCE_CATALOG_PAGE_SIZE,
+  SOURCE_UPLOAD_BYTE_LIMIT,
+  SOURCE_UPLOAD_COUNT_LIMIT,
   type SourceCatalogPosition,
   type SourceReservationInput,
   type SourceReservation,
+  type SourceUploadInput,
+  type SourceUploadDetails,
   type InspectionClaim,
   type InspectionReport,
   type InspectionReceipt,
@@ -21,6 +25,7 @@ import {
   id,
   digest,
   reservation,
+  uploadReservation,
   receipt,
   report,
   geometry,
@@ -72,7 +77,18 @@ interface ReadyRows {
 }
 interface PrivateReservation extends SourceReservationInput {
   fingerprint: string;
+  intake?: 'teacher-upload-v1';
 }
+const uploadFingerprint = (input: SourceUploadInput) =>
+  hash(canonical(['teacher-upload-v1', input]));
+const checkUploadSignal = (signal?: AbortSignal) => {
+  if (signal?.aborted)
+    throw new IngestionError(
+      503,
+      'ingestion_cancelled',
+      'The source upload request was cancelled.',
+    );
+};
 const scanBinding = (s: Pick<ScanRow, 'id' | 'claim_id' | 'attempt' | 'verdict'>) =>
   canonical([s.id, s.claim_id, s.attempt, s.verdict]);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -333,6 +349,15 @@ export class PostgresIngestionRepository {
         discard = true;
       }
       const code = (e as { code?: string }).code;
+      if (
+        code === '23514' &&
+        (e as { constraint?: string }).constraint === 'upload_reservation_capacity_limit'
+      )
+        throw new IngestionError(
+          429,
+          'ingestion_limit',
+          'The source upload capacity for this teacher and course has been reached.',
+        );
       if (code === '23505')
         throw new IngestionError(
           409,
@@ -382,22 +407,22 @@ export class PostgresIngestionRepository {
         );
       await ctx(c, 'installation_id', b.installation_id);
       await ctx(c, 'course_id', b.course_id);
-      const check = async () => {
-        if (
-          !(await c.query<{ ok: boolean }>('SELECT margin_ingestion.active_teacher() AS ok'))
-            .rows[0]?.ok
-        )
-          throw new IngestionError(
-            403,
-            'ingestion_revoked',
-            'Current course access has changed. Launch again from Canvas.',
-          );
-      };
-      await check();
+      await this.checkTeacher(c);
       const result = await run(c, b);
-      await check();
+      await this.checkTeacher(c);
       return result;
     });
+  }
+  private async checkTeacher(c: PoolClient) {
+    if (
+      !(await c.query<{ ok: boolean }>('SELECT margin_ingestion.active_teacher() AS ok')).rows[0]
+        ?.ok
+    )
+      throw new IngestionError(
+        403,
+        'ingestion_revoked',
+        'Current course access has changed. Launch again from Canvas.',
+      );
   }
   private async seal(
     kind: string,
@@ -480,7 +505,7 @@ export class PostgresIngestionRepository {
       ).rows[0];
       if (existing) {
         const data = await this.open<PrivateReservation>('reservation', existing, existing);
-        if (data.fingerprint !== fingerprint)
+        if (data.intake !== undefined || data.fingerprint !== fingerprint)
           throw new IngestionError(
             409,
             'idempotency_conflict',
@@ -553,6 +578,180 @@ export class PostgresIngestionRepository {
       );
       return { identity: identity(r), status: 'pending', duplicate: false };
     });
+  }
+  private async authenticatedUpload(c: PoolClient, r: Row): Promise<SourceUploadInput | null> {
+    const data = await this.open<PrivateReservation>('reservation', r, r);
+    await this.checkTeacher(c);
+    if (data.intake !== 'teacher-upload-v1') return null;
+    try {
+      const expected = uploadReservation({
+        requestId: data.requestId,
+        metadata: data.metadata,
+        plaintextBytes: data.plaintextBytes,
+        plaintextSha256: data.plaintextSha256,
+      });
+      const accounting = (
+        await c.query<{ plaintext_bytes: string }>(
+          'SELECT plaintext_bytes FROM margin_ingestion.upload_reservations WHERE artifact_id=$1',
+          [r.artifact_id],
+        )
+      ).rows[0];
+      if (
+        data.documentId !== r.document_id ||
+        data.versionId !== r.version_id ||
+        expected.requestId !== r.request_id ||
+        data.fingerprint !== uploadFingerprint(expected) ||
+        Number(accounting?.plaintext_bytes) !== expected.plaintextBytes
+      )
+        throw new Error('Reservation binding mismatch');
+      return expected;
+    } catch {
+      throw new IngestionError(
+        503,
+        'ingestion_integrity',
+        'Encrypted source metadata could not be authenticated.',
+      );
+    }
+  }
+  /** Reserve a new teacher-owned source; callers cannot nominate a document, course or owner. */
+  async reserveUpload(
+    principal: SessionPrincipal,
+    input: SourceUploadInput,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<SourceReservation> {
+    const p = { ...principal },
+      parsed = uploadReservation(input);
+    const fingerprint = uploadFingerprint(parsed),
+      signal = options.signal;
+    checkUploadSignal(signal);
+    const result = await this.teacher(p, async (c, b) => {
+      checkUploadSignal(signal);
+      // Share the legacy reservation lock so the request ID cannot race either entry point.
+      // Owner-wide serialization also serializes each narrower owner/course capacity account.
+      await c.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+        canonical([p.organizationId, p.userId, 'source-reservations']),
+      ]);
+      const existing = (
+        await c.query<Row>(
+          'SELECT * FROM margin_ingestion.artifacts WHERE organization_id=$1 AND owner_id=$2 AND request_id=$3',
+          [p.organizationId, p.userId, parsed.requestId],
+        )
+      ).rows[0];
+      if (existing) {
+        const expected = await this.authenticatedUpload(c, existing);
+        if (!expected || uploadFingerprint(expected) !== fingerprint)
+          throw new IngestionError(
+            409,
+            'idempotency_conflict',
+            'The request identifier belongs to another source.',
+          );
+        checkUploadSignal(signal);
+        return {
+          identity: identity(existing),
+          status: await this.status(c, existing),
+          duplicate: true,
+        };
+      }
+      const capacity = (
+        await c.query<{ count: string; bytes: string }>(
+          'SELECT count(*) AS count,coalesce(sum(plaintext_bytes),0) AS bytes FROM margin_ingestion.upload_reservations WHERE organization_id=$1 AND owner_id=$2 AND installation_id=$3 AND course_id=$4',
+          [p.organizationId, p.userId, b.installation_id, b.course_id],
+        )
+      ).rows[0];
+      if (
+        Number(capacity.count) >= SOURCE_UPLOAD_COUNT_LIMIT ||
+        Number(capacity.bytes) + parsed.plaintextBytes > SOURCE_UPLOAD_BYTE_LIMIT
+      )
+        throw new IngestionError(
+          429,
+          'ingestion_limit',
+          'The source upload capacity for this teacher and course has been reached.',
+        );
+      const r = {
+        artifact_id: randomUUID(),
+        organization_id: p.organizationId,
+        document_id: randomUUID(),
+        version_id: randomUUID(),
+        owner_id: p.userId,
+        ...b,
+        request_id: parsed.requestId,
+      } as Row;
+      const e = await this.seal('reservation', r, {
+        ...parsed,
+        documentId: r.document_id,
+        versionId: r.version_id,
+        fingerprint,
+        intake: 'teacher-upload-v1',
+      });
+      checkUploadSignal(signal);
+      await this.checkTeacher(c);
+      await c.query(
+        "INSERT INTO margin_sync.documents(organization_id,id,owner_id,current_version_id,audience,origin) VALUES($1,$2,$3,$4,'teachers','lms-source')",
+        [r.organization_id, r.document_id, r.owner_id, r.version_id],
+      );
+      await c.query(
+        'INSERT INTO margin_sync.versions(organization_id,document_id,id) VALUES($1,$2,$3)',
+        [r.organization_id, r.document_id, r.version_id],
+      );
+      await c.query(
+        "INSERT INTO margin_sync.grants(organization_id,document_id,user_id,permission) VALUES($1,$2,$3,'owner')",
+        [r.organization_id, r.document_id, r.owner_id],
+      );
+      await c.query(
+        'INSERT INTO margin_ingestion.artifacts(artifact_id,organization_id,document_id,version_id,owner_id,installation_id,course_id,registration_version,request_id,ciphertext,nonce,tag,wrapped_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
+        [
+          r.artifact_id,
+          r.organization_id,
+          r.document_id,
+          r.version_id,
+          r.owner_id,
+          r.installation_id,
+          r.course_id,
+          r.registration_version,
+          r.request_id,
+          e.ciphertext,
+          e.nonce,
+          e.tag,
+          e.wrapped_key,
+        ],
+      );
+      await c.query(
+        'INSERT INTO margin_ingestion.upload_reservations(artifact_id,organization_id,owner_id,installation_id,course_id,plaintext_bytes) VALUES($1,$2,$3,$4,$5,$6)',
+        [
+          r.artifact_id,
+          r.organization_id,
+          r.owner_id,
+          r.installation_id,
+          r.course_id,
+          parsed.plaintextBytes,
+        ],
+      );
+      checkUploadSignal(signal);
+      return { identity: identity(r), status: 'pending' as const, duplicate: false };
+    });
+    checkUploadSignal(signal);
+    return result;
+  }
+  /** Trusted server storage input only; possession of an artifact ID never grants access. */
+  async uploadDetails(
+    principal: SessionPrincipal,
+    artifactId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<SourceUploadDetails | null> {
+    const p = { ...principal },
+      artifact = id(artifactId),
+      signal = options.signal;
+    checkUploadSignal(signal);
+    const result = await this.teacher(p, async (c) => {
+      checkUploadSignal(signal);
+      const r = await this.row(c, artifact);
+      if (!r) return null;
+      const expected = await this.authenticatedUpload(c, r);
+      checkUploadSignal(signal);
+      return expected ? { identity: identity(r), status: await this.status(c, r), expected } : null;
+    });
+    checkUploadSignal(signal);
+    return result;
   }
   /** Trusted server call only, after authenticated storage returned a full receipt. Never mount with client receipt JSON. */
   async stageConfirmed(

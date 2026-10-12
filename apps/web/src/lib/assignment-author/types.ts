@@ -30,6 +30,22 @@ export interface AuthorSourcePage {
   sources: AuthorSource[];
   nextCursor: string | null;
 }
+export const MAX_AUTHOR_UPLOAD_BYTES = 100 * 1024 * 1024;
+export interface AuthorUploadIntent {
+  requestId: string;
+  metadata: { name: string; mimeType: 'application/pdf' };
+  plaintextBytes: number;
+  plaintextSha256: string;
+}
+export interface AuthorUpload {
+  id: string;
+  requestId: string;
+  status: 'pending' | 'quarantined' | 'ready' | 'rejected';
+}
+export interface AuthorUploadResult {
+  upload: AuthorUpload;
+  duplicate: boolean;
+}
 export interface AuthorDraft {
   documentId: string;
   versionId: string;
@@ -68,6 +84,9 @@ export class AuthorClientError extends Error {
 export interface AssignmentAuthorClient {
   open(options?: RequestOptions): Promise<AuthorContext>;
   sources(after?: string, options?: RequestOptions): Promise<AuthorSourcePage>;
+  reserveUpload(intent: AuthorUploadIntent, options?: RequestOptions): Promise<AuthorUploadResult>;
+  uploadContent(id: string, content: Blob, options?: RequestOptions): Promise<AuthorUploadResult>;
+  uploadStatus(id: string, options?: RequestOptions): Promise<AuthorUpload>;
   create(
     draft: AuthorDraft,
     requestId: string,

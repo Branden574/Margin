@@ -167,7 +167,7 @@ describe.skipIf(!available)(
           });
           expect(
             (await db.query('SELECT count(*) FROM margin_local.migrations')).rows[0].count,
-          ).toBe('12');
+          ).toBe('13');
           expect(
             Number(
               (await db.query('SELECT count(*) FROM margin_local.policy_contract')).rows[0].count,

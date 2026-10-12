@@ -48,7 +48,22 @@ npm run setup:canvas -- start
 
 Data and credentials remain on disk. There is no background launch agent or automatic boot startup. The API's default configuration is `.local/canvas/config.json`; an explicit absolute configuration path can be passed after `--`.
 
-Certificate maintenance is still an operator gap: setup issues a 30-day PostgreSQL server leaf and copies the existing API leaf with its original expiry. There is no supported renewal command yet. Expired database TLS prevents the verified operator connection used by start/stop checks; expired API TLS prevents application startup. Preserve the directory and keys rather than resetting the installation or disabling TLS checks. Certificate renewal and additive database upgrades must be implemented before this setup is treated as a long-lived environment.
+Certificate maintenance is still an operator gap: setup issues a 30-day PostgreSQL server leaf and copies the existing API leaf with its original expiry. There is no supported renewal command yet. Expired database TLS prevents the verified operator connection used by start/stop checks; expired API TLS prevents application startup. Preserve the directory and keys rather than resetting the installation or disabling TLS checks. Certificate renewal must be implemented before this setup is treated as a long-lived environment. The explicit additive upgrade described below does not renew certificates.
+
+## Explicit database upgrade
+
+Fresh setup installs migrations 001–013. An existing verified 001–012 installation is preserved by ordinary setup/start; upgrading is a separate operator action. Stop the Canvas API, workers and every other client of its dedicated database, then run:
+
+```sh
+npm run setup:canvas -- upgrade
+npm run dev:canvas:api
+```
+
+The upgrade accepts only the reviewed 012→013 transition. It requires an exclusive database maintenance lease and no other active clients, creates a private logical database backup, then commits the migration, exact ledger and policy baseline in one transaction. Existing keys, credentials, configuration and encrypted artifact files stay in place. A verified rerun on 013 performs no additional migration or backup. Unsupported versions, drift and incomplete directories are refused without resetting them.
+
+Backup output is capped at 2 GiB while writing, with a 60-second process deadline and bounded diagnostics. An interrupted backup is retained without an accepted recovery manifest, and no migration starts. Backups remain under the private `.local/canvas/backups/` directory with their checksum and restoration notes. The database archive does not include global PostgreSQL roles, filesystem artifacts or secret files: retain the original protected root as well. Restore into a separate recovery database and validate it before any deliberate cutover; this command never automatically overwrites the working database. Backup retention and automated disaster recovery remain separate work.
+
+Current runtime processes hold a shared maintenance lease. Losing that database connection stops HTTP/worker admission and drains their actual work before resources close. Older binaries do not participate in this lease, so they must be stopped explicitly before maintenance.
 
 ## Startup and shutdown checks
 
@@ -61,7 +76,7 @@ Provisioning and materialization run sequentially in one process. Cancellation d
 ## Still required before a live Canvas workflow
 
 - A real private Canvas instance, trusted HTTPS routing for each caller, LTI developer-key/deployment registration, and explicit Margin installation/account/course/enrollment mappings.
-- Teacher source intake connected to the ingestion registry and an isolated structural validator/malware scanner. Startup never seeds ready-source approvals; the synthetic test inspector must never process user uploads.
+- An isolated structural validator/malware scanner connected to the teacher source intake registry. Startup never seeds ready-source approvals; the synthetic test inspector must never process user uploads.
 - Public-key registration or an appropriate published JWKS endpoint. Tool signing keys persist; the runtime exposes public-only JWKS to its caller, but this command does not publish a public HTTP JWKS route.
 - Confirmed Canvas submission delivery, teacher feedback release, roster/grade integration and institution-specific testing.
 

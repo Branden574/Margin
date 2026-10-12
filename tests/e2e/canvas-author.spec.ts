@@ -33,6 +33,94 @@ test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: 'ignoreErrors' });
 });
 
+test('teacher authority revoked while the source catalog opens leaves recovery guidance without a page error', async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await install(page);
+  await page.route('**/api/assignments/sources', (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        error: { code: 'session_revoked', message: 'The synthetic teacher session was revoked.' },
+      }),
+    }),
+  );
+  await page.goto('/');
+  await unlockWorkspace(page);
+  await page.goto('/canvas/author');
+  await unlockWorkspace(page);
+  await expect(
+    page.getByRole('heading', { name: 'Reopen assignment setup from Canvas', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Upload PDF', exact: true })).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test('synthetic teacher upload recovers an unknown transfer and appears only after explicit document approval', async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  const fixture = await install(page);
+  await openAuthor(page);
+  await enterDraft(page);
+  fixture.state.loseNextContentResponse = true;
+  await expect(page.getByRole('button', { name: 'Upload PDF', exact: true })).toBeEnabled();
+  await page.locator('.canvas-author-upload input[type="file"]').setInputFiles({
+    name: 'Synthetic uploaded worksheet.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.7\nSynthetic upload recovery fixture\n%%EOF'),
+  });
+  await expect(page.getByRole('button', { name: 'Retry saved upload', exact: true })).toBeEnabled();
+  expect(fixture.transfers).toHaveLength(1);
+  await expect(page.getByRole('button', { name: /Synthetic uploaded worksheet\.pdf/ })).toHaveCount(
+    0,
+  );
+  await page.reload();
+  await unlockWorkspace(page);
+  await expect(
+    page.getByRole('button', { name: 'Resume saved upload', exact: true }),
+  ).toBeEnabled();
+  await expect(page.getByLabel('Assignment title', { exact: true })).toHaveValue(
+    'Synthetic teacher assignment',
+  );
+  await page.getByRole('button', { name: 'Resume saved upload', exact: true }).click();
+  await expect(page.getByText('Waiting for document checks', { exact: true })).toBeVisible();
+  expect(fixture.transfers).toHaveLength(1);
+  expect(fixture.statusReads).toHaveLength(1);
+  await expect(page.getByRole('button', { name: /Synthetic uploaded worksheet\.pdf/ })).toHaveCount(
+    0,
+  );
+  fixture.approveUpload();
+  await page.getByRole('button', { name: 'Check upload status', exact: true }).click();
+  await expect(page.getByText('Document ready', { exact: true })).toBeVisible();
+  const approved = page.getByRole('button', { name: /Synthetic uploaded worksheet\.pdf/ });
+  await expect(approved).toBeEnabled();
+  await approved.click();
+  await expect(page.getByLabel('Assignment title', { exact: true })).toHaveValue(
+    'Synthetic teacher assignment',
+  );
+  await expect(page.getByLabel(/Instructions/)).toHaveValue(
+    'Read the document and explain your answer.',
+  );
+  expect(fixture.uploads.size).toBe(1);
+  expect(fixture.transfers).toHaveLength(1);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(page.getByRole('button', { name: 'Upload another PDF', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+  const axe = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+    .analyze();
+  expect(axe.violations).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
 test('teacher source pagination, encrypted reload, explicit creation and native Canvas return', async ({
   page,
 }) => {

@@ -262,3 +262,15 @@ Screenshots: `.local/manual-checks/lti-account-settings.jpg` and `lti-account-ex
 - Direct browser navigation to `/api/health` was blocked by the client; this was recorded rather than bypassed. The normal workspace page loaded and the proxy's JSON health response was verified using an explicit CA HTTPS request.
 
 Screenshots: `.local/manual-checks/canvas-startup-home.jpg` and `canvas-startup-separate-origin.jpg`. This verifies preview availability and origin isolation, not an end-to-end live Canvas workflow or a new manual pass of every feature.
+
+## Teacher upload and encrypted recovery — October 11, 2026
+
+Used the original trusted HTTPS workspace on port 5173 with a temporary synthetic loopback authoring API. The existing vault and 21 documents were retained; a distinct synthetic selection kept this walkthrough separate from earlier author drafts. The uploaded 2,034-byte PDF was a generated QA fixture. No actual school, scanner or Canvas server participated.
+
+- Selected an existing source, entered a title/instructions, and uploaded the synthetic PDF through the actual file chooser. An intentionally lost transfer acknowledgement displayed **Retry saved upload** and retained the encrypted recovery copy. The upload did not appear as an approved selectable source.
+- Reloaded, unlocked and observed **Resume saved upload** with the original title, instructions and source selection preserved. Resume changed to **Waiting for document checks** without exposing the quarantined file in the picker.
+- Changed only the synthetic server's approval state and selected **Check upload status**. The UI displayed **Document ready** and refreshed its approved list. Selecting the new source preserved title/instructions; **Create assignment** reached **Ready for Canvas review**. No real Canvas return or submission was attempted.
+- At 390×844 and 1280×900, rendered page width equaled viewport width, the upload controls were visible, and the document list/detail layout adapted without horizontal overflow. The temporary viewport override was reset.
+- Stopped the synthetic API, restored the ordinary API and returned to the unlocked original workspace with **All files 21** visible.
+
+Screenshots: `.local/manual-checks/teacher-upload-interrupted.jpg`, `teacher-upload-mobile.jpg`, `teacher-upload-ready.jpg`, and `teacher-upload-created.jpg`. These prove the interacted-with UI and encrypted recovery against a synthetic transport. Real HTTPS/storage/PostgreSQL checks are recorded separately; this is not all-feature manual coverage or live scan/Canvas evidence.

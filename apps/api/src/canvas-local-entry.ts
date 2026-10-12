@@ -30,6 +30,16 @@ if (args.length > 1) {
           `Canvas ${worker} worker deferred a job; the durable queue controls retry.\n`,
         ),
     });
+    const admissionLost = () => {
+      if (stop.signal.aborted) return;
+      process.stderr.write(
+        'Local Canvas stopped accepting requests because its database maintenance lease was lost. Restart after database readiness is restored.\n',
+      );
+      process.exitCode = 1;
+      shutdown();
+    };
+    runtime.signal.addEventListener('abort', admissionLost, { once: true });
+    if (runtime.signal.aborted) admissionLost();
     if (stop.signal.aborted) shutdown();
     else
       process.stdout.write(
