@@ -48,6 +48,8 @@ npm run setup:canvas -- start
 
 Data and credentials remain on disk. There is no background launch agent or automatic boot startup. The API's default configuration is `.local/canvas/config.json`; an explicit absolute configuration path can be passed after `--`.
 
+Certificate maintenance is still an operator gap: setup issues a 30-day PostgreSQL server leaf and copies the existing API leaf with its original expiry. There is no supported renewal command yet. Expired database TLS prevents the verified operator connection used by start/stop checks; expired API TLS prevents application startup. Preserve the directory and keys rather than resetting the installation or disabling TLS checks. Certificate renewal and additive database upgrades must be implemented before this setup is treated as a long-lived environment.
+
 ## Startup and shutdown checks
 
 The loader bounds input sizes, rejects duplicate JSON properties and unsupported fields, validates private file ownership and certificate purpose, requires independent keys and distinct database logins, and rejects production or disabled TLS verification. Environment connection options do not replace the configured values.

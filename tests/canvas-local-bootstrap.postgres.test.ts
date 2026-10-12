@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from 'pg';
+import { postgresTlsToolsAvailable } from './helpers/postgres-tools';
 import { loadCanvasLocalConfig } from '../apps/api/src/canvas-local/config';
 import {
   bootCanvasLocal,
@@ -28,24 +29,18 @@ import {
   type CanvasBootstrapReceipt,
 } from '../apps/api/src/canvas-local/bootstrap';
 
-const available = ['initdb', 'pg_ctl', 'openssl'].every((name) => {
-  try {
-    execFileSync(name, ['--version'], { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
+const available = postgresTlsToolsAvailable('Canvas bootstrap');
+async function freePort(excluded: number[] = []) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    if (![5174, 5432, ...excluded].includes(port)) return port;
   }
-});
-if (!available && process.env.MARGIN_REQUIRE_POSTGRES_TESTS === '1')
-  throw new Error('Required Canvas bootstrap PostgreSQL/TLS tooling is unavailable.');
-async function freePort() {
-  const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as { port: number }).port;
-  await new Promise<void>((resolve, reject) =>
-    server.close((error) => (error ? reject(error) : resolve())),
-  );
-  return port;
+  throw new Error('Could not select separate loopback ports for the disposable fixture.');
 }
 let directory: string, options: CanvasBootstrapOptions, saved: CanvasBootstrapReceipt;
 async function connection(role = 'operator', tls = true) {
@@ -87,7 +82,7 @@ describe.skipIf(!available)(
       const tls = ensureLocalTls(join(directory, 'api-tls'));
       options = {
         rootDirectory: join(directory, 'canvas'),
-        postgresPort: await freePort(),
+        postgresPort: await freePort([4101]),
         apiPort: 4101,
         applicationOrigin: 'https://127.0.0.1:5174',
         apiTls: { keyFile: tls.keyPath, certFile: tls.certPath },
@@ -312,9 +307,12 @@ describe.skipIf(!available)(
         await writeFile(path, old);
         old.fill(0);
       }
-      await expect(bootCanvasLocal({ ...options, postgresPort: await freePort() })).rejects.toThrow(
-        'differs from the requested',
-      );
+      await expect(
+        bootCanvasLocal({
+          ...options,
+          postgresPort: await freePort([options.apiPort, options.postgresPort]),
+        }),
+      ).rejects.toThrow('differs from the requested');
     });
     it('preserves and refuses a foreign nonempty root, incomplete setup, and symlink root', async () => {
       const foreign = join(directory, 'foreign');
@@ -496,7 +494,11 @@ describe.skipIf(!available)(
       } as Client['query']);
       try {
         await expect(
-          bootCanvasLocal({ ...options, rootDirectory, postgresPort: await freePort() }),
+          bootCanvasLocal({
+            ...options,
+            rootDirectory,
+            postgresPort: await freePort([options.apiPort]),
+          }),
         ).rejects.toThrow('synthetic setup interruption');
       } finally {
         spy.mockRestore();

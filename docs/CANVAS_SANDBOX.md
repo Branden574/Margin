@@ -4,7 +4,7 @@ For development without institutional administrator access, use a private Canvas
 
 Instructure documents a [Docker development setup](https://github.com/instructure/canvas-lms/blob/master/doc/docker/getting_docker.md) and its [development environment](https://github.com/instructure/canvas-lms/blob/master/doc/docker/README.md). The macOS instructions require at least 8 GB of memory allocated to Docker. The documented default `http://canvas.docker` needs additional HTTPS configuration for Margin's strict issuer/endpoint checks. Do not deploy a development installation as the public school service.
 
-The development Mac currently has Docker tooling installed but its daemon was unavailable at the October 8 check. No Canvas installation, account, paid service, public tunnel or certificate trust change was made for this checkpoint. The existing personal workspace remains at its original browser origin and retains its own encrypted vault. On October 11, the separate persistent Margin database/API/web startup was verified locally; Canvas itself is still not installed.
+The October 11 read-only environment check found Docker Desktop running on ARM64 with about 7.75 GiB allocated memory and 30 GiB of host disk space free. Existing unrelated containers were left running; no images were pulled or pruned. These are point-in-time measurements, not a demonstrated Canvas resource budget. The separate persistent Margin database/API/web startup was verified locally; Canvas itself is still not installed. No Canvas account, paid service, public tunnel or certificate trust change was made. The existing personal workspace remains at its original browser origin and retains its own encrypted vault.
 
 ## Margin prerequisites
 

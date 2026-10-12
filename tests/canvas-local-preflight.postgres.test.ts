@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from 'pg';
+import { postgresTlsToolsAvailable } from './helpers/postgres-tools';
 import {
   bootCanvasLocal,
   stopCanvasLocal,
@@ -20,24 +20,18 @@ import {
   type CanvasDatabases,
 } from '../apps/api/src/canvas-local/preflight';
 
-const available = ['initdb', 'pg_ctl', 'openssl'].every((name) => {
-  try {
-    execFileSync(name, ['--version'], { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
+const available = postgresTlsToolsAvailable('Canvas preflight');
+async function freePort(excluded: number[] = []) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    if (![5174, 5432, ...excluded].includes(port)) return port;
   }
-});
-if (!available && process.env.MARGIN_REQUIRE_POSTGRES_TESTS === '1')
-  throw new Error('Required Canvas preflight PostgreSQL/TLS tooling is unavailable.');
-async function freePort() {
-  const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as { port: number }).port;
-  await new Promise<void>((resolve, reject) =>
-    server.close((error) => (error ? reject(error) : resolve())),
-  );
-  return port;
+  throw new Error('Could not select separate loopback ports for the disposable fixture.');
 }
 let directory: string, saved: CanvasBootstrapReceipt, admin: Client, apiCa: Buffer;
 let loaded: Awaited<ReturnType<typeof loadCanvasLocalConfig>>;
@@ -77,10 +71,11 @@ async function altered(sql: string, restore: string, test: () => Promise<void>) 
 async function serverSetting(name: 'ssl' | 'fsync' | 'full_page_writes', enabled: boolean) {
   await admin.query(enabled ? `ALTER SYSTEM RESET ${name}` : `ALTER SYSTEM SET ${name}='off'`);
   await admin.query('SELECT pg_reload_conf()');
-  for (let attempt = 0; attempt < 40; attempt++) {
+  const deadline = performance.now() + 5000;
+  do {
     if ((await admin.query(`SHOW ${name}`)).rows[0][name] === (enabled ? 'on' : 'off')) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+  } while (performance.now() < deadline);
   throw new Error('Disposable PostgreSQL did not reload its test setting.');
 }
 describe.skipIf(!available)(
@@ -96,7 +91,7 @@ describe.skipIf(!available)(
       apiCa = await readFile(tls.certPath);
       saved = await bootCanvasLocal({
         rootDirectory: join(directory, 'canvas'),
-        postgresPort: await freePort(),
+        postgresPort: await freePort([4101]),
         apiPort: 4101,
         applicationOrigin: 'https://127.0.0.1:5174',
         apiTls: { keyFile: tls.keyPath, certFile: tls.certPath },
@@ -162,8 +157,8 @@ describe.skipIf(!available)(
     });
 
     it('refuses a real PostgreSQL server with TLS disabled instead of downgrading to plaintext', async () => {
-      await serverSetting('ssl', false);
       try {
+        await serverSetting('ssl', false);
         await rejects(config(), 'identity', 'connection');
       } finally {
         await serverSetting('ssl', true);
@@ -439,8 +434,8 @@ describe.skipIf(!available)(
     it.each(['fsync', 'full_page_writes'] as const)(
       'rejects a real PostgreSQL server with %s disabled',
       async (setting) => {
-        await serverSetting(setting, false);
         try {
+          await serverSetting(setting, false);
           await rejects(config(), 'identity', 'durability');
         } finally {
           await serverSetting(setting, true);

@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { request } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from 'pg';
+import { postgresTlsToolsAvailable } from './helpers/postgres-tools';
 import {
   bootCanvasLocal,
   stopCanvasLocal,
@@ -13,24 +13,18 @@ import {
 } from '../apps/api/src/canvas-local/bootstrap';
 import { startCanvasLocalApi } from '../apps/api/src/runtime-canvas-local';
 
-const available = ['initdb', 'pg_ctl', 'openssl'].every((name) => {
-  try {
-    execFileSync(name, ['--version'], { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
+const available = postgresTlsToolsAvailable('persistent Canvas runtime');
+async function freePort(excluded: number[] = []) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    if (![5174, 5432, ...excluded].includes(port)) return port;
   }
-});
-if (!available && process.env.MARGIN_REQUIRE_POSTGRES_TESTS === '1')
-  throw new Error('Required persistent Canvas runtime PostgreSQL/TLS tools are unavailable.');
-async function freePort() {
-  const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as { port: number }).port;
-  await new Promise<void>((resolve, reject) =>
-    server.close((error) => (error ? reject(error) : resolve())),
-  );
-  return port;
+  throw new Error('Could not select separate loopback ports for the disposable fixture.');
 }
 let directory: string, saved: CanvasBootstrapReceipt, ca: Buffer, apiPort: number;
 let runtime: Awaited<ReturnType<typeof startCanvasLocalApi>> | undefined;
@@ -81,7 +75,7 @@ describe.skipIf(!available)(
       apiPort = await freePort();
       saved = await bootCanvasLocal({
         rootDirectory: join(directory, 'canvas'),
-        postgresPort: await freePort(),
+        postgresPort: await freePort([apiPort]),
         apiPort,
         applicationOrigin: 'https://127.0.0.1:5174',
         apiTls: { keyFile: tls.keyPath, certFile: tls.certPath },
