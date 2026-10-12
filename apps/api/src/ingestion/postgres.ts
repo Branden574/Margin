@@ -293,6 +293,11 @@ export class PostgresIngestionRepository {
       statement_timeout: 5000,
       idle_in_transaction_session_timeout: 5000,
     });
+    // pg removes a broken idle client before emitting this event. Without a
+    // listener EventEmitter would crash the process outside any job promise.
+    // A later transaction obtains a fresh connection; active query failures still
+    // reject through tx(). Never publish native database diagnostics here.
+    this.pool.on('error', () => {});
   }
   close() {
     return this.pool.end();
@@ -308,6 +313,23 @@ export class PostgresIngestionRepository {
   private async tx<T>(run: (c: PoolClient) => Promise<T>): Promise<T> {
     const c = await this.pool.connect();
     let discard = false;
+    let disconnected = false;
+    // pg detaches its pool listener while a client is checked out. A transport
+    // error can arrive between queries (for example while unwrapping a key),
+    // so own that event until release restores the pool's idle listener.
+    const onConnectionError = () => {
+      disconnected = true;
+      discard = true;
+    };
+    const requireConnection = () => {
+      if (disconnected)
+        throw new IngestionError(
+          503,
+          'ingestion_unavailable',
+          'Ingestion storage is unavailable. Retry the same operation.',
+        );
+    };
+    c.on('error', onConnectionError);
     try {
       await c.query('BEGIN');
       await c.query("SET LOCAL synchronous_commit='on'");
@@ -340,7 +362,9 @@ export class PostgresIngestionRepository {
           'Ingestion requires separate least-privilege credentials and durable PostgreSQL settings.',
         );
       const result = await run(c);
+      requireConnection();
       await c.query('COMMIT');
+      requireConnection();
       return result;
     } catch (e) {
       try {
@@ -348,6 +372,7 @@ export class PostgresIngestionRepository {
       } catch {
         discard = true;
       }
+      requireConnection();
       const code = (e as { code?: string }).code;
       if (
         code === '23514' &&
@@ -372,7 +397,11 @@ export class PostgresIngestionRepository {
         );
       throw e;
     } finally {
-      c.release(discard);
+      try {
+        c.release(discard);
+      } finally {
+        c.removeListener('error', onConnectionError);
+      }
     }
   }
   private async teacher<T>(

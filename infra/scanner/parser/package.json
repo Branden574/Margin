@@ -1,0 +1,9 @@
+{
+  "name": "margin-isolated-pdf-parser",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "pdfjs-dist": "6.3.289"
+  }
+}

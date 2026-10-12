@@ -389,6 +389,117 @@ async function locked<T>(root: string, work: () => Promise<T>) {
     await rmdir(path);
   }
 }
+
+/** Operator-only verification; this checks all saved protected-file hashes and reads no database. */
+export async function readCanvasLocalInstallation(
+  rootDirectory: string,
+): Promise<CanvasBootstrapReceipt> {
+  assertLocalEnvironment();
+  return receipt(await canonicalRoot(rootDirectory, false));
+}
+
+export interface CanvasLocalMaintenanceContext {
+  readonly root: string;
+  readonly receipt: CanvasBootstrapReceipt;
+  readonly client: Client;
+  /** Current connection's admission; read again after an explicitly successful reconnect. */
+  readonly signal: AbortSignal;
+  /** Reconnect only to reconcile an uncertain operation, rechecking admission and installation. */
+  reconnect(): Promise<Client>;
+}
+/** Additive operator tasks share the bootstrap lock and exclusive database admission. */
+export async function withCanvasLocalMaintenance<T>(
+  rootDirectory: string,
+  work: (context: CanvasLocalMaintenanceContext) => Promise<T>,
+): Promise<T> {
+  assertLocalEnvironment();
+  const root = await canonicalRoot(rootDirectory, false);
+  return locked(root, async () => {
+    const saved = await receipt(root);
+    if (!(await running(saved.dataDirectory)))
+      fail('Start the owned Canvas database before adding a local companion service.');
+    let current: Client | undefined;
+    let admission = new AbortController();
+    const detach = new Map<Client, () => void>();
+    const endCurrent = async () => {
+      admission.abort(
+        new CanvasBootstrapError(
+          'Canvas maintenance admission ended or is reconnecting. Recheck the current admission before continuing.',
+        ),
+      );
+      const prior = current;
+      current = undefined;
+      if (!prior) return;
+      detach.get(prior)?.();
+      detach.delete(prior);
+      // Ending a failed pg connection must never turn a late error into an uncaught exception.
+      prior.on('error', () => {});
+      await prior.end().catch(() => {});
+    };
+    const reconnect = async (): Promise<Client> => {
+      await endCurrent();
+      const unchanged = await receipt(root);
+      if (JSON.stringify(unchanged) !== JSON.stringify(saved))
+        fail('The original Canvas installation changed before maintenance could reconnect.');
+      const next = await operator(root);
+      const connectionAdmission = new AbortController();
+      const lost = () =>
+        connectionAdmission.abort(
+          new CanvasBootstrapError(
+            'Canvas maintenance admission was lost. Preserve the companion journal and reconcile before continuing.',
+          ),
+        );
+      next.on('error', lost);
+      next.on('end', lost);
+      detach.set(next, () => {
+        next.off('error', lost);
+        next.off('end', lost);
+      });
+      try {
+        await serverIdentity(next, saved.dataDirectory, saved.systemIdentifier);
+        await acquireCanvasMaintenance(next);
+        if ((await supportedLedger(next, saved.instanceId)) !== 13)
+          fail(
+            'Upgrade the owned Canvas database to migration 13 before adding a companion service.',
+          );
+        connectionAdmission.signal.throwIfAborted();
+        current = next;
+        admission = connectionAdmission;
+        return next;
+      } catch (error) {
+        await next.end().catch(() => {});
+        detach.get(next)?.();
+        detach.delete(next);
+        throw error;
+      }
+    };
+    try {
+      await reconnect();
+      const result = await work({
+        root,
+        receipt: saved,
+        get client() {
+          admission.signal.throwIfAborted();
+          return current!;
+        },
+        get signal() {
+          return admission.signal;
+        },
+        reconnect,
+      });
+      admission.signal.throwIfAborted();
+      // Companion publication must preserve the original bootstrap, migration and policy contract.
+      const unchanged = await receipt(root);
+      if (JSON.stringify(unchanged) !== JSON.stringify(saved))
+        fail('The original Canvas installation receipt changed during companion setup.');
+      await ledger(current!, saved.instanceId);
+      admission.signal.throwIfAborted();
+      return result;
+    } finally {
+      await endCurrent();
+    }
+  });
+}
 export async function startCanvasLocal(rootDirectory: string) {
   assertLocalEnvironment();
   const root = await canonicalRoot(rootDirectory, false);

@@ -69,6 +69,8 @@ Connect actual structural validation and malware scanning. Keep quarantine close
 
 **Exit evidence:** real object-store and scanner integration; malformed/bomb/pathological corpus contained within limits; process termination cleanup; storage/queue outages and retry/replay; refresh/reconnect upload continuity; shared quota correctness; ready/quarantine access enforcement. Initial 100-concurrent-upload staging test precedes increasing load.
 
+**Local checkpoint:** teacher PDF reservations, encrypted upload recovery and a durable quarantine queue now connect to an optional isolated qpdf/PDF.js and ClamAV sidecar. Real-engine tests cover bounded malformed/active content, EICAR detection, cancellation cleanup and the signed synthetic-identity HTTPS/PostgreSQL upload-to-assignment journey. This completes a local slice of P3; production object-store operation, automatic engine/definition maintenance, broader efficacy and load qualification remain open. See [scanner boundaries](SCANNER.md).
+
 ## P4 — Add OCR, conversion and rich document inputs
 
 **Scope:** B4, B6.3–B6.5, B7, B13.3–B13.4, S33.02/S33.06–08.

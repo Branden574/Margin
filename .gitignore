@@ -16,4 +16,5 @@ test-results/
 *.p12
 *.pfx
 margin-sbom.json
+margin-parser-sbom.json
 apps/web/public/ocr/

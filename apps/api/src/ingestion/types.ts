@@ -83,6 +83,9 @@ export interface ArtifactReader {
 }
 /** Implement in a resource-limited isolated scanner. This module supplies no malware engine. */
 export interface SourceScanner {
+  /** Real providers check current definitions and engine availability before claiming work.
+   * Optional only for compatibility with existing explicitly synthetic scanner fixtures. */
+  ready?(signal: AbortSignal): Promise<void>;
   inspect(
     bytes: Uint8Array,
     signal: AbortSignal,

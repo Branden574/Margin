@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!validate.cc
+!qpdf-bounds.hh
+!runner.mjs
+!package.json
+!package-lock.json

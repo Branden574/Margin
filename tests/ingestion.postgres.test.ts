@@ -11,7 +11,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { Pool } from 'pg';
+import { Client, Pool } from 'pg';
 import { LocalKeyProvider, type KeyManagementProvider } from '../apps/api/src/encryption';
 import {
   PostgresIngestionRepository,
@@ -659,6 +659,140 @@ describe.skipIf(!available)(
         await fresh.close();
       }
     });
+    it.each(['claim', 'decision'] as const)(
+      'discards a checked-out client lost after %s writes and recovers the durable queue',
+      async (phase) => {
+        const s = await staged();
+        const previousClaim = phase === 'decision' ? (await inspector.claimNext())! : undefined;
+        const applicationName = 'ingestion-disconnect-' + randomUUID();
+        const disconnecting = new PostgresIngestionRepository(
+          { ...config('ingestion_inspector_test'), application_name: applicationName },
+          kms,
+          'inspector',
+        );
+        const targetSql =
+          phase === 'claim'
+            ? 'UPDATE margin_ingestion.inspection_jobs SET attempt=attempt+1'
+            : 'UPDATE margin_ingestion.inspection_jobs SET status=$2';
+        let release!: () => void;
+        let reached!: () => void;
+        let errorObserved = false;
+        let intercept = true;
+        let disconnectedPid: number | undefined;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        const written = new Promise<void>((resolve) => (reached = resolve));
+        const originalQuery = Client.prototype.query;
+        const querySpy = vi.spyOn(Client.prototype, 'query').mockImplementation(async function (
+          this: Client,
+          ...args: unknown[]
+        ) {
+          const result = await Reflect.apply(originalQuery, this, args);
+          if (intercept && String(args[0]).startsWith(targetSql)) {
+            intercept = false;
+            disconnectedPid = (
+              await Reflect.apply(originalQuery, this, ['SELECT pg_backend_pid() AS pid'])
+            ).rows[0].pid as number;
+            const originalEmit = this.emit;
+            // Observe the real pg event without installing a test error listener:
+            // an unhandled EventEmitter error must still fail this regression.
+            vi.spyOn(this, 'emit').mockImplementation(function (
+              this: Client,
+              event: string | symbol,
+              ...values: unknown[]
+            ) {
+              if (event === 'error') errorObserved = true;
+              return Reflect.apply(originalEmit, this, [event, ...values]);
+            });
+            reached();
+            // SQL has changed real rows, but the transaction has not committed.
+            await gate;
+          }
+          return result;
+        } as Client['query']);
+        let settled = false;
+        const operation = (
+          previousClaim
+            ? disconnecting.complete(previousClaim, goodReport())
+            : disconnecting.claimNext()
+        ).then(
+          (value) => ({ value, error: undefined }),
+          (error: unknown) => ({ value: undefined, error }),
+        );
+        void operation.then(() => (settled = true));
+        try {
+          await written;
+          await expect
+            .poll(
+              async () =>
+                (
+                  await admin.query(
+                    'SELECT state FROM pg_stat_activity WHERE pid=$1 AND application_name=$2',
+                    [disconnectedPid, applicationName],
+                  )
+                ).rows[0]?.state,
+              { timeout: 3000 },
+            )
+            .toBe('idle in transaction');
+          expect(
+            (await admin.query('SELECT pg_terminate_backend($1) AS terminated', [disconnectedPid]))
+              .rows[0].terminated,
+          ).toBe(true);
+          await expect.poll(() => errorObserved, { timeout: 5000 }).toBe(true);
+          expect(settled).toBe(false);
+          release();
+          const result = await operation;
+          expect(result.value).toBeUndefined();
+          expect(result.error).toMatchObject({ status: 503, code: 'ingestion_unavailable' });
+          expect((result.error as Error).message).not.toMatch(/terminat|backend|socket|password/i);
+          const job = (
+            await admin.query(
+              'SELECT status,attempt,claim_id,scan_receipt_id FROM margin_ingestion.inspection_jobs WHERE artifact_id=$1',
+              [s.reserved.identity.artifactId],
+            )
+          ).rows[0];
+          expect(job).toEqual({
+            status: 'quarantined',
+            attempt: previousClaim ? 1 : 0,
+            claim_id: previousClaim?.claimId ?? null,
+            scan_receipt_id: null,
+          });
+          expect(
+            (
+              await admin.query(
+                'SELECT count(*)::integer AS count FROM margin_ingestion.inspection_receipts WHERE artifact_id=$1',
+                [s.reserved.identity.artifactId],
+              )
+            ).rows[0].count,
+          ).toBe(0);
+          expect(await gateway().resolveForTeacher(p, s.input)).toBeNull();
+
+          // The same repository must replace the discarded connection. A failed
+          // claim did not consume an attempt; a failed decision retains its claim.
+          const recoveredClaim = previousClaim ?? (await disconnecting.claimNext())!;
+          expect(recoveredClaim.attempt).toBe(1);
+          const completed = await disconnecting.complete(recoveredClaim, goodReport());
+          expect(completed.status).toBe('ready');
+          expect(await disconnecting.complete(recoveredClaim, goodReport())).toEqual({
+            ...completed,
+            duplicate: true,
+          });
+          const replacement = (
+            await admin.query('SELECT pid FROM pg_stat_activity WHERE application_name=$1', [
+              applicationName,
+            ])
+          ).rows;
+          expect(replacement).toHaveLength(1);
+          expect(replacement[0].pid).not.toBe(disconnectedPid);
+        } finally {
+          release();
+          await operation;
+          querySpy.mockRestore();
+          vi.restoreAllMocks();
+          await disconnecting.close();
+        }
+      },
+      15000,
+    );
     it('runs a bounded worker flow with an explicitly synthetic clean scanner and clears plaintext', async () => {
       const s = await staged();
       let captured: Uint8Array | undefined;

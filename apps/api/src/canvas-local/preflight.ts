@@ -4,6 +4,7 @@ import { CANVAS_DATABASE_ROLES, CANVAS_MIGRATIONS, migrationManifest } from './b
 import { CANVAS_DATABASE_PURPOSES, type CanvasDatabasePurpose } from './config.js';
 
 export type CanvasDatabases = Record<CanvasDatabasePurpose, PoolConfig>;
+export type CanvasReadinessPurpose = CanvasDatabasePurpose | 'inspector';
 type Check =
   | 'configuration'
   | 'connection'
@@ -17,7 +18,7 @@ type Check =
 export class CanvasDatabasePreflightError extends Error {
   readonly code = 'canvas_database_not_ready';
   constructor(
-    readonly purpose: CanvasDatabasePurpose,
+    readonly purpose: CanvasReadinessPurpose,
     readonly check: Check,
   ) {
     super(
@@ -60,11 +61,14 @@ const permittedOptions = new Set([
   'application_name',
   'connectionTimeoutMillis',
 ]);
-function configuration(input: CanvasDatabases): CanvasDatabases {
-  const result = {} as CanvasDatabases;
+function configuration<P extends CanvasReadinessPurpose>(
+  input: Record<P, PoolConfig>,
+  purposes: readonly P[],
+): Record<P, PoolConfig> {
+  const result = {} as Record<P, PoolConfig>;
   let endpoint: string | undefined;
   const users = new Set<string>();
-  for (const purpose of CANVAS_DATABASE_PURPOSES) {
+  for (const purpose of purposes) {
     const c = input?.[purpose],
       ssl = c?.ssl;
     if (
@@ -524,33 +528,76 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
   if (!constraint?.valid) throw Error('Submission constraint drift');
 }
 
-/** Read-only startup checks for the local 001–012 installation. This checks explicit critical
+interface ReadinessOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+export interface CanvasInspectorReadinessOptions extends ReadinessOptions {
+  instanceId: string;
+  /** Operator-verified receipt context. This check does not require pg_control_system access.
+   * Runtime identity is established by certificate-verified TLS, database/login and instanceId. */
+  systemIdentifier?: string;
+}
+
+/** Read-only startup checks for the local 001–013 installation. This checks explicit critical
  * objects, not a complete schema/ACL fingerprint, live Canvas registration, or capacity readiness.
  * Every credential is verified over TLS, including tests; no account or migration is applied. */
 export async function assertCanvasDatabaseReady(
   input: CanvasDatabases,
-  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  options: ReadinessOptions = {},
 ): Promise<void> {
+  await assertReady(input, CANVAS_DATABASE_PURPOSES, CANVAS_DATABASE_ROLES, options);
+}
+
+/** Independent restricted inspection login: no API/operator credentials or catalog-control grant. */
+export async function assertCanvasInspectorReady(
+  database: PoolConfig,
+  options: CanvasInspectorReadinessOptions,
+): Promise<void> {
+  if (
+    !options ||
+    typeof options.instanceId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(options.instanceId) ||
+    (options.systemIdentifier !== undefined &&
+      (typeof options.systemIdentifier !== 'string' ||
+        !/^[0-9]{1,20}$/.test(options.systemIdentifier)))
+  )
+    throw new CanvasDatabasePreflightError('inspector', 'configuration');
+  await assertReady(
+    { inspector: database },
+    ['inspector'],
+    { inspector: 'margin_ingestion_inspector' },
+    { signal: options.signal, timeoutMs: options.timeoutMs, instanceId: options.instanceId },
+  );
+}
+
+async function assertReady<P extends CanvasReadinessPurpose>(
+  input: Record<P, PoolConfig>,
+  purposes: readonly P[],
+  roles: Record<P, string>,
+  options: ReadinessOptions & { instanceId?: string },
+): Promise<void> {
+  const first = purposes[0];
   const timeoutMs = options.timeoutMs ?? 30000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000)
-    throw new CanvasDatabasePreflightError('identity', 'configuration');
+    throw new CanvasDatabasePreflightError(first, 'configuration');
   const deadline = Date.now() + timeoutMs;
-  const active = (purpose: CanvasDatabasePurpose) => {
+  const active = (purpose: CanvasReadinessPurpose) => {
     if (options.signal?.aborted) throw new CanvasDatabasePreflightError(purpose, 'cancelled');
     if (Date.now() >= deadline) throw new CanvasDatabasePreflightError(purpose, 'deadline');
   };
-  active('identity');
-  const databases = configuration(input);
+  active(first);
+  const databases = configuration(input, purposes);
   let expectedManifest: Awaited<ReturnType<typeof migrationManifest>>,
     contract: Awaited<ReturnType<typeof schemaContract>>;
   try {
     [expectedManifest, contract] = await Promise.all([migrationManifest(), schemaContract()]);
   } catch {
-    throw new CanvasDatabasePreflightError('identity', 'schema');
+    throw new CanvasDatabasePreflightError(first, 'schema');
   }
   let databaseIdentity: string | undefined;
   const logins = new Set<string>();
-  for (const purpose of CANVAS_DATABASE_PURPOSES) {
+  for (const purpose of purposes) {
     active(purpose);
     const pool = new Pool({
       ...databases[purpose],
@@ -593,7 +640,7 @@ export async function assertCanvasDatabaseReady(
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY');
       await client.query("SET LOCAL lock_timeout='2s'");
       check = 'role';
-      await role(client, CANVAS_DATABASE_ROLES[purpose]);
+      await role(client, roles[purpose]);
       check = 'installation';
       const manifest = (
         await client.query(
@@ -612,7 +659,8 @@ export async function assertCanvasDatabaseReady(
         installation.length !== 1 ||
         installation[0].id !== 1 ||
         installation[0].schema_version !== 1 ||
-        !/^[0-9a-f-]{36}$/.test(installation[0].instance_id)
+        !/^[0-9a-f-]{36}$/.test(installation[0].instance_id) ||
+        (options.instanceId !== undefined && installation[0].instance_id !== options.instanceId)
       )
         throw Error('Installation identity missing');
       const identity = (

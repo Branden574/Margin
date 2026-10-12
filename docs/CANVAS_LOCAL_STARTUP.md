@@ -73,10 +73,16 @@ Before listening, the API performs bounded read-only database checks for all ten
 
 Provisioning and materialization run sequentially in one process. Cancellation does not release admission while the underlying job is still running. Shutdown stops new HTTP/worker admission, closes idle connections, allows active responses ten seconds before closing their sockets, and then awaits actual route/worker work before closing repositories, artifact storage and owned key buffers. It does not claim an unconditional shutdown deadline for an uncooperative dependency. Immutable JavaScript strings and OpenSSL key objects remain subject to garbage collection.
 
+## Optional source inspection worker
+
+The API queues teacher uploads in quarantine. A separate [local source inspector](SCANNER.md) runs the reviewed PDF parser and ClamAV images, using official signed definitions and a dedicated restricted database login. Its explicit setup requires stopping clients of this dedicated database for a maintenance lease. It adds private companion files under `.local/canvas/scanner/` while preserving the existing bootstrap, API credentials, keys and artifacts.
+
+After following the scanner build, definition-update and setup instructions, run `npm run dev:canvas:scanner` in another terminal. Starting the API alone does not start this worker. The ordinary API's `scanningConfigured` health field describes its own composition; it does not discover this separate process or report its current readiness. The worker checks its engines and fresh definitions before claiming jobs, and shutdown retains ownership until actual work and container cleanup finish. It has no automatic boot startup or scheduled definition refresh.
+
 ## Still required before a live Canvas workflow
 
 - A real private Canvas instance, trusted HTTPS routing for each caller, LTI developer-key/deployment registration, and explicit Margin installation/account/course/enrollment mappings.
-- An isolated structural validator/malware scanner connected to the teacher source intake registry. Startup never seeds ready-source approvals; the synthetic test inspector must never process user uploads.
+- Configure and operate the separate source inspector with current definitions. Startup never seeds ready-source approvals; synthetic test inspectors must never process user uploads. Local engine tests do not qualify a production malware service.
 - Public-key registration or an appropriate published JWKS endpoint. Tool signing keys persist; the runtime exposes public-only JWKS to its caller, but this command does not publish a public HTTP JWKS route.
 - Confirmed Canvas submission delivery, teacher feedback release, roster/grade integration and institution-specific testing.
 

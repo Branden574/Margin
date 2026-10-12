@@ -3,7 +3,8 @@ import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Client } from 'pg';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { Client, type PoolConfig } from 'pg';
 import { postgresTlsToolsAvailable } from './helpers/postgres-tools';
 import {
   bootCanvasLocal,
@@ -16,6 +17,7 @@ import {
 } from '../apps/api/src/canvas-local/config';
 import {
   assertCanvasDatabaseReady,
+  assertCanvasInspectorReady,
   CanvasDatabasePreflightError,
   type CanvasDatabases,
 } from '../apps/api/src/canvas-local/preflight';
@@ -35,6 +37,29 @@ async function freePort(excluded: number[] = []) {
 }
 let directory: string, saved: CanvasBootstrapReceipt, admin: Client, apiCa: Buffer;
 let loaded: Awaited<ReturnType<typeof loadCanvasLocalConfig>>;
+const inspectorPassword = randomBytes(32).toString('hex');
+function inspector(): PoolConfig {
+  return {
+    ...loaded.configuration.databases.ingestion,
+    user: 'margin_canvas_inspector_probe',
+    password: inspectorPassword,
+  };
+}
+async function inspectorRejects(check: string, database = inspector()) {
+  let failure: unknown;
+  try {
+    await assertCanvasInspectorReady(database, { instanceId: saved.instanceId });
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(CanvasDatabasePreflightError);
+  expect(failure).toMatchObject({ code: 'canvas_database_not_ready', purpose: 'inspector', check });
+  const visible = String(failure) + JSON.stringify(failure);
+  expect(visible).not.toContain(inspectorPassword);
+  if (typeof database.password === 'string') expect(visible).not.toContain(database.password);
+  expect(visible).not.toContain(String(database.user));
+  expect(failure).not.toHaveProperty('cause');
+}
 function config(): CanvasDatabases {
   return Object.fromEntries(
     CANVAS_DATABASE_PURPOSES.map((purpose) => [
@@ -112,6 +137,9 @@ describe.skipIf(!available)(
         },
       });
       await admin.connect();
+      await admin.query(
+        `CREATE ROLE margin_canvas_inspector_probe LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${inspectorPassword}'; GRANT margin_ingestion_inspector TO margin_canvas_inspector_probe; GRANT CONNECT ON DATABASE margin_canvas TO margin_canvas_inspector_probe; GRANT USAGE ON SCHEMA margin_local TO margin_ingestion_inspector; GRANT SELECT ON margin_local.installation,margin_local.migrations,margin_local.policy_contract TO margin_ingestion_inspector`,
+      );
     }, 60000);
     afterAll(async () => {
       loaded?.dispose();
@@ -137,6 +165,189 @@ describe.skipIf(!available)(
         ).rows[0].count,
       ).toBe('0');
     });
+
+    it('independently accepts an inspector login without granting operator control or supplying the ten API credentials', async () => {
+      // PostgreSQL versions differ in the PUBLIC default for this catalog
+      // function. Prove readiness does not depend on it even when revoked.
+      const publicExecute = (
+        await admin.query(
+          "SELECT EXISTS(SELECT 1 FROM pg_proc p CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) a WHERE p.oid='pg_control_system()'::regprocedure AND a.grantee=0 AND a.privilege_type='EXECUTE') AS allowed",
+        )
+      ).rows[0].allowed as boolean;
+      await admin.query('REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC');
+      try {
+        await expect(
+          assertCanvasInspectorReady(inspector(), {
+            instanceId: saved.instanceId,
+            systemIdentifier: saved.systemIdentifier,
+          }),
+        ).resolves.toBeUndefined();
+        const client = new Client(inspector());
+        await client.connect();
+        try {
+          const row = (
+            await client.query(
+              "SELECT current_user AS login,has_function_privilege(current_user,'pg_control_system()','EXECUTE') AS control",
+            )
+          ).rows[0];
+          expect(row).toEqual({ login: 'margin_canvas_inspector_probe', control: false });
+          await expect(client.query('SELECT * FROM pg_control_system()')).rejects.toMatchObject({
+            code: '42501',
+          });
+        } finally {
+          await client.end();
+        }
+      } finally {
+        if (publicExecute)
+          await admin.query('GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO PUBLIC');
+      }
+      expect(
+        (await admin.query('SELECT count(*) FROM margin_ingestion.artifacts')).rows[0].count,
+      ).toBe('0');
+    });
+
+    it('requires the exact operator-created installation instance for the inspector', async () => {
+      await expect(
+        assertCanvasInspectorReady(inspector(), { instanceId: randomUUID() }),
+      ).rejects.toMatchObject({ purpose: 'inspector', check: 'installation' });
+      for (const options of [
+        { instanceId: '' },
+        { instanceId: saved.instanceId, systemIdentifier: 'bad-secret-system-id' },
+        { instanceId: saved.instanceId, timeoutMs: 0 },
+      ]) {
+        await expect(assertCanvasInspectorReady(inspector(), options)).rejects.toMatchObject({
+          purpose: 'inspector',
+          check: 'configuration',
+        });
+      }
+      await expect(
+        assertCanvasInspectorReady(inspector(), { instanceId: saved.instanceId }),
+      ).resolves.toBeUndefined();
+    });
+
+    it('applies exact TLS and pg configuration rules to the separate inspector', async () => {
+      await inspectorRejects('configuration', {
+        ...inspector(),
+        ssl: { ca: apiCa, rejectUnauthorized: false },
+      });
+      await inspectorRejects('configuration', {
+        ...inspector(),
+        connectionString: 'postgresql://fixture.invalid/override',
+      });
+      await inspectorRejects('connection', {
+        ...inspector(),
+        ssl: { ca: apiCa, rejectUnauthorized: true },
+      });
+      await inspectorRejects('connection', {
+        ...inspector(),
+        password: 'never-publish-inspector-failed-password',
+      });
+    });
+
+    it('rejects an existing intake login even though it uses the same verified endpoint', async () => {
+      await inspectorRejects('role', config().ingestion);
+    });
+
+    it.each(['SUPERUSER', 'BYPASSRLS', 'CREATEROLE'])(
+      'rejects inspector privilege escalation to %s',
+      async (privilege) => {
+        await altered(
+          `ALTER ROLE margin_canvas_inspector_probe ${privilege}`,
+          `ALTER ROLE margin_canvas_inspector_probe NO${privilege}`,
+          () => inspectorRejects('role'),
+        );
+      },
+    );
+
+    it('rejects inspector memberships reachable through SET ROLE', async () => {
+      await altered(
+        'CREATE ROLE margin_inspector_extra NOLOGIN NOINHERIT; GRANT margin_identity_provisioner TO margin_inspector_extra; GRANT margin_inspector_extra TO margin_canvas_inspector_probe',
+        'REVOKE margin_inspector_extra FROM margin_canvas_inspector_probe; REVOKE margin_identity_provisioner FROM margin_inspector_extra; DROP ROLE margin_inspector_extra',
+        () => inspectorRejects('role'),
+      );
+    });
+
+    it('rejects writable inspector readiness metadata', async () => {
+      await altered(
+        'GRANT UPDATE ON margin_local.policy_contract TO margin_ingestion_inspector',
+        'REVOKE UPDATE ON margin_local.policy_contract FROM margin_ingestion_inspector',
+        () => inspectorRejects('role'),
+      );
+    });
+
+    it('does not accept missing inspector access to the immutable ledger', async () => {
+      await altered(
+        'REVOKE SELECT ON margin_local.migrations FROM margin_ingestion_inspector',
+        'GRANT SELECT ON margin_local.migrations TO margin_ingestion_inspector',
+        () => inspectorRejects('installation'),
+      );
+    });
+
+    it('checks migration ledger and forced RLS through the independent inspector path', async () => {
+      await altered(
+        "INSERT INTO margin_local.migrations(position,name,sha256) VALUES(14,'014-unexpected-inspector.sql',repeat('0',64))",
+        'DELETE FROM margin_local.migrations WHERE position=14',
+        () => inspectorRejects('installation'),
+      );
+      await altered(
+        'ALTER TABLE margin_ingestion.artifacts NO FORCE ROW LEVEL SECURITY',
+        'ALTER TABLE margin_ingestion.artifacts FORCE ROW LEVEL SECURITY',
+        () => inspectorRejects('schema'),
+      );
+    });
+
+    it('compares policy predicates for the inspector instead of trusting the migration ledger alone', async () => {
+      await altered(
+        'ALTER POLICY identity_membership_read ON margin_identity.memberships USING(true)',
+        'ALTER POLICY identity_membership_read ON margin_identity.memberships USING(user_id=margin_identity.context_user())',
+        () => inspectorRejects('schema'),
+      );
+    });
+
+    it('requires durable commit configuration for the inspector', async () => {
+      await altered(
+        "ALTER ROLE margin_canvas_inspector_probe SET synchronous_commit='off'",
+        'ALTER ROLE margin_canvas_inspector_probe RESET synchronous_commit',
+        () => inspectorRejects('durability'),
+      );
+    });
+
+    it.each(['deadline', 'cancelled'] as const)(
+      'bounds inspector %s and releases its blocked read-only session',
+      async (check) => {
+        await admin.query('BEGIN');
+        await admin.query('LOCK TABLE margin_local.migrations IN ACCESS EXCLUSIVE MODE');
+        const controller = new AbortController();
+        const timer = check === 'cancelled' ? setTimeout(() => controller.abort(), 150) : undefined;
+        const started = Date.now();
+        try {
+          await expect(
+            assertCanvasInspectorReady(inspector(), {
+              instanceId: saved.instanceId,
+              signal: controller.signal,
+              timeoutMs: check === 'deadline' ? 150 : 5000,
+            }),
+          ).rejects.toMatchObject({ purpose: 'inspector', check });
+          expect(Date.now() - started).toBeLessThan(1500);
+        } finally {
+          clearTimeout(timer);
+          await admin.query('ROLLBACK');
+        }
+        // After TCP destruction, PostgreSQL observes the close once its blocked
+        // query resumes. Wait for that bounded server-side teardown to finish.
+        await expect
+          .poll(
+            async () =>
+              (
+                await admin.query(
+                  "SELECT count(*) FROM pg_stat_activity WHERE application_name='margin-canvas-preflight'",
+                )
+              ).rows[0].count,
+            { timeout: 1500 },
+          )
+          .toBe('0');
+      },
+    );
 
     it('rejects disabled certificate validation, plaintext and custom TLS callbacks even in tests', async () => {
       for (const ssl of [
