@@ -10,6 +10,10 @@
   "scripts": {
     "dev": "npm run dev -w @margin/web",
     "dev:api": "npm run dev -w @margin/api",
+    "setup:canvas": "node --import tsx scripts/setup-canvas-local.mjs",
+    "dev:canvas:api": "node --import tsx apps/api/src/canvas-local-entry.ts",
+    "predev:canvas:api": "npm run build:lms",
+    "dev:canvas:web": "npm run dev -w @margin/web -- --mode canvas-local --strictPort",
     "dev:marketing": "npm run dev -w @margin/marketing",
     "build:marketing": "npm run build -w @margin/marketing",
     "build:lms": "npm run build -w @margin/lms",

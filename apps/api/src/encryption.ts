@@ -40,6 +40,7 @@ function unseal(key: Buffer, ciphertext: Buffer, iv: string, tag: string, contex
 /** Development-only KEK provider using standard Node/OpenSSL AES-256-GCM. Replace with managed KMS before deployment. */
 export class LocalKeyProvider implements KeyManagementProvider {
   private readonly key: Buffer;
+  private closed = false;
   constructor(
     key: Buffer,
     private readonly keyId = 'local-development-key-v1',
@@ -49,6 +50,7 @@ export class LocalKeyProvider implements KeyManagementProvider {
     this.key = Buffer.from(key);
   }
   async wrapKey(key: Buffer, context: string): Promise<WrappedDataKey> {
+    if (this.closed) throw new Error('The local key provider is closed.');
     const sealed = seal(this.key, key, `margin-wrap-v1:${context}`);
     return {
       provider: 'local-aes-256-gcm',
@@ -59,6 +61,7 @@ export class LocalKeyProvider implements KeyManagementProvider {
     };
   }
   async unwrapKey(envelope: WrappedDataKey, context: string) {
+    if (this.closed) throw new Error('The local key provider is closed.');
     if (envelope.provider !== 'local-aes-256-gcm' || envelope.keyId !== this.keyId)
       throw new Error('The encryption key provider does not match this object.');
     const key = unseal(
@@ -73,6 +76,11 @@ export class LocalKeyProvider implements KeyManagementProvider {
       throw new Error('Invalid data encryption key.');
     }
     return key;
+  }
+  /** Call only after consumers have drained. Clears this provider's owned key copy. */
+  close() {
+    this.closed = true;
+    this.key.fill(0);
   }
 }
 interface Envelope {

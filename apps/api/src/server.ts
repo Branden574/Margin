@@ -338,7 +338,7 @@ export function createApi(options: ApiOptions) {
       );
     return document;
   }
-  const handler: RequestListener = async (req, res) => {
+  const handler = async (...[req, res]: Parameters<RequestListener>) => {
     const correlationId = randomUUID();
     const started = Date.now();
     let tenantHash: string | undefined;
@@ -1056,12 +1056,29 @@ export function createApi(options: ApiOptions) {
       if (admitted) concurrentRequests--;
     }
   };
+  const pendingHandlers = new Set<Promise<void>>();
+  const trackedHandler: RequestListener = (req, res) => {
+    const pending = handler(req, res);
+    pendingHandlers.add(pending);
+    void pending.then(
+      () => pendingHandlers.delete(pending),
+      () => {
+        pendingHandlers.delete(pending);
+        res.destroy();
+      },
+    );
+  };
   const server = options.tls
-    ? createHttpsServer({ ...options.tls, minVersion: 'TLSv1.2' }, handler)
-    : createHttpServer(handler);
+    ? createHttpsServer({ ...options.tls, minVersion: 'TLSv1.2' }, trackedHandler)
+    : createHttpServer(trackedHandler);
   server.requestTimeout = 30_000;
   server.headersTimeout = 10_000;
   server.maxHeadersCount = 40;
-  return server;
+  return Object.assign(server, {
+    /** Stop HTTP admission first. Socket closure alone does not settle asynchronous route work. */
+    async drainRequests() {
+      while (pendingHandlers.size) await Promise.allSettled([...pendingHandlers]);
+    },
+  });
 }
 export const createLocalToken = () => randomBytes(32).toString('base64url');

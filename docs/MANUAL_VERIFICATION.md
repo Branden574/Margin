@@ -253,3 +253,12 @@ Used the existing unlocked in-app workspace and trusted HTTPS origin. A temporar
 - Returned to unlocked Teacher Home with all 21 existing documents retained. No local browser test runner was used and no real account was revoked.
 
 Screenshots: `.local/manual-checks/lti-account-settings.jpg` and `lti-account-expired.jpg`. These demonstrate the synthetic browser controls and recovery instructions, not a configured institution connection or a whole-product manual pass.
+
+## Persistent Canvas startup and preview recovery — October 11, 2026
+
+- The ordinary development servers had stopped. Restarted them with the existing trusted certificate, opened the original in-app browser tab and unlocked the existing workspace using the user-authorized passphrase. Teacher Home and all 21 documents remained present. No document content or account settings were changed.
+- Ran the reviewed isolated persistent bootstrap, repeated it successfully without replacing its keys, stopped the Canvas API, explicitly stopped/restarted its owned database, then restarted the API. Certificate-verified HTTPS requests through port 5174 returned the expected LTI-only composition health; scanning remained unconfigured. These are real local service/CLI checks, not browser-driven Canvas launches.
+- Opened the separate `https://127.0.0.1:5174/` browser origin. Its initial vault-creation screen loaded over trusted HTTPS and the tab reported no warning/error logs. No new vault/passphrase was entered, no Canvas identity was provisioned and no school data was used. The temporary tab was closed; the original workspace remains the user-facing tab.
+- Direct browser navigation to `/api/health` was blocked by the client; this was recorded rather than bypassed. The normal workspace page loaded and the proxy's JSON health response was verified using an explicit CA HTTPS request.
+
+Screenshots: `.local/manual-checks/canvas-startup-home.jpg` and `canvas-startup-separate-origin.jpg`. This verifies preview availability and origin isolation, not an end-to-end live Canvas workflow or a new manual pass of every feature.

@@ -4,19 +4,19 @@ For development without institutional administrator access, use a private Canvas
 
 Instructure documents a [Docker development setup](https://github.com/instructure/canvas-lms/blob/master/doc/docker/getting_docker.md) and its [development environment](https://github.com/instructure/canvas-lms/blob/master/doc/docker/README.md). The macOS instructions require at least 8 GB of memory allocated to Docker. The documented default `http://canvas.docker` needs additional HTTPS configuration for Margin's strict issuer/endpoint checks. Do not deploy a development installation as the public school service.
 
-The development Mac currently has Docker tooling installed but its daemon was unavailable at the October 8 check. No Canvas installation, account, paid service, public tunnel or certificate trust change was made for this checkpoint. The existing personal workspace remains at its original browser origin and retains its own encrypted vault.
+The development Mac currently has Docker tooling installed but its daemon was unavailable at the October 8 check. No Canvas installation, account, paid service, public tunnel or certificate trust change was made for this checkpoint. The existing personal workspace remains at its original browser origin and retains its own encrypted vault. On October 11, the separate persistent Margin database/API/web startup was verified locally; Canvas itself is still not installed.
 
 ## Margin prerequisites
 
-The explicit [runtime factory](RUNTIME_COMPOSITION.md) is a composition boundary, not a startup command. Before connecting Canvas:
+The explicit [runtime factory](RUNTIME_COMPOSITION.md) now has a separate [persistent local startup path](CANVAS_LOCAL_STARTUP.md). Before connecting Canvas:
 
 1. Create an isolated persistent PostgreSQL database/cluster for Margin; do not reuse an unrelated database listening on this Mac. Apply versioned migrations with an operator account and provision distinct restricted runtime/reader/worker logins with verified database TLS.
 2. Persist independent session/lookup/resource secrets, a tool signing key and a development wrapping key outside Git. Use a dedicated encrypted artifact directory. The local filesystem adapter preserves authenticated exact-version receipts and never marks source files inspected.
-3. Add a reviewed startup/bootstrap path that calls `createCanvasRuntime`, mounts its API services and explicitly schedules provisioning and materialization. LTI-only authentication avoids requiring a separate OIDC provider; it does not bypass signed launches, persisted identity links or current enrollment checks.
+3. Run the separate local startup after its protected configuration and database checks pass. It calls `createCanvasRuntime`, mounts its API services and schedules provisioning and materialization. LTI-only authentication avoids requiring a separate OIDC provider; it does not bypass signed launches, persisted identity links or current enrollment checks.
 4. Connect teacher source intake to the inspection registry and a real isolated scanner/structure validator. Keep unknown uploaded files quarantined. The deterministic PDF inspector in tests accepts only a generated fixture and must never be enabled for user files.
 5. Export the tool's public JWKS and register the exact HTTPS issuer, client ID, deployment ID, redirect/launch/Deep Linking targets and public signing key in the private Canvas instance. The operator must also provision the corresponding Margin installation/account/course mappings. Never infer identity by email or grant roles from the local teacher/student preference.
 
-These startup, operator-provisioning, scanner and scheduling steps remain open. The default `npm run dev:api` still runs the encrypted local upload service, not a configured Canvas application.
+The local bootstrap/startup and sequential scheduling are implemented. Canvas installation and identity/course operator provisioning, source intake and scanning remain open. The default `npm run dev:api` still runs the encrypted local upload service. Use the separate `dev:canvas:api` command for the persistent LTI-only composition.
 
 ## HTTPS and network boundary
 

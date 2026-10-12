@@ -72,7 +72,7 @@ function localOcrWorkerPolicy(): Plugin {
     },
   };
 }
-export default defineConfig(({ command }) => {
+export default defineConfig(({ command, mode }) => {
   if (command === 'serve' && !tls)
     throw new Error(
       'HTTPS is required. Run npm run setup:dev to create your local certificate first.',
@@ -82,13 +82,13 @@ export default defineConfig(({ command }) => {
     // The PDF worker imports this lazily; prebundle it before an export can trigger a reload.
     optimizeDeps: { include: ['@pdf-lib/fontkit'] },
     server: {
-      port: 5173,
+      port: mode === 'canvas-local' ? 5174 : 5173,
       host: '127.0.0.1',
       https: tls,
       headers: baseHeaders,
       proxy: {
         '/api': {
-          target: 'https://127.0.0.1:4100',
+          target: mode === 'canvas-local' ? 'https://127.0.0.1:4101' : 'https://127.0.0.1:4100',
           agent: tls ? new Agent({ ca: tls.cert, minVersion: 'TLSv1.2' }) : undefined,
         },
       },

@@ -1,6 +1,6 @@
 # Explicit Canvas service composition
 
-`apps/api/src/runtime-composition.ts` exports `createCanvasRuntime(config, dependencies)`. It composes identity, LMS, assignment-authoring and student-work services, with an optional capture/materialization/teacher-review pipeline. It does not listen on a socket, load environment variables, migrate a database, create accounts or installations, seed approvals, run workers, or configure a scanner. `apps/api/src/index.ts` does not call it, and the production startup rejection remains in place.
+`apps/api/src/runtime-composition.ts` exports `createCanvasRuntime(config, dependencies)`. It composes identity, LMS, assignment-authoring and student-work services, with an optional capture/materialization/teacher-review pipeline. It does not listen on a socket, load environment variables, migrate a database, create accounts or installations, seed approvals, run workers, or configure a scanner. `apps/api/src/index.ts` does not call it, and the production startup rejection remains in place. The separate [persistent local entry point](CANVAS_LOCAL_STARTUP.md) loads protected configuration, checks the database, invokes this factory and schedules workers.
 
 ## Inputs and ownership
 
