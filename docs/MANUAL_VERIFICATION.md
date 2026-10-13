@@ -274,3 +274,17 @@ Used the original trusted HTTPS workspace on port 5173 with a temporary syntheti
 - Stopped the synthetic API, restored the ordinary API and returned to the unlocked original workspace with **All files 21** visible.
 
 Screenshots: `.local/manual-checks/teacher-upload-interrupted.jpg`, `teacher-upload-mobile.jpg`, `teacher-upload-ready.jpg`, and `teacher-upload-created.jpg`. These prove the interacted-with UI and encrypted recovery against a synthetic transport. Real HTTPS/storage/PostgreSQL checks are recorded separately; this is not all-feature manual coverage or live scan/Canvas evidence.
+
+## Workspace homepage motion — October 13, 2026
+
+The normally trusted in-app browser exercised the existing encrypted workspace at `https://127.0.0.1:5173/#home` using Anime.js 4.5.0. Its 21 documents remained present. This walkthrough covers homepage motion and the controls below, not every editor feature or a live school integration.
+
+- Observed the staged entrance through actual rendered transforms (12/18-pixel starting offsets), with text opacity remaining 1. After completion, the temporary transforms returned to `none`.
+- Keyboard focus lifted a recent document card; Enter opened its three-page PDF editor. Returning to the workspace succeeded.
+- Enabled the existing **Reduce motion** setting: the homepage entrance and focused document card both remained at `transform: none`. Restored the original disabled setting afterward. Live operating-system preference changes were reviewed against Anime.js scope cleanup, but were not manually emulated in this browser.
+- Switched between teacher and student views. The student view retained its feedback queue and opened the student assignments screen; the teacher quick action opened the assignment dialog, which was cancelled without creating data. Restored the original teacher view and dark theme.
+- Search filtered the document library and clearing it restored Home without replaying the entrance. The four teacher recent cards reappeared.
+- Checked the student homepage at a 390-by-844 viewport: heading, action, assignment summary, feedback row, and subjects fit without horizontal overflow. Reset the viewport afterward.
+- No warnings or errors were reported in the tab log after these checks. The final tab remains on Home.
+
+The optional motion module is loaded only for the workspace homepage and uses transform-only finite entrance animations plus reusable interaction animations. Production build measurements: motion chunk **14.61 kB gzip**, main entry **107.48 kB gzip** (an increase of **0.26 kB gzip** from the build taken immediately before this change). This is a bundle-size observation, not a device-performance or 100,000-user capacity result.

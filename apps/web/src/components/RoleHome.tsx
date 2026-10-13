@@ -70,8 +70,14 @@ export function RoleHome({
               : 'See what is due, revisit feedback, and continue your work.'}
           </p>
         </div>
-        <button className="button primary" onClick={teacher ? onCreate : onAssignments}>
-          {teacher ? <Plus size={17} /> : <BookOpen size={17} />}
+        <button
+          className="button primary"
+          data-home-action
+          onClick={teacher ? onCreate : onAssignments}
+        >
+          <span className="home-action-icon" data-home-icon="lift" aria-hidden="true">
+            {teacher ? <Plus size={17} /> : <BookOpen size={17} />}
+          </span>
           {teacher ? 'Create assignment' : 'View my assignments'}
         </button>
       </div>
@@ -101,14 +107,22 @@ export function RoleHome({
         >
           <div className="section-title">
             <h2>{teacher ? 'On your desk' : 'Your next steps'}</h2>
-            <button className="text-button" onClick={onAssignments}>
-              {teacher ? 'All assignments' : 'My assignments'} <ArrowRight size={14} />
+            <button className="text-button" data-home-action onClick={onAssignments}>
+              {teacher ? 'All assignments' : 'My assignments'}
+              <span className="home-action-icon" data-home-icon="arrow" aria-hidden="true">
+                <ArrowRight size={14} />
+              </span>
             </button>
           </div>
           {queue.length ? (
             <div className="role-home-rows">
               {queue.slice(0, 4).map((a) => (
-                <button key={a.id} className="role-home-row" onClick={() => onAssignment(a.id)}>
+                <button
+                  key={a.id}
+                  className="role-home-row"
+                  data-home-action
+                  onClick={() => onAssignment(a.id)}
+                >
                   {teacher ? <ClipboardList size={20} /> : <BookOpen size={20} />}
                   <span>
                     <strong>{a.title}</strong>
@@ -128,7 +142,9 @@ export function RoleHome({
                           ? 'Finish draft'
                           : 'Continue'}
                   </span>
-                  <ArrowRight size={15} />
+                  <span className="home-action-icon" data-home-icon="arrow" aria-hidden="true">
+                    <ArrowRight size={15} />
+                  </span>
                 </button>
               ))}
             </div>
@@ -141,8 +157,15 @@ export function RoleHome({
                   ? 'Create a local assignment from one of your documents. Work marked as submitted will appear here for review.'
                   : 'Assigned work and teacher feedback will appear here. Your own notes and documents are always available below.'}
               </p>
-              <button className="text-button" onClick={teacher ? onCreate : onDocuments}>
-                {teacher ? 'Prepare an assignment' : 'Open my documents'} <ArrowRight size={14} />
+              <button
+                className="text-button"
+                data-home-action
+                onClick={teacher ? onCreate : onDocuments}
+              >
+                {teacher ? 'Prepare an assignment' : 'Open my documents'}
+                <span className="home-action-icon" data-home-icon="arrow" aria-hidden="true">
+                  <ArrowRight size={14} />
+                </span>
               </button>
             </div>
           )}
@@ -177,8 +200,11 @@ export function RoleHome({
             </p>
           )}
           {teacher && (
-            <button className="text-button" onClick={onAssignments}>
-              Manage assignments <ArrowRight size={14} />
+            <button className="text-button" data-home-action onClick={onAssignments}>
+              Manage assignments
+              <span className="home-action-icon" data-home-icon="arrow" aria-hidden="true">
+                <ArrowRight size={14} />
+              </span>
             </button>
           )}
         </aside>

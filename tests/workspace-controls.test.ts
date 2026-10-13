@@ -48,6 +48,7 @@ function library(page: Parameters<typeof Library>[0]['page'], documents: Documen
       search: '',
       name: 'Reader',
       role: 'teacher',
+      reducedMotion: false,
       assignments: [],
       boundCopyIds: new Set<string>(),
       onCreateAssignment: vi.fn(),

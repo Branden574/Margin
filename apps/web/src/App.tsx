@@ -642,6 +642,7 @@ export default function App() {
                   search={search}
                   name={preferences.name}
                   role={preferences.role}
+                  reducedMotion={preferences.reducedMotion}
                   assignments={assignments}
                   boundCopyIds={boundCopyIds}
                   onCreateAssignment={() => {

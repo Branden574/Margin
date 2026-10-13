@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   ArrowUpRight,
   Plus,
@@ -22,6 +22,8 @@ import { RoleHome } from './RoleHome';
 import type { Page } from './Sidebar';
 import { DocumentCover } from './DocumentCover';
 import { fileSize, relativeDate } from '../lib/format';
+import { useWorkspaceMotion } from '../lib/useWorkspaceMotion';
+import './workspace-motion.css';
 export type DocumentAction =
   | 'rename'
   | 'move'
@@ -38,6 +40,7 @@ interface Props {
   search: string;
   name: string;
   role: Preferences['role'];
+  reducedMotion: boolean;
   assignments: Assignment[];
   boundCopyIds: ReadonlySet<string>;
   onCreateAssignment: () => void;
@@ -58,6 +61,7 @@ export function Library({
   search,
   name,
   role,
+  reducedMotion,
   assignments,
   boundCopyIds,
   onCreateAssignment,
@@ -71,6 +75,8 @@ export function Library({
   onAction,
   onTemplate,
 }: Props) {
+  const root = useRef<HTMLDivElement>(null);
+  useWorkspaceMotion(root, page === 'home', reducedMotion);
   const [layout, setLayout] = useState<'grid' | 'list'>('list');
   const [sort, setSort] = useState<'recent' | 'name'>('recent');
   const [filter, setFilter] = useState<'all' | 'mine' | 'sample'>('all');
@@ -166,7 +172,11 @@ export function Library({
     </div>
   );
   return (
-    <div className="library-page" onClick={() => menu && setMenu(null)}>
+    <div
+      ref={root}
+      className={`library-page${page === 'home' ? ' workspace-home' : ''}`}
+      onClick={() => menu && setMenu(null)}
+    >
       {isHome ? (
         <RoleHome
           role={role}
@@ -205,8 +215,15 @@ export function Library({
               <h2>
                 Jump back in <span className="section-dot" />
               </h2>
-              <button className="text-button" onClick={() => onNavigate('documents')}>
-                View all documents <ArrowRight size={14} />
+              <button
+                className="text-button"
+                data-home-action
+                onClick={() => onNavigate('documents')}
+              >
+                View all documents
+                <span className="home-action-icon" data-home-icon="arrow" aria-hidden="true">
+                  <ArrowRight size={14} />
+                </span>
               </button>
             </div>
             <div className="recent-grid">
@@ -244,8 +261,10 @@ export function Library({
           <section className="folder-section" aria-label="Folders">
             <div className="section-title">
               <h2>Your folders</h2>
-              <button className="text-button" onClick={onFolder}>
-                <Plus size={15} />
+              <button className="text-button" data-home-action onClick={onFolder}>
+                <span className="home-action-icon" data-home-icon="lift" aria-hidden="true">
+                  <Plus size={15} />
+                </span>
                 New folder
               </button>
             </div>
@@ -268,7 +287,9 @@ export function Library({
                       {documents.filter((d) => !d.trashed && d.folderId === f.id).length} documents
                     </small>
                   </span>
-                  <ArrowUpRight size={16} />
+                  <span className="home-action-icon" data-home-icon="arrow" aria-hidden="true">
+                    <ArrowUpRight size={16} />
+                  </span>
                 </button>
               ))}
             </div>

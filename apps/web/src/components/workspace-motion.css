@@ -1,0 +1,35 @@
+/* Anime.js owns home transforms; keep CSS color, shadow, and focus feedback. */
+.library-page.workspace-home {
+  animation: none;
+}
+.workspace-home .recent-card {
+  transition: box-shadow 0.18s;
+}
+.workspace-home .recent-card:hover {
+  transform: none;
+}
+.workspace-home .recent-card:focus-within {
+  box-shadow: 0 6px 18px #37372609;
+}
+.workspace-home .folder-card,
+.workspace-home .role-home .page-heading > button {
+  transition:
+    background 0.15s,
+    color 0.15s,
+    box-shadow 0.15s;
+}
+.home-action-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+}
+.folder-card > .home-action-icon {
+  margin-left: auto;
+  color: #a5a89c;
+}
+@media (max-width: 1200px) {
+  .folder-card > .home-action-icon > svg {
+    width: 13px;
+  }
+}
