@@ -13,6 +13,7 @@ export type VaultStore =
   | 'assignment-outbox'
   | 'assignment-receipts'
   | 'author-drafts'
+  | 'feedback-drafts'
   | 'author-uploads'
   | 'ocr'
   | 'assignments'

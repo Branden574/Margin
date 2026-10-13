@@ -7,7 +7,13 @@ async function install(page: Page) {
   const fixture = await canvasReviewFixture();
   await page.route('**/api/**', async (route) => {
     const request = route.request();
-    await route.fulfill(await fixture.handle(new URL(request.url()), request.method()));
+    await route.fulfill(
+      await fixture.handle(
+        new URL(request.url()),
+        request.method(),
+        request.postData() ?? undefined,
+      ),
+    );
   });
   return fixture;
 }
@@ -24,7 +30,7 @@ test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: 'ignoreErrors' });
 });
 
-test('teacher review shows frozen layers, comments and both pages without editing controls', async ({
+test('teacher review keeps frozen layers and comments separate from feedback controls', async ({
   page,
 }) => {
   const errors: string[] = [];
@@ -187,4 +193,51 @@ test('changing selection during an authority check keeps the new submission open
     'The open gate suggests a new beginning.',
   ]);
   await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('teacher saves a separate encrypted feedback layer, recovers it after reload and explicitly returns a revision', async ({
+  page,
+}) => {
+  const fixture = await install(page);
+  await open(page);
+  const original = await page.locator('svg.review-annotation-layer').innerHTML();
+  await page
+    .getByLabel('General comment', { exact: true })
+    .fill('Thoughtful reading. Add a detail from the passage.');
+  await page.getByRole('combobox', { name: 'Feedback tool', exact: true }).selectOption('stamp');
+  await page.getByRole('textbox', { name: 'Feedback mark text', exact: true }).fill('REVIEWED');
+  await page.getByRole('application', { name: /Teacher feedback drawing area/ }).focus();
+  await page.keyboard.press('Enter');
+  await expect(
+    page.locator('.feedback-annotation-layer [data-annotation-type="stamp"]'),
+  ).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Return feedback', exact: true })).toBeDisabled();
+  await expect(page.getByText('Saved on this device · not sent', { exact: true })).toBeVisible();
+  await page.reload();
+  await unlockWorkspace(page, '.canvas-review');
+  await expect(page.getByLabel('General comment', { exact: true })).toHaveValue(
+    'Thoughtful reading. Add a detail from the passage.',
+  );
+  await expect(
+    page.locator('.feedback-annotation-layer [data-annotation-type="stamp"]'),
+  ).toHaveCount(1);
+  await page.getByRole('button', { name: 'Save feedback', exact: true }).click();
+  await expect(page.getByText('Saved revision 1', { exact: true })).toBeVisible();
+  expect(fixture.feedback.get(fixture.submissions[0].id)?.released).toBeNull();
+  await page.getByRole('button', { name: 'Return feedback', exact: true }).click();
+  await expect(page.locator('.feedback-heading > span')).toHaveText('Returned');
+  expect(
+    fixture.feedback.get(fixture.submissions[0].id)?.released?.content.annotations[0].type,
+  ).toBe('stamp');
+  await page.getByLabel('General comment', { exact: true }).fill('Unreturned follow-up.');
+  await page.getByRole('button', { name: 'Save feedback', exact: true }).click();
+  await expect(page.getByText('Saved revision 2', { exact: true })).toBeVisible();
+  expect(fixture.feedback.get(fixture.submissions[0].id)?.released?.content.comment).toBe(
+    'Thoughtful reading. Add a detail from the passage.',
+  );
+  expect(await page.locator('svg.review-annotation-layer').innerHTML()).toBe(original);
+  const axe = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+    .analyze();
+  expect(axe.violations).toEqual([]);
 });

@@ -352,9 +352,10 @@ export class PostgresIngestionRepository {
         'margin_submission_retention_guard',
         'margin_submission_processor',
         'margin_submission_reviewer',
+        'margin_feedback_runtime',
       ].filter((g) => g !== group);
       const safe = await c.query<{ unsafe: boolean }>(
-        `SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,$1,'MEMBER') OR EXISTS(SELECT 1 FROM pg_roles other WHERE other.rolname=ANY($2::text[]) AND pg_has_role(current_user,other.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_ingestion','margin_identity','margin_lms','margin_sync','margin_assignments','margin_work','margin_submissions','margin_review') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user`,
+        `SELECT (current_setting('fsync')<>'on' OR current_setting('full_page_writes')<>'on' OR r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR NOT pg_has_role(current_user,$1,'MEMBER') OR EXISTS(SELECT 1 FROM pg_roles other WHERE other.rolname=ANY($2::text[]) AND pg_has_role(current_user,other.oid,'MEMBER')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('margin_ingestion','margin_identity','margin_lms','margin_sync','margin_assignments','margin_work','margin_submissions','margin_review','margin_feedback') AND pg_has_role(current_user,c.relowner,'MEMBER'))) AS unsafe FROM pg_roles r WHERE r.rolname=current_user`,
         [group, groups],
       );
       if (!safe.rows[0] || safe.rows[0].unsafe)

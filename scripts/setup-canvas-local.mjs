@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+import {
+  enableCanvasLocalFeedback,
+  CanvasFeedbackSetupError,
+} from '../apps/api/src/canvas-local/feedback-companion.ts';
 import { mkdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,13 +25,19 @@ const repository = fileURLToPath(new URL('../', import.meta.url));
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
   process.stdout.write(
-    'Usage: node --import tsx scripts/setup-canvas-local.mjs [setup|start|stop|upgrade|renew-postgres-cert] [--root PATH] [--postgres-port 55439] [--api-port 4101] [--application-origin https://127.0.0.1:5174] [--api-tls-key PATH] [--api-tls-cert PATH]\nSetup starts only its dedicated persistent PostgreSQL cluster. Explicit upgrade applies reviewed migration 013 after a private database backup; stop the API, workers and other database sessions first. The explicit renew-postgres-cert action preserves the PostgreSQL CA and server key, rebinds the owned scanner companion, and restores the database’s prior running state. Stop API and scanner runtimes before maintenance. Existing keys, configuration and artifacts are preserved. It never changes OS trust or another database.\n',
+    'Usage: node --import tsx scripts/setup-canvas-local.mjs [setup|start|stop|upgrade|enable-feedback|renew-postgres-cert] [--root PATH] [--postgres-port 55439] [--api-port 4101] [--application-origin https://127.0.0.1:5174] [--api-tls-key PATH] [--api-tls-cert PATH]\nSetup starts only its dedicated persistent PostgreSQL cluster. Explicit upgrade applies reviewed migration 013 after a private database backup; enable-feedback separately installs migration 014 and its own restricted login without rewriting original credentials; stop the API, workers and other database sessions first. The explicit renew-postgres-cert action preserves the PostgreSQL CA and server key, rebinds the owned scanner companion, and restores the database’s prior running state. Stop API and scanner runtimes before maintenance. Existing keys, configuration and artifacts are preserved. It never changes OS trust or another database.\n',
   );
 } else {
   try {
     const action = args[0] && !args[0].startsWith('--') ? args.shift() : 'setup';
-    if (!['setup', 'start', 'stop', 'upgrade', 'renew-postgres-cert'].includes(action))
-      throw new CanvasBootstrapError('Choose setup, start, stop, upgrade, or renew-postgres-cert.');
+    if (
+      !['setup', 'start', 'stop', 'upgrade', 'enable-feedback', 'renew-postgres-cert'].includes(
+        action,
+      )
+    )
+      throw new CanvasBootstrapError(
+        'Choose setup, start, stop, upgrade, enable-feedback, or renew-postgres-cert.',
+      );
     const known = new Set([
       '--root',
       '--postgres-port',
@@ -85,6 +95,11 @@ if (args.includes('--help')) {
           ? `Recovered the completed PostgreSQL leaf renewal record and retired its interrupted ownership lock. Saved leaf expires ${result.expiresAt}. No new live database verification or running-state change was performed.\n`
           : `Owned PostgreSQL leaf renewal ${result.resumed ? 'was recovered and verified' : 'completed'}. Leaf expires ${result.expiresAt}. The database is ${result.wasRunning ? 'running' : 'stopped'}; CA, server key, credentials and data were preserved. Browser/API certificates and OS trust were unchanged.\n`,
       );
+    } else if (action === 'enable-feedback') {
+      const result = await enableCanvasLocalFeedback(rootDirectory);
+      process.stdout.write(
+        `Feedback migration 014 and its dedicated credential are ${result.changed ? 'installed and verified' : 'already installed and verified'}. Original Canvas files and credentials were preserved.\nPrivate pre-upgrade backup: ${result.backup.directory}\n`,
+      );
     } else if (action === 'upgrade') {
       const result = await upgradeCanvasLocal(rootDirectory);
       process.stdout.write(
@@ -101,6 +116,7 @@ if (args.includes('--help')) {
     const message =
       error instanceof CanvasCertificateMaintenanceError ||
       error instanceof CanvasBootstrapError ||
+      error instanceof CanvasFeedbackSetupError ||
       error instanceof CanvasLocalConfigError ||
       error instanceof CanvasAdmissionError
         ? error.message

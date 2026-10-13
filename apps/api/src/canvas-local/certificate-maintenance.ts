@@ -1,3 +1,5 @@
+import { loadCanvasFeedbackDatabase } from './feedback-companion.js';
+import { assertCanvasFeedbackReady } from './preflight.js';
 import { execFile } from 'node:child_process';
 import {
   createHash,
@@ -653,7 +655,9 @@ async function runtimeReadiness(receipt: CanvasBootstrapReceipt, plan: Plan, ver
       }
     }
     // Exact schema 012 installations can renew before using the separate supported upgrade.
-    if (version === 13) await assertCanvasDatabaseReady(databases);
+    if (version >= 13) await assertCanvasDatabaseReady(databases);
+    const feedback = await loadCanvasFeedbackDatabase(receipt.rootDirectory);
+    if (feedback) await assertCanvasFeedbackReady(feedback, { instanceId: receipt.instanceId });
     if (plan.files.some((f) => f.path === 'scanner/installation.json')) {
       const bytes = await read(join(receipt.rootDirectory, 'scanner/database.url'), 8192);
       try {

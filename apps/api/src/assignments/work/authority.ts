@@ -65,7 +65,7 @@ export const workCancelled = (signal?: AbortSignal) => {
 /** Internal current-launch authority shared by independently credentialed work/capture services. */
 export class WorkAuthority {
   constructor(
-    private readonly pool: WorkPool,
+    private readonly pool: Pick<WorkPool, 'transaction'>,
     private readonly kms: KeyManagementProvider,
   ) {}
   async capture(c: PoolClient): Promise<WorkSnapshot> {

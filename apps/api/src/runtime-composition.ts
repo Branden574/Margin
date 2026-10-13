@@ -23,6 +23,7 @@ import type { ArtifactReader } from './ingestion/types.js';
 import { PostgresIngestionRepository } from './ingestion/postgres.js';
 import { PostgresAssignmentSubmissionService } from './assignments/submissions/index.js';
 import { PostgresAssignmentReviewService } from './assignments/review/index.js';
+import { PostgresAssignmentFeedbackService } from './assignments/feedback/index.js';
 import {
   PostgresSubmissionProcessor,
   SubmissionMaterializationWorker,
@@ -41,6 +42,8 @@ interface CanvasRuntimeCommonConfig {
       processor: PoolConfig;
       reviewer: PoolConfig;
       sourceReader: PoolConfig;
+      /** Separate writer role. Omission preserves read-only legacy review. */
+      feedback?: PoolConfig;
     };
     captureEnabled: boolean;
     processingDeadlineMs?: number;
@@ -72,6 +75,7 @@ export interface CanvasRuntime {
     assignmentWorkService: PostgresAssignmentWorkService;
     assignmentSubmissionService?: PostgresAssignmentSubmissionService;
     assignmentReviewService?: PostgresAssignmentReviewService;
+    assignmentFeedbackService?: PostgresAssignmentFeedbackService;
   };
   /** Explicit single-job processing; absent unless the submission pipeline was configured. */
   materializeSubmission?: (signal?: AbortSignal) => Promise<MaterializationReceipt | null>;
@@ -192,6 +196,7 @@ export async function createCanvasRuntime(
     cleanups.push(() => work.close());
     let capture: PostgresAssignmentSubmissionService | undefined;
     let review: PostgresAssignmentReviewService | undefined;
+    let feedback: PostgresAssignmentFeedbackService | undefined;
     let worker: SubmissionMaterializationWorker | undefined;
     if (submissions) {
       const sourceReader = new PostgresIngestionRepository(
@@ -213,6 +218,14 @@ export async function createCanvasRuntime(
         artifacts,
       );
       cleanups.push(() => review!.close());
+      if (submissions.databases.feedback) {
+        feedback = new PostgresAssignmentFeedbackService(
+          submissions.databases.feedback,
+          keys,
+          sourceReader,
+        );
+        cleanups.push(() => feedback!.close());
+      }
       worker = new SubmissionMaterializationWorker(processor, sourceReader, artifacts, {
         deadlineMs: submissions.processingDeadlineMs,
       });
@@ -249,7 +262,11 @@ export async function createCanvasRuntime(
         assignmentService: assignments,
         assignmentWorkService: work,
         ...(capture && review
-          ? { assignmentSubmissionService: capture, assignmentReviewService: review }
+          ? {
+              assignmentSubmissionService: capture,
+              assignmentReviewService: review,
+              ...(feedback ? { assignmentFeedbackService: feedback } : {}),
+            }
           : {}),
       },
       ...(worker

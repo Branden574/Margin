@@ -38,6 +38,7 @@ export const CANVAS_MIGRATIONS = [
   '011-submission-outcomes.sql',
   '012-submission-review.sql',
   '013-teacher-source-intake.sql',
+  '014-submission-feedback.sql',
 ] as const;
 export const CANVAS_DATABASE_ROLES = {
   identity: 'margin_identity_runtime',
@@ -89,7 +90,7 @@ function assertLocalEnvironment() {
     fail('Local Canvas setup requires POSIX ownership and no-follow filesystem support.');
 }
 const manifestDirectory = new URL('../../../../infra/migrations/', import.meta.url);
-export async function migrationManifest(through: number = CANVAS_MIGRATIONS.length) {
+export async function migrationManifest(through: number = 13) {
   return Promise.all(
     CANVAS_MIGRATIONS.slice(0, through).map(async (name, index) => ({
       position: index + 1,
@@ -267,12 +268,12 @@ async function ledger(
       'Canvas row-level security policies differ from their installed contract. No policies were changed.',
     );
 }
-async function supportedLedger(client: Client, instanceId: string): Promise<12 | 13> {
+async function supportedLedger(client: Client, instanceId: string): Promise<12 | 13 | 14> {
   const count = (
     await client.query('SELECT count(*)::integer AS count FROM margin_local.migrations')
   ).rows[0]?.count;
-  if (count !== 12 && count !== 13)
-    fail('Only exact local Canvas migration versions 12 and 13 are supported.');
+  if (count !== 12 && count !== 13 && count !== 14)
+    fail('Only exact local Canvas migration versions 12, 13 and 14 are supported.');
   await ledger(client, instanceId, await migrationManifest(count));
   return count;
 }
@@ -292,6 +293,7 @@ const policySchemas = [
   'margin_work',
   'margin_submissions',
   'margin_review',
+  'margin_feedback',
 ];
 function policySnapshot(client: Client) {
   return client.query(policyInventory, [policySchemas]);
@@ -462,7 +464,7 @@ export async function withCanvasLocalMaintenance<T>(
       try {
         await serverIdentity(next, saved.dataDirectory, saved.systemIdentifier);
         await acquireCanvasMaintenance(next);
-        if ((await supportedLedger(next, saved.instanceId)) !== 13)
+        if ((await supportedLedger(next, saved.instanceId)) < 13)
           fail(
             'Upgrade the owned Canvas database to migration 13 before adding a companion service.',
           );
@@ -492,11 +494,11 @@ export async function withCanvasLocalMaintenance<T>(
         reconnect,
       });
       admission.signal.throwIfAborted();
-      // Companion publication must preserve the original bootstrap, migration and policy contract.
+      // Companion publication preserves original files and leaves an exact supported ledger/policy contract.
       const unchanged = await receipt(root);
       if (JSON.stringify(unchanged) !== JSON.stringify(saved))
         fail('The original Canvas installation receipt changed during companion setup.');
-      await ledger(current!, saved.instanceId);
+      await supportedLedger(current!, saved.instanceId);
       admission.signal.throwIfAborted();
       return result;
     } finally {
@@ -574,6 +576,10 @@ export async function upgradeCanvasLocal(rootDirectory: string): Promise<{
       await serverIdentity(client, saved.dataDirectory, saved.systemIdentifier);
       await acquireCanvasMaintenance(client);
       const version = await supportedLedger(client, saved.instanceId);
+      if (version === 14)
+        fail(
+          'Migration 014 is already installed. Use enable-feedback to verify its companion; the 12 to 13 upgrade does not downgrade it.',
+        );
       if (version === 13) return { from: 13, to: 13, changed: false, reconciled: false };
       // A backup is accepted only after all legacy runtime sessions have stopped and the exact old baseline passed.
       backup = await createCanvasUpgradeBackup(
@@ -1029,5 +1035,20 @@ export const canvasCertificateOwnership = {
   async verify(client: Client, saved: CanvasBootstrapReceipt) {
     await serverIdentity(client, saved.dataDirectory, saved.systemIdentifier);
     return supportedLedger(client, saved.instanceId);
+  },
+};
+
+/** Operator-only primitives for the additive feedback companion; no runtime credentials. */
+export const canvasCompanionOwnership = {
+  configuration: operatorConfiguration,
+  ledger: supportedLedger,
+  policies: policySnapshot,
+  async recordPolicies(client: Client) {
+    await client.query('DELETE FROM margin_local.policy_contract');
+    await client.query(
+      'INSERT INTO margin_local.policy_contract(table_name,name,roles,command,permissive,using_expression,check_expression) ' +
+        policyInventory,
+      [policySchemas],
+    );
   },
 };

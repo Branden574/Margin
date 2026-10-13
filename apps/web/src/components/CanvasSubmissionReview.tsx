@@ -9,7 +9,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { Brand } from './Brand';
-import { CanvasReviewDocument } from './CanvasReviewDocument';
+import { CanvasTeacherFeedback } from './CanvasTeacherFeedback';
 import {
   createAssignmentReviewClient,
   readVerifiedReviewSnapshot,
@@ -70,6 +70,10 @@ function ReviewSession({ client }: { client: ReviewClient }) {
     request = useRef<AbortController | null>(null);
   const cursors = useRef<Array<string | undefined>>([undefined]);
   const lastContext = useRef<ReviewContext | null>(null);
+  const feedbackLeaveGuard = useRef<(() => Promise<void>) | null>(null);
+  const registerFeedbackLeaveGuard = useCallback((guard: (() => Promise<void>) | null) => {
+    feedbackLeaveGuard.current = guard;
+  }, []);
 
   const clearView = useCallback(() => {
     generation.current++;
@@ -82,6 +86,12 @@ function ReviewSession({ client }: { client: ReviewClient }) {
   }, [client]);
   const select = useCallback(
     async (id: string, summary: ReviewPage['submissions'][number]) => {
+      try {
+        await feedbackLeaveGuard.current?.();
+      } catch (reason) {
+        setError(message(reason));
+        return;
+      }
       clearView();
       setSelection(id);
       setError('');
@@ -113,6 +123,12 @@ function ReviewSession({ client }: { client: ReviewClient }) {
   );
   const loadList = useCallback(
     async (index: number, after?: string, selectLast = false) => {
+      try {
+        await feedbackLeaveGuard.current?.();
+      } catch (reason) {
+        setError(message(reason));
+        return;
+      }
       clearView();
       setSelection('');
       setListing(null);
@@ -398,11 +414,10 @@ function ReviewSession({ client }: { client: ReviewClient }) {
               </div>
             )}
             {view ? (
-              <CanvasReviewDocument
+              <CanvasTeacherFeedback
                 key={`${view.detail.submission.id}:${view.detail.snapshotPin}`}
-                source={view.source}
-                pages={view.detail.pages}
-                annotations={view.annotations}
+                view={view}
+                registerLeaveGuard={registerFeedbackLeaveGuard}
               />
             ) : (
               <div className="review-placeholder">
@@ -439,7 +454,7 @@ function ReviewSession({ client }: { client: ReviewClient }) {
               </div>
             )}
             <footer className="review-status">
-              <span>Frozen submission · read-only</span>
+              <span>Frozen student work · separate teacher feedback</span>
               <span>Canvas submission confirmation is not available yet.</span>
             </footer>
           </section>

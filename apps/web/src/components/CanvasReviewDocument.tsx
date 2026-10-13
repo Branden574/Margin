@@ -4,6 +4,12 @@ import type { Annotation } from '@margin/core';
 import { PdfCanvas } from '../editor/PdfCanvas';
 import { AnnotationGraphic } from '../editor/AnnotationLayer';
 import { usePdf } from '../editor/usePdf';
+import {
+  FeedbackAnnotationLayer,
+  type FeedbackDrawing,
+  type FeedbackTool,
+} from './FeedbackAnnotationLayer';
+import type { ReactNode } from 'react';
 
 interface PageGeometry {
   id: string;
@@ -15,10 +21,23 @@ interface Props {
   source: Blob;
   pages: readonly PageGeometry[];
   annotations: readonly Annotation[];
+  feedback?: Omit<FeedbackDrawing, 'tool' | 'color' | 'text'>;
+  feedbackPanel?: ReactNode;
+  sourceOnly?: boolean;
 }
 
-/** This viewer has no editing adapter, local outbox, or mutable document subscription. */
-export function CanvasReviewDocument({ source, pages, annotations }: Props) {
+/** Captured student marks remain read-only; edits are confined to the separate teacher layer. */
+export function CanvasReviewDocument({
+  source,
+  pages,
+  annotations,
+  feedback,
+  feedbackPanel,
+  sourceOnly = false,
+}: Props) {
+  const [feedbackTool, setFeedbackTool] = useState<FeedbackTool>('select');
+  const [feedbackColor, setFeedbackColor] = useState('#b85d3c');
+  const [feedbackText, setFeedbackText] = useState('');
   const { pdf, loading, error } = usePdf(source);
   const [pageIndex, setPageIndex] = useState(0);
   const [zoom, setZoom] = useState<number | 'fit'>('fit');
@@ -168,21 +187,91 @@ export function CanvasReviewDocument({ source, pages, annotations }: Props) {
             <Plus size={15} />
           </button>
         </div>
-        <label className="review-layer-toggle">
-          <input
-            type="checkbox"
-            checked={showAnnotations}
-            onChange={(event) => setShowAnnotations(event.target.checked)}
-          />
-          Student annotations
-        </label>
+        {!sourceOnly && (
+          <label className="review-layer-toggle">
+            <input
+              type="checkbox"
+              checked={showAnnotations}
+              onChange={(event) => setShowAnnotations(event.target.checked)}
+            />
+            Student annotations
+          </label>
+        )}
       </nav>
+      {feedback?.onChange && (
+        <div className="feedback-tools" aria-label="Teacher feedback tools">
+          <label>
+            Feedback tool
+            <select
+              aria-label="Feedback tool"
+              value={feedbackTool}
+              disabled={feedback.disabled}
+              onChange={(event) => setFeedbackTool(event.target.value as FeedbackTool)}
+            >
+              {(
+                [
+                  'select',
+                  'pen',
+                  'highlight',
+                  'text',
+                  'comment',
+                  'rectangle',
+                  'ellipse',
+                  'line',
+                  'stamp',
+                ] as const
+              ).map((tool) => (
+                <option key={tool} value={tool}>
+                  {tool === 'select' ? 'Select feedback' : tool[0].toUpperCase() + tool.slice(1)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Ink
+            <input
+              aria-label="Feedback ink color"
+              type="color"
+              value={feedbackColor}
+              disabled={feedback.disabled}
+              onChange={(event) => setFeedbackColor(event.target.value)}
+            />
+          </label>
+          {['text', 'comment', 'stamp'].includes(feedbackTool) && (
+            <label className="feedback-mark-copy">
+              Mark text
+              <input
+                aria-label="Feedback mark text"
+                value={feedbackText}
+                maxLength={feedbackTool === 'stamp' ? 160 : 1000}
+                disabled={feedback.disabled}
+                onChange={(event) => setFeedbackText(event.target.value)}
+                placeholder={
+                  feedbackTool === 'stamp' ? 'Reviewed' : 'Write a note, then place it on the page'
+                }
+              />
+            </label>
+          )}
+          <button
+            className="review-button"
+            disabled={feedback.disabled || !feedback.annotations.length}
+            onClick={() => feedback.onChange!(feedback.annotations.slice(0, -1))}
+          >
+            Remove last mark
+          </button>
+          <span>
+            Draw on the page, or focus it and press Enter. {feedback.annotations.length}/500
+          </span>
+        </div>
+      )}
       <div className="review-document-body">
         <div
           className="review-paper-scroll"
           ref={surface}
           tabIndex={0}
-          aria-label="Frozen submission document"
+          aria-label={
+            sourceOnly ? 'Assignment source with returned feedback' : 'Frozen submission document'
+          }
         >
           {loading && (
             <p className="review-canvas-message" role="status">
@@ -215,58 +304,92 @@ export function CanvasReviewDocument({ source, pages, annotations }: Props) {
                     ))}
                   </svg>
                 )}
+                {feedback && measuredPage === pageIndex && (
+                  <FeedbackAnnotationLayer
+                    key={pageIndex}
+                    {...feedback}
+                    pageIndex={pageIndex}
+                    width={page.width}
+                    height={page.height}
+                    scale={scale}
+                    tool={feedbackTool}
+                    color={feedbackColor}
+                    text={feedbackText}
+                  />
+                )}
               </div>
             </div>
           )}
         </div>
-        <aside className="review-inspector" aria-label="Student comments and page text">
-          <div className="review-inspector-heading">
-            <MessageSquare size={17} />
-            <h2>Student comments</h2>
-            <span>{comments.length}</span>
-          </div>
-          <p className="review-small">Page {pageIndex + 1} · captured work</p>
-          {renderBudgetExceeded && (
-            <p className="review-notice" role="alert">
-              This page has more than 5,000 annotations. The annotation layer is too large to
-              display here; the preserved submission is unchanged.
-            </p>
-          )}
-          {comments.length ? (
-            <>
-              <ol className="review-comments" start={commentPage * 25 + 1}>
-                {shownComments.map((comment, index) => (
-                  <li key={comment.id}>
-                    <span className="review-comment-mark">{commentPage * 25 + index + 1}</span>
-                    <div>
-                      <strong>Student</strong>
-                      <p>{comment.text || 'Empty comment'}</p>
-                    </div>
-                  </li>
+        <aside className="review-inspector" aria-label="Feedback and page text">
+          {feedbackPanel}
+          {feedback && (
+            <details className="review-transcript" open={sourceOnly}>
+              <summary>
+                Teacher marks on this page (
+                {feedback.annotations.filter((a) => a.pageIndex === pageIndex).length})
+              </summary>
+              {feedback.annotations
+                .filter((a) => a.pageIndex === pageIndex)
+                .map((a) => (
+                  <p key={a.id}>
+                    <strong>{a.type}</strong>
+                    {a.text ? ` · ${a.text}` : ''}
+                  </p>
                 ))}
-              </ol>
-              {comments.length > 25 && (
-                <nav className="review-comment-pages" aria-label="Comment pages">
-                  <button
-                    disabled={commentPage === 0}
-                    onClick={() => setCommentPage((value) => value - 1)}
-                  >
-                    Previous comments
-                  </button>
-                  <span>
-                    {commentPage + 1} / {Math.ceil(comments.length / 25)}
-                  </span>
-                  <button
-                    disabled={(commentPage + 1) * 25 >= comments.length}
-                    onClick={() => setCommentPage((value) => value + 1)}
-                  >
-                    Next comments
-                  </button>
-                </nav>
+            </details>
+          )}
+          {!sourceOnly && (
+            <>
+              <div className="review-inspector-heading">
+                <MessageSquare size={17} />
+                <h2>Student comments</h2>
+                <span>{comments.length}</span>
+              </div>
+              <p className="review-small">Page {pageIndex + 1} · captured work</p>
+              {renderBudgetExceeded && (
+                <p className="review-notice" role="alert">
+                  This page has more than 5,000 annotations. The annotation layer is too large to
+                  display here; the preserved submission is unchanged.
+                </p>
+              )}
+              {comments.length ? (
+                <>
+                  <ol className="review-comments" start={commentPage * 25 + 1}>
+                    {shownComments.map((comment, index) => (
+                      <li key={comment.id}>
+                        <span className="review-comment-mark">{commentPage * 25 + index + 1}</span>
+                        <div>
+                          <strong>Student</strong>
+                          <p>{comment.text || 'Empty comment'}</p>
+                        </div>
+                      </li>
+                    ))}
+                  </ol>
+                  {comments.length > 25 && (
+                    <nav className="review-comment-pages" aria-label="Comment pages">
+                      <button
+                        disabled={commentPage === 0}
+                        onClick={() => setCommentPage((value) => value - 1)}
+                      >
+                        Previous comments
+                      </button>
+                      <span>
+                        {commentPage + 1} / {Math.ceil(comments.length / 25)}
+                      </span>
+                      <button
+                        disabled={(commentPage + 1) * 25 >= comments.length}
+                        onClick={() => setCommentPage((value) => value + 1)}
+                      >
+                        Next comments
+                      </button>
+                    </nav>
+                  )}
+                </>
+              ) : (
+                <p className="review-empty-comments">No student comments on this page.</p>
               )}
             </>
-          ) : (
-            <p className="review-empty-comments">No student comments on this page.</p>
           )}
           <details className="review-transcript">
             <summary>
@@ -293,8 +416,9 @@ export function CanvasReviewDocument({ source, pages, annotations }: Props) {
             </details>
           )}
           <p className="review-inspector-foot">
-            Viewing the captured student layer. Teacher feedback and grading are not available in
-            this viewer yet.
+            {sourceOnly
+              ? 'Assignment source and returned teacher feedback. The captured student annotation layer is not included in this view.'
+              : 'Student work is preserved. Teacher feedback is a separate layer.'}
           </p>
         </aside>
       </div>

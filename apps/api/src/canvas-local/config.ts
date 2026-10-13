@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { createPrivateKey, createPublicKey, X509Certificate } from 'node:crypto';
 import { dirname, sep } from 'node:path';
 import type { PoolConfig } from 'pg';
+import { loadCanvasFeedbackDatabase } from './feedback-companion.js';
 import { strictJson } from '../strict-json.js';
 import { assertNoPendingCertificateMaintenance } from './certificate-barrier.js';
 import {
@@ -41,9 +42,13 @@ export interface CanvasLocalConfiguration {
   toolSigning: { kid: string; privateKeyPem: Buffer };
   tls: { key: Buffer; cert: Buffer };
   databases: Record<CanvasDatabasePurpose, PoolConfig>;
+  feedbackDatabase?: PoolConfig;
 }
 interface References
-  extends Omit<CanvasLocalConfiguration, 'secrets' | 'toolSigning' | 'tls' | 'databases'> {
+  extends Omit<
+    CanvasLocalConfiguration,
+    'secrets' | 'toolSigning' | 'tls' | 'databases' | 'feedbackDatabase'
+  > {
   secrets: Record<SecretPurpose, string>;
   toolSigning: { kid: string; privateKeyFile: string };
   tls: { keyFile: string; certFile: string };
@@ -436,6 +441,7 @@ export async function loadCanvasLocalConfig(
       toolSigning: { kid: refs.toolSigning.kid, privateKeyPem: signingPem },
       tls: { key: tlsKey, cert: tlsCert },
       databases,
+      feedbackDatabase: await loadCanvasFeedbackDatabase(dirname(configPath)),
     };
     // Callers own their provider snapshots. Disposal clears our byte buffers; immutable strings/KeyObjects remain subject to GC.
     return { configuration, dispose };

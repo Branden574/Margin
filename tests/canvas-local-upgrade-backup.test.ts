@@ -11,6 +11,7 @@ vi.mock('node:child_process', async (original) => {
 });
 // The real child is a bounded local fixture; PostgreSQL is never contacted by these process tests.
 const native = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+import { migrationManifest } from '../apps/api/src/canvas-local/bootstrap';
 import { createCanvasUpgradeBackup } from '../apps/api/src/canvas-local/upgrade-backup';
 
 describe('Canvas upgrade backup process cancellation', () => {
@@ -66,7 +67,7 @@ describe('Canvas upgrade backup process cancellation', () => {
             systemIdentifier: 'test',
             files: {},
           },
-          [],
+          await migrationManifest(12),
           { maximumArchiveBytes: 1024, timeoutMs: 1000 },
         ),
       ).rejects.toThrow('backup could not be verified');

@@ -7,6 +7,12 @@ import type {
   ReviewSubmission,
 } from '../../apps/api/src/assignments/review/types';
 import { canonical } from '../../apps/api/src/sync/validation';
+import type {
+  FeedbackCommand,
+  TeacherFeedback,
+  SaveFeedbackInput,
+  ReleaseFeedbackInput,
+} from '../../apps/api/src/assignments/feedback/types';
 
 /** Synthetic browser transport only; never mount in the application runtime. */
 export async function canvasReviewFixture() {
@@ -205,6 +211,25 @@ export async function canvasReviewFixture() {
       chunks: [{ index: 0, sha256: digest(payload), bytes: payload.length }],
     });
   }
+  const feedback = new Map<string, TeacherFeedback>();
+  const feedbackCommands = new Map<string, FeedbackCommand>();
+  for (const snapshot of snapshots.values())
+    feedback.set(snapshot.submission.id, {
+      capture: {
+        submissionId: snapshot.submission.id,
+        snapshotPin: snapshot.snapshotPin,
+        documentId: snapshot.documentId,
+        versionId: snapshot.versionId,
+        frozenCursor: snapshot.submission.frozenCursor,
+        frozenAt: snapshot.submission.frozenAt,
+        pages: snapshot.pages,
+        source: snapshot.source,
+      },
+      revision: 0,
+      savedAt: null,
+      content: { comment: '', annotations: [] },
+      released: null,
+    });
   const state = {
     authorized: true,
     role: 'teacher',
@@ -228,7 +253,9 @@ export async function canvasReviewFixture() {
     submissions,
     snapshots,
     requests,
-    async handle(url: URL, method: string) {
+    feedback,
+    feedbackCommands,
+    async handle(url: URL, method: string, body?: string) {
       requests.push({ pathname: url.pathname, method });
       if (!state.authorized)
         return error('session_revoked', 'The synthetic teacher launch was revoked.', 401);
@@ -246,7 +273,55 @@ export async function canvasReviewFixture() {
           expiresAt: Date.now() + 3_600_000,
           csrfToken: 'a'.repeat(43),
         });
-      if (method !== 'GET') return error('read_only', 'Synthetic review is read-only.', 405);
+      const feedbackRoute =
+        /^\/api\/assignments\/review\/submissions\/([^/]+)\/feedback(?:\/(release|commands\/[^/]+))?$/.exec(
+          url.pathname,
+        );
+      if (feedbackRoute) {
+        const current = feedback.get(feedbackRoute[1]);
+        if (!current || state.role !== 'teacher')
+          return error('feedback_unavailable', 'Feedback is unavailable.', 404);
+        if (method === 'GET') {
+          if (!feedbackRoute[2]) return json(current);
+          const command = feedbackCommands.get(feedbackRoute[2].split('/')[1]);
+          return command
+            ? json(command)
+            : error('feedback_command_not_found', 'The feedback command was not found.', 404);
+        }
+        const input = JSON.parse(body ?? '{}') as SaveFeedbackInput | ReleaseFeedbackInput;
+        const existing = feedbackCommands.get(input.requestId);
+        if (existing) return json(existing, existing.state === 'accepted' ? 200 : 409);
+        const action = method === 'PUT' ? 'save' : 'release';
+        const rejected =
+          input.snapshotPin !== current.capture.snapshotPin ||
+          input.expectedRevision !== current.revision;
+        if (!rejected) {
+          if (action === 'save') {
+            current.revision++;
+            current.savedAt = new Date().toISOString();
+            current.content = structuredClone((input as SaveFeedbackInput).content);
+          } else
+            current.released = {
+              revision: current.revision,
+              releasedAt: new Date().toISOString(),
+              content: structuredClone(current.content),
+            };
+        }
+        const command: FeedbackCommand = {
+          requestId: input.requestId,
+          snapshotPin: input.snapshotPin,
+          expectedRevision: input.expectedRevision,
+          action,
+          state: rejected ? 'rejected' : 'accepted',
+          code: rejected ? 'revision_changed' : null,
+          revision: current.revision,
+          savedAt: current.savedAt,
+          releasedAt: current.released?.releasedAt ?? null,
+        };
+        feedbackCommands.set(input.requestId, command);
+        return json(command, rejected ? 409 : 200);
+      }
+      if (method !== 'GET') return error('read_only', 'Captured student review is read-only.', 405);
       if (url.pathname === '/api/assignments/review') return json(context);
       if (url.pathname === '/api/assignments/review/submissions') {
         const after = url.searchParams.get('after') ?? '';

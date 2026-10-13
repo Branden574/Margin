@@ -100,7 +100,13 @@ export async function startCanvasLocalApi(
         },
         lmsLookupKey: config.secrets.lms,
         resourceHmacKey: config.secrets.resource,
-        submissions: { databases: config.databases, captureEnabled: config.captureEnabled },
+        submissions: {
+          databases: {
+            ...config.databases,
+            ...(config.feedbackDatabase ? { feedback: config.feedbackDatabase } : {}),
+          },
+          captureEnabled: config.captureEnabled,
+        },
       },
       {
         keys,

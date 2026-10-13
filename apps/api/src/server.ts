@@ -29,6 +29,8 @@ import { handleSubmissions, isSubmissionPath } from './submission-http.js';
 import type { AssignmentSubmissionService } from './assignments/submissions/types.js';
 import { handleSubmissionReview, isSubmissionReviewPath } from './submission-review-http.js';
 import type { AssignmentReviewService } from './assignments/review/types.js';
+import type { AssignmentFeedbackService } from './assignments/feedback/types.js';
+import { handleSubmissionFeedback, isSubmissionFeedbackPath } from './submission-feedback-http.js';
 import { handleSourceUploads, isSourceUploadPath } from './source-upload-http.js';
 import { IngestionError } from './ingestion/types.js';
 import type { SourceUploadService } from './ingestion/upload.js';
@@ -66,6 +68,8 @@ export interface ApiOptions {
   assignmentSubmissionService?: AssignmentSubmissionService;
   /** Explicit read-only author-teacher review; never implies Canvas delivery. */
   assignmentReviewService?: AssignmentReviewService;
+  /** Separate encrypted teacher drafts and explicitly returned student feedback. */
+  assignmentFeedbackService?: AssignmentFeedbackService;
   /** Teacher-owned source intake; uploads remain quarantined until independent inspection. */
   sourceUploadService?: SourceUploadService;
   keyEncryptionKey?: Buffer;
@@ -203,6 +207,7 @@ export function createApi(options: ApiOptions) {
       options.assignmentWorkService ||
       options.assignmentSubmissionService ||
       options.assignmentReviewService ||
+      options.assignmentFeedbackService ||
       options.sourceUploadService) &&
     (!options.identityService || !options.lmsService)
   )
@@ -445,6 +450,7 @@ export function createApi(options: ApiOptions) {
           assignmentWorkConfigured: Boolean(options.assignmentWorkService),
           assignmentSubmissionsConfigured: Boolean(options.assignmentSubmissionService),
           assignmentReviewConfigured: Boolean(options.assignmentReviewService),
+          assignmentFeedbackConfigured: Boolean(options.assignmentFeedbackService),
           sourceUploadsConfigured: Boolean(options.sourceUploadService),
         });
         return;
@@ -496,6 +502,20 @@ export function createApi(options: ApiOptions) {
             options.identityService!.verifyCsrf(req, fresh);
             return fresh.principal;
           });
+          return;
+        }
+        if (isSubmissionFeedbackPath(path)) {
+          await handleSubmissionFeedback(
+            req,
+            res,
+            options.assignmentFeedbackService,
+            principal,
+            async () => {
+              const fresh = await options.identityService!.authenticateRequest(req);
+              options.identityService!.verifyCsrf(req, fresh);
+              return fresh.principal;
+            },
+          );
           return;
         }
         if (isSubmissionReviewPath(path)) {

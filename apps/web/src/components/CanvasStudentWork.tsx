@@ -12,6 +12,7 @@ import { ArrowLeft, Loader2, LockKeyhole, RefreshCw } from 'lucide-react';
 import type { AnnotationTool, DocumentRecord } from '@margin/core';
 import { Brand } from './Brand';
 import { CanvasSubmissionStatus } from './CanvasSubmissionStatus';
+import { CanvasReturnedFeedback } from './CanvasReturnedFeedback';
 import { createStudentWorkController } from '../lib/assignment-work/controller';
 import type { StudentWorkController } from '../lib/assignment-work/controllerTypes';
 import { readAssignmentSnapshot } from '../lib/assignment-work/repository';
@@ -209,6 +210,10 @@ function StudentWorkSession({ controller }: { controller: StudentWorkController 
           : state.saveStatus === 'acknowledged'
             ? 'Server has acknowledged the saved edits.'
             : 'Your private assignment copy';
+  const capturedSubmission =
+    state.submissionRecord?.outcome?.state === 'captured'
+      ? state.submissionRecord.outcome.submission
+      : state.submissionHistory[0];
   const controls = (
     <section className="canvas-work-status" aria-label="Canvas assignment status">
       <div>
@@ -302,6 +307,15 @@ function StudentWorkSession({ controller }: { controller: StudentWorkController 
         >
           Discard unsaved changes and refresh
         </button>
+      )}
+      {capturedSubmission && loaded && !terminal && (
+        <CanvasReturnedFeedback
+          key={`${identity}:${capturedSubmission.id}`}
+          submissionId={capturedSubmission.id}
+          documentId={loaded.document.id}
+          contentRevision={loaded.document.contentRevision!}
+          source={loaded.blob}
+        />
       )}
       <CanvasSubmissionStatus
         state={state}

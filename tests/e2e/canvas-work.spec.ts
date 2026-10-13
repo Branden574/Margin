@@ -114,7 +114,9 @@ test('submission capture freezes acknowledged work while later draft edits stay 
   const panel = page.getByRole('region', { name: 'Canvas submission', exact: true });
   await expect(panel.getByText('Submission version saved', { exact: true })).toBeVisible();
   await expect(
-    panel.getByText('Preparing submission. Not submitted to Canvas yet.', { exact: true }),
+    panel.getByText('Your submission version is saved. Canvas delivery has not been confirmed.', {
+      exact: true,
+    }),
   ).toBeVisible();
   await expect(page.getByText('Not submitted to Canvas', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Text', exact: true })).toBeDisabled();
@@ -153,7 +155,9 @@ test('submission capture freezes acknowledged work while later draft edits stay 
   );
   await panel.getByRole('button', { name: 'Check submission status', exact: true }).click();
   await expect(
-    panel.getByText('Preparing submission. Not submitted to Canvas yet.', { exact: true }),
+    panel.getByText('Your submission version is saved. Canvas delivery has not been confirmed.', {
+      exact: true,
+    }),
   ).toBeVisible();
   expect(fixture.captures).toHaveLength(1);
   expect(failures).toEqual([]);
@@ -277,7 +281,9 @@ test('failed preparation retries the frozen version and recovers a lost retry af
     panel.getByRole('button', { name: 'Confirm preparation retry', exact: true }),
   ).toHaveCount(0);
   await expect(
-    panel.getByText('Preparing submission. Not submitted to Canvas yet.', { exact: true }),
+    panel.getByText('Your submission version is saved. Canvas delivery has not been confirmed.', {
+      exact: true,
+    }),
   ).toBeVisible();
   await expect(page.getByText('Not submitted to Canvas', { exact: true })).toBeVisible();
   expect(fixture.reprocessPosts).toEqual([2, 2]);
@@ -289,4 +295,65 @@ test('failed preparation retries the frozen version and recovers a lost retry af
     .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
     .analyze();
   expect(a11y.violations).toEqual([]);
+});
+
+test('student opens returned feedback against the source without substituting later draft annotations', async ({
+  page,
+}) => {
+  const fixture = await installFixture(page);
+  fixture.state.submissionsConfigured = true;
+  await openWork(page);
+  await addText(page, 'Student captured response');
+  await page.getByRole('button', { name: 'Submit assignment', exact: true }).click();
+  const panel = page.getByRole('region', { name: 'Canvas submission', exact: true });
+  await expect(panel.getByText('Submission version saved', { exact: true })).toBeVisible();
+  const submission = fixture.submissions[0];
+  fixture.returnedFeedback.set(submission.id, {
+    revision: 1,
+    releasedAt: new Date().toISOString(),
+    content: {
+      comment: 'Good evidence. Explain the connection.',
+      annotations: [
+        {
+          id: '80000000-0000-4000-8000-000000000001',
+          pageIndex: 0,
+          type: 'text',
+          x: 70,
+          y: 180,
+          text: 'Explain this detail',
+          color: '#b85d3c',
+          strokeWidth: 1,
+          opacity: 1,
+          createdAt: Date.now(),
+          author: 'Teacher',
+        },
+      ],
+    },
+  });
+  await panel.getByRole('button', { name: 'Continue draft', exact: true }).click();
+  await addText(page, 'Later mutable draft response', 330);
+  await page.getByRole('button', { name: 'Check feedback', exact: true }).click();
+  await expect(
+    page.getByRole('button', { name: 'Open returned feedback', exact: true }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Open returned feedback', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Returned feedback', exact: true });
+  await expect(dialog).toBeVisible();
+  await expect(
+    dialog.getByText('Good evidence. Explain the connection.', { exact: true }),
+  ).toBeVisible();
+  await expect(dialog.locator('.feedback-annotation-layer text')).toHaveText('Explain this detail');
+  await expect(dialog.getByText('Later mutable draft response', { exact: true })).toHaveCount(0);
+  await expect(dialog.locator('.editor-annotation-layer')).toHaveCount(0);
+  await expect(dialog.getByRole('combobox', { name: 'Feedback tool', exact: true })).toHaveCount(0);
+  const a11y = await new AxeBuilder({ page })
+    .include('#returned-feedback-dialog')
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+    .analyze();
+  expect(a11y.violations).toEqual([]);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+  await expect(
+    page.getByRole('button', { name: 'Open returned feedback', exact: true }),
+  ).toBeFocused();
 });

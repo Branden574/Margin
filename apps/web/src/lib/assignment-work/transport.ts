@@ -67,12 +67,13 @@ export class Transport {
     expectedStatus: number | readonly number[],
     body?: string,
     csrf?: string,
+    method?: 'POST' | 'PUT',
   ) {
     scope.check();
     const url = `${this.origin}${path}`;
     const response = await scope.wait(
       this.fetcher(url, {
-        method: body === undefined ? 'GET' : 'POST',
+        method: body === undefined ? 'GET' : (method ?? 'POST'),
         mode: 'same-origin',
         credentials: 'same-origin',
         cache: 'no-store',

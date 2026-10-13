@@ -50,6 +50,10 @@ Data and credentials remain on disk. There is no background launch agent or auto
 
 Setup issues a 30-day PostgreSQL server leaf and copies the existing API leaf with its original expiry. Database leaf renewal is a separate explicit operation described below. Synchronizing a renewed browser/API certificate remains an operator gap; database renewal does not replace that certificate or change OS trust. The additive database upgrade does not renew either certificate.
 
+## Optional feedback provisioning
+
+Teacher feedback uses an additional dedicated credential and additive migration 014. Stop this installation's API/scanner/workers, leave its PostgreSQL cluster running, and run `npm run setup:canvas -- enable-feedback` (append `--root /absolute/path/to/owned/canvas` for a custom installation). Existing v13 files, credentials and captures are preserved; v12 installations must first run the separate `upgrade` action. See [feedback setup and interrupted-operation recovery](CANVAS_FEEDBACK_SETUP.md) before maintenance. Feedback remains unavailable until its private installation receipt is verified and published.
+
 ## Explicit PostgreSQL certificate renewal
 
 Stop the Canvas API, inspector and other clients of this dedicated database, then run:

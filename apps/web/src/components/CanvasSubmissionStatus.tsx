@@ -33,7 +33,7 @@ export function CanvasSubmissionStatus({
     captured &&
     (!record?.retry || record.retry.expectedRevision < status.revision);
   const descriptions = {
-    processing: 'Preparing submission. Not submitted to Canvas yet.',
+    processing: 'Your submission version is saved. Canvas delivery has not been confirmed.',
     queued: 'Waiting for Canvas. Delivery has not been confirmed.',
     sending: 'Sending the saved submission version to Canvas.',
     uncertain: 'Canvas delivery is awaiting confirmation. Your saved version is kept.',

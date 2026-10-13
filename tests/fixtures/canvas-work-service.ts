@@ -1,4 +1,6 @@
 import { PDFDocument, StandardFonts } from 'pdf-lib';
+import { createHash } from 'node:crypto';
+import type { FeedbackRelease } from '../../apps/api/src/assignments/feedback/types';
 import type { AppendOperation, CommittedOperation } from '../../apps/api/src/sync/types';
 import type {
   SubmissionInput,
@@ -34,6 +36,7 @@ export async function canvasWorkFixture({
   const submissionRequests = new Map<string, SubmissionRequest>();
   const submissions: SubmissionStatus[] = [];
   const frozenOperations = new Map<string, CommittedOperation[]>();
+  const returnedFeedback = new Map<string, FeedbackRelease>();
   const reprocessRequests = new Map<number, SubmissionReprocessRequest>();
   const reprocessPosts: number[] = [];
   const state = {
@@ -60,6 +63,7 @@ export async function canvasWorkFixture({
     submissionRequests,
     submissions,
     frozenOperations,
+    returnedFeedback,
     reprocessRequests,
     reprocessPosts,
     async handle(url: URL, method: string, body?: string) {
@@ -82,6 +86,34 @@ export async function canvasWorkFixture({
           expiresAt: createdAt + 3_600_000,
           csrfToken: 'a'.repeat(43),
         });
+      const feedbackMatch = /^\/api\/assignments\/work\/submissions\/([^/]+)\/feedback$/.exec(
+        url.pathname,
+      );
+      if (feedbackMatch && method === 'GET') {
+        const submission = submissions.find((row) => row.id === feedbackMatch[1]);
+        if (!submission)
+          return json(
+            { error: { code: 'feedback_unavailable', message: 'No captured feedback source.' } },
+            404,
+          );
+        return json({
+          capture: {
+            submissionId: submission.id,
+            snapshotPin: createHash('sha256').update(`feedback-${submission.id}`).digest('hex'),
+            documentId: id(6),
+            versionId: id(7),
+            frozenCursor: submission.frozenCursor,
+            frozenAt: submission.frozenAt,
+            pages: [{ id: id(8), index: 0, width: 612, height: 792 }],
+            source: {
+              sha256: createHash('sha256').update(bytes).digest('hex'),
+              bytes: bytes.length,
+              mimeType: 'application/pdf',
+            },
+          },
+          released: returnedFeedback.get(submission.id) ?? null,
+        });
+      }
       if (
         url.pathname === '/api/assignments/work/submissions' ||
         url.pathname.startsWith('/api/assignments/work/submissions/') ||

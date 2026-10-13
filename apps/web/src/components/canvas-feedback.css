@@ -1,0 +1,204 @@
+.teacher-feedback {
+  padding-bottom: 22px;
+}
+.feedback-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.teacher-feedback h2 {
+  font-size: 13px;
+  font-weight: 700;
+}
+.feedback-heading > span {
+  color: var(--accent-hover);
+  font-size: 10px;
+  font-weight: 600;
+}
+.feedback-description {
+  font-size: 11px;
+  color: var(--review-secondary);
+  line-height: 1.7;
+  margin: 12px 0 19px;
+}
+.teacher-feedback label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.teacher-feedback textarea {
+  resize: vertical;
+  min-height: 115px;
+  max-height: 45vh;
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 6px;
+  padding: 11px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.feedback-save-status {
+  font-size: 10px;
+  color: var(--review-secondary);
+  line-height: 1.6;
+  margin: 9px 0 15px;
+}
+.feedback-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.feedback-actions .button {
+  min-height: 36px;
+  font-size: 11px;
+  padding: 8px 12px;
+}
+.feedback-error {
+  font-size: 12px;
+  color: var(--accent-hover);
+  line-height: 1.6;
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+}
+.feedback-release-note,
+.feedback-limit {
+  font-size: 10px;
+  line-height: 1.7;
+  color: var(--review-secondary);
+  margin-top: 14px;
+}
+.feedback-limit {
+  padding-top: 13px;
+  border-top: 1px solid var(--border);
+}
+.feedback-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  gap: 9px 15px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.feedback-tools label {
+  display: flex;
+  align-items: center;
+  flex-direction: row;
+  gap: 8px;
+  font-size: 10px;
+}
+.feedback-tools select,
+.feedback-tools input {
+  background: var(--subtle);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 6px 8px;
+  min-height: 32px;
+  color: var(--ink);
+}
+.feedback-tools input[type='color'] {
+  width: 38px;
+  padding: 3px;
+}
+.feedback-tools > span {
+  font-size: 10px;
+  color: var(--review-secondary);
+}
+.feedback-tools .feedback-mark-copy {
+  flex: 1 1 260px;
+}
+.feedback-mark-copy input {
+  width: 100%;
+  min-width: 0;
+}
+.feedback-annotation-layer.is-editable {
+  pointer-events: auto;
+  touch-action: none;
+  cursor: crosshair;
+}
+.feedback-annotation-layer:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.returned-feedback-summary {
+  flex-basis: 100%;
+  width: 100%;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.returned-feedback-summary > div:first-child {
+  flex: 1 1 250px;
+  min-width: 0;
+}
+.returned-feedback-summary strong {
+  font-size: 12px;
+}
+.returned-feedback-summary p {
+  font-size: 11px;
+  line-height: 1.7;
+}
+.returned-feedback-comment {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.8;
+  margin-top: 12px;
+  font-size: 12px;
+}
+.returned-feedback-dialog.canvas-review {
+  width: calc(100vw - 40px);
+  max-width: 1500px;
+  height: calc(100dvh - 40px);
+  min-height: 0;
+  max-height: calc(100dvh - 40px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.returned-feedback-dialog:not([open]) {
+  display: none;
+}
+.returned-feedback-dialog::backdrop {
+  background: #171c24a6;
+}
+.returned-feedback-dialog .review-document {
+  min-height: 0;
+  overflow: auto;
+}
+.returned-feedback-dialog .review-inspector {
+  background: var(--surface);
+}
+@media (max-width: 700px) {
+  .feedback-tools {
+    padding: 10px 12px;
+  }
+  .feedback-tools .feedback-mark-copy {
+    flex-basis: 100%;
+  }
+  .returned-feedback-dialog.canvas-review {
+    width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    border-radius: 0;
+  }
+}
+
+.feedback-annotation-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  overflow: hidden;
+}

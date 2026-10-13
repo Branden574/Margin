@@ -113,7 +113,10 @@ export async function createCanvasUpgradeBackup(
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
   await checkDedicatedDirectory(parent);
-  const directory = await mkdtemp(join(parent, 'before-013-'));
+  const from = migrations.length,
+    to = from + 1;
+  if (from !== 12 && from !== 13) throw new Error('Unsupported backup migration boundary.');
+  const directory = await mkdtemp(join(parent, `before-${String(to).padStart(3, '0')}-`));
   await syncDirectory(parent);
   const archive = join(directory, 'database.dump');
   try {
@@ -205,15 +208,14 @@ export async function createCanvasUpgradeBackup(
         JSON.stringify(
           {
             schema: 1,
-            from: 12,
-            to: 13,
+            from,
+            to,
             ...identity,
             migrations,
             archive: 'database.dump',
             sha256: digest,
             bytes,
-            restore:
-              'Restore with pg_restore into a separate verified-TLS PostgreSQL database using the retained original roles, then validate schema 001–012 and its policy contract. Keep the original protected root, keys, credentials and encrypted artifacts. This archive does not copy artifact files or global PostgreSQL roles. Never automatically restore over the live database.',
+            restore: `Restore with pg_restore into a separate verified-TLS PostgreSQL database using the retained original roles, then validate schema 001–${String(from).padStart(3, '0')} and its policy contract. Keep the original protected root, keys, credentials and encrypted artifacts. This archive does not copy artifact files or global PostgreSQL roles. Never automatically restore over the live database.`,
           },
           null,
           2,

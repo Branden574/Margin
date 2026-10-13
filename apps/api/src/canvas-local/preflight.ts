@@ -4,7 +4,7 @@ import { CANVAS_DATABASE_ROLES, CANVAS_MIGRATIONS, migrationManifest } from './b
 import { CANVAS_DATABASE_PURPOSES, type CanvasDatabasePurpose } from './config.js';
 
 export type CanvasDatabases = Record<CanvasDatabasePurpose, PoolConfig>;
-export type CanvasReadinessPurpose = CanvasDatabasePurpose | 'inspector';
+export type CanvasReadinessPurpose = CanvasDatabasePurpose | 'inspector' | 'feedback';
 type Check =
   | 'configuration'
   | 'connection'
@@ -37,7 +37,7 @@ const schemas = [
   'margin_submissions',
   'margin_review',
 ];
-const allSchemas = [...schemas, 'margin_local'];
+const allSchemas = [...schemas, 'margin_feedback', 'margin_local'];
 const groups = [
   ...Object.values(CANVAS_DATABASE_ROLES),
   'margin_identity_provisioner',
@@ -160,12 +160,12 @@ interface PolicyContract {
   command: string;
   permissive: boolean;
 }
-async function schemaContract() {
+async function schemaContract(through: 13 | 14) {
   const tables = new Set<string>(),
     functions = new Map<string, FunctionContract>(),
     triggers: TriggerContract[] = [],
     policies: PolicyContract[] = [];
-  for (const name of CANVAS_MIGRATIONS) {
+  for (const name of CANVAS_MIGRATIONS.slice(0, through)) {
     const sql = await readFile(
       new URL('../../../../infra/migrations/' + name, import.meta.url),
       'utf8',
@@ -233,13 +233,13 @@ async function schemaContract() {
       });
   }
   if (
-    tables.size !== 39 ||
-    functions.size !== 36 ||
-    triggers.length !== 10 ||
-    policies.length !== 182
+    tables.size !== (through === 14 ? 42 : 39) ||
+    functions.size !== (through === 14 ? 39 : 36) ||
+    triggers.length !== (through === 14 ? 11 : 10) ||
+    policies.length !== (through === 14 ? 188 : 182)
   )
     throw Error('Incomplete fixed migration contract');
-  return { tables, functions, triggers, policies };
+  return { tables, functions, triggers, policies, through };
 }
 
 async function role(c: PoolClient, expected: string) {
@@ -360,21 +360,24 @@ const columns = {
   },
 };
 async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaContract>>) {
+  const activeSchemas = contract.through === 14 ? [...schemas, 'margin_feedback'] : schemas;
+  const namespacesExpected = [...activeSchemas, 'margin_local'];
+  const activeGroups = contract.through === 14 ? [...groups, 'margin_feedback_runtime'] : groups;
   const roles = (
     await c.query<{ name: string; safe: boolean }>(
       `SELECT rolname AS name, NOT(rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication OR rolcanlogin OR rolinherit) AND NOT EXISTS(SELECT 1 FROM pg_auth_members m WHERE m.member=r.oid) AS safe FROM pg_roles r WHERE rolname=ANY($1)`,
-      [groups],
+      [activeGroups],
     )
   ).rows;
-  if (roles.length !== groups.length || roles.some((r) => !r.safe))
+  if (roles.length !== activeGroups.length || roles.some((r) => !r.safe))
     throw Error('Unsafe application groups');
   const namespaces = (
     await c.query<{ name: string }>(
       'SELECT nspname AS name FROM pg_namespace WHERE nspname=ANY($1)',
-      [allSchemas],
+      [namespacesExpected],
     )
   ).rows;
-  if (namespaces.length !== allSchemas.length) throw Error('Missing schema');
+  if (namespaces.length !== namespacesExpected.length) throw Error('Missing schema');
   const tables = (
     await c.query<{ name: string; safe: boolean }>(
       `SELECT n.nspname||'.'||t.relname AS name, t.relkind='r' AND t.relpersistence='p' AND t.relrowsecurity AND t.relforcerowsecurity
@@ -382,7 +385,7 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
     AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conrelid=t.oid AND NOT k.convalidated)
     AND EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid=t.oid)
     AS safe FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=ANY($1) AND t.relkind IN ('r','p','f')`,
-      [schemas],
+      [activeSchemas],
     )
   ).rows;
   if (
@@ -393,7 +396,7 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
   const attrs = (
     await c.query<{ table: string; column: string; type: string }>(
       `SELECT n.nspname||'.'||t.relname AS table,a.attname AS column,y.typname AS type FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_attribute a ON a.attrelid=t.oid JOIN pg_type y ON y.oid=a.atttypid WHERE n.nspname=ANY($1) AND a.attnum>0 AND NOT a.attisdropped`,
-      [schemas],
+      [activeSchemas],
     )
   ).rows;
   for (const [table, expected] of Object.entries(columns))
@@ -414,7 +417,7 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
       owner: string;
     }>(
       `SELECT n.nspname||'.'||f.proname AS name,f.prosrc AS body,l.lanname AS language,f.provolatile AS stable,f.prosecdef AS definer,f.proconfig AS config,ARRAY(SELECT t.typname::text FROM unnest(f.proargtypes) WITH ORDINALITY a(oid,position) JOIN pg_type t ON t.oid=a.oid ORDER BY a.position) AS args,pg_get_expr(f.proargdefaults,0) AS defaults,f.proleakproof OR f.prokind<>'f' OR f.proparallel<>'u' AS unsafe,pg_get_userbyid(f.proowner) AS owner FROM pg_proc f JOIN pg_namespace n ON n.oid=f.pronamespace JOIN pg_language l ON l.oid=f.prolang WHERE n.nspname=ANY($1)`,
-      [schemas],
+      [activeSchemas],
     )
   ).rows;
   if (functions.length !== contract.functions.size) throw Error('Function inventory drift');
@@ -452,7 +455,7 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
       initially_deferred: boolean;
     }>(
       `SELECT n.nspname||'.'||t.relname AS table,g.tgname AS name,pn.nspname||'.'||p.proname AS function,g.tgtype AS type,g.tgenabled AS enabled,g.tgqual IS NOT NULL OR g.tgnargs<>0 OR cardinality(g.tgattr::smallint[])>0 AS conditional,g.tgconstraint<>0 AS constraint_trigger,g.tgdeferrable AS deferrable,g.tginitdeferred AS initially_deferred FROM pg_trigger g JOIN pg_class t ON t.oid=g.tgrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_proc p ON p.oid=g.tgfoid JOIN pg_namespace pn ON pn.oid=p.pronamespace WHERE n.nspname=ANY($1) AND NOT g.tgisinternal`,
-      [schemas],
+      [activeSchemas],
     )
   ).rows;
   if (
@@ -483,13 +486,11 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
       permissive: boolean;
     }>(
       `SELECT n.nspname||'.'||t.relname AS table,p.polname AS name,ARRAY(SELECT r.rolname::text FROM pg_roles r WHERE r.oid=ANY(p.polroles) ORDER BY r.rolname) AS roles,p.polcmd AS command,p.polpermissive AS permissive FROM pg_policy p JOIN pg_class t ON t.oid=p.polrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=ANY($1)`,
-      [schemas],
+      [activeSchemas],
     )
   ).rows;
   if (
-    policies.some(
-      (p) => !p.roles.length || p.roles.some((r) => !groups.includes(r as (typeof groups)[number])),
-    ) ||
+    policies.some((p) => !p.roles.length || p.roles.some((r) => !activeGroups.includes(r))) ||
     contract.policies.some(
       (e) =>
         !policies.some(
@@ -510,7 +511,7 @@ async function schema(c: PoolClient, contract: Awaited<ReturnType<typeof schemaC
   const actualPolicies = (
     await c.query(
       `SELECT n.nspname||'.'||t.relname AS table_name,p.polname AS name,ARRAY(SELECT r.rolname::text FROM pg_roles r WHERE r.oid=ANY(p.polroles) ORDER BY r.rolname) AS roles,p.polcmd::text AS command,p.polpermissive AS permissive,pg_get_expr(p.polqual,p.polrelid,false) AS using_expression,pg_get_expr(p.polwithcheck,p.polrelid,false) AS check_expression FROM pg_policy p JOIN pg_class t ON t.oid=p.polrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=ANY($1) ORDER BY n.nspname,t.relname,p.polname`,
-      [schemas],
+      [activeSchemas],
     )
   ).rows;
   const installedPolicies = (
@@ -571,6 +572,21 @@ export async function assertCanvasInspectorReady(
   );
 }
 
+/** Optional dedicated feedback login; never reuse another API purpose's credential. */
+export async function assertCanvasFeedbackReady(
+  database: PoolConfig,
+  options: CanvasInspectorReadinessOptions,
+): Promise<void> {
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(options.instanceId))
+    throw new CanvasDatabasePreflightError('feedback', 'configuration');
+  await assertReady(
+    { feedback: database },
+    ['feedback'],
+    { feedback: 'margin_feedback_runtime' },
+    options,
+  );
+}
+
 async function assertReady<P extends CanvasReadinessPurpose>(
   input: Record<P, PoolConfig>,
   purposes: readonly P[],
@@ -589,9 +605,12 @@ async function assertReady<P extends CanvasReadinessPurpose>(
   active(first);
   const databases = configuration(input, purposes);
   let expectedManifest: Awaited<ReturnType<typeof migrationManifest>>,
-    contract: Awaited<ReturnType<typeof schemaContract>>;
+    contracts: Awaited<ReturnType<typeof schemaContract>>[];
   try {
-    [expectedManifest, contract] = await Promise.all([migrationManifest(), schemaContract()]);
+    [expectedManifest, contracts] = await Promise.all([
+      migrationManifest(14),
+      Promise.all([schemaContract(13), schemaContract(14)]),
+    ]);
   } catch {
     throw new CanvasDatabasePreflightError(first, 'schema');
   }
@@ -648,7 +667,11 @@ async function assertReady<P extends CanvasReadinessPurpose>(
           [expectedManifest.length + 1],
         )
       ).rows;
-      if (JSON.stringify(manifest) !== JSON.stringify(expectedManifest))
+      if (
+        (manifest.length !== 13 && manifest.length !== 14) ||
+        (purpose === 'feedback' && manifest.length !== 14) ||
+        JSON.stringify(manifest) !== JSON.stringify(expectedManifest.slice(0, manifest.length))
+      )
         throw Error('Migration ledger drift');
       const installation = (
         await client.query<{ id: number; instance_id: string; schema_version: number }>(
@@ -682,6 +705,7 @@ async function assertReady<P extends CanvasReadinessPurpose>(
         identity.port,
         identity.started,
         installation[0].instance_id,
+        manifest.length,
       ]);
       if (
         identity.database !== databases[purpose].database ||
@@ -693,7 +717,7 @@ async function assertReady<P extends CanvasReadinessPurpose>(
       databaseIdentity = actual;
       logins.add(identity.login);
       check = 'schema';
-      await schema(client, contract);
+      await schema(client, contracts[manifest.length - 13]);
       await client.query('ROLLBACK');
     } catch (error) {
       throw new CanvasDatabasePreflightError(
