@@ -7,6 +7,65 @@ import type {
   ReleaseFeedbackInput,
 } from '../../../../api/src/assignments/feedback/types';
 import * as decode from './decode';
+import type { Annotation } from '@margin/core';
+import type { AssignmentBinding } from '../assignment-work/repositoryTypes';
+import * as reviewDecode from '../assignment-review/decode';
+import {
+  readMaterializedAnnotations,
+  digestReviewBytes,
+} from '../assignment-review/materialization';
+import {
+  MAX_REVIEW_BYTES,
+  MAX_REVIEW_SOURCE_BYTES,
+  type ReviewSnapshot,
+  type ReviewLoadOptions,
+} from '../assignment-review/types';
+
+export interface ReturnedCaptureData {
+  feedback: decode.StudentFeedback;
+  detail: ReviewSnapshot;
+  annotations: Annotation[];
+  source: Blob;
+}
+export interface VerifiedReturnedCapture {
+  readonly kind: 'verified-returned-capture';
+}
+interface ReturnedCaptureRecord {
+  data: ReturnedCaptureData | null;
+  check: () => void;
+}
+const returnedProofs = new WeakMap<object, ReturnedCaptureRecord>();
+/** Live client provenance is required; a lookalike object cannot authorize a rendered capture. */
+export function readVerifiedReturnedCapture(proof: VerifiedReturnedCapture): ReturnedCaptureData {
+  const record = returnedProofs.get(proof);
+  if (!record?.data) throw new Error('Reopen returned feedback to verify the captured work.');
+  record.check();
+  return structuredClone(record.data);
+}
+export interface ReturnedCaptureInput {
+  expected: decode.StudentFeedback;
+  source: Blob;
+  /** Local values constrain the response. Current authenticated server identity grants access. */
+  readBinding: () => Promise<Pick<AssignmentBinding, 'identity' | 'sourceSha256'>>;
+}
+const immutableCapture = (detail: ReviewSnapshot) => ({
+  ...detail,
+  submission: {
+    id: detail.submission.id,
+    frozenAt: detail.submission.frozenAt,
+    frozenCursor: detail.submission.frozenCursor,
+  },
+});
+const feedbackCapture = (detail: ReviewSnapshot): decode.FeedbackCapture => ({
+  submissionId: detail.submission.id,
+  snapshotPin: detail.snapshotPin,
+  documentId: detail.documentId,
+  versionId: detail.versionId,
+  frozenCursor: detail.submission.frozenCursor,
+  frozenAt: detail.submission.frozenAt,
+  pages: detail.pages,
+  source: detail.source,
+});
 
 export type PendingFeedback =
   | { action: 'save'; input: SaveFeedbackInput }
@@ -35,6 +94,9 @@ export class FeedbackClient {
   private closed = false;
   private readonly scopes = new Set<RequestScope>();
   private readonly listeners = new Set<() => void>();
+  private returnedGeneration = 0;
+  private returnedProof: ReturnedCaptureRecord | null = null;
+  private readonly returnedScopes = new Set<RequestScope>();
   constructor(
     private readonly role: 'teacher' | 'student',
     readonly submissionId: string,
@@ -81,6 +143,7 @@ export class FeedbackClient {
   dispose() {
     if (this.closed) return;
     this.closed = true;
+    this.clearReturnedCapture();
     this.session = null;
     this.removeLock();
     for (const scope of this.scopes)
@@ -151,6 +214,7 @@ export class FeedbackClient {
       throw reason;
     } finally {
       this.scopes.delete(scope);
+      this.returnedScopes.delete(scope);
       scope.close();
     }
   }
@@ -181,6 +245,199 @@ export class FeedbackClient {
       if (result.capture.submissionId !== this.submissionId) throw decode.fail();
       return result;
     }, signal);
+  }
+  clearReturnedCapture() {
+    this.returnedGeneration++;
+    for (const scope of this.returnedScopes)
+      scope.controller.abort(new Error('The returned feedback view was closed.'));
+    this.returnedScopes.clear();
+    if (this.returnedProof) {
+      if (this.returnedProof.data) this.returnedProof.data.annotations.length = 0;
+      this.returnedProof.data = null;
+      this.returnedProof = null;
+    }
+  }
+  async loadReturnedCapture(
+    input: ReturnedCaptureInput,
+    options: ReviewLoadOptions = {},
+  ): Promise<VerifiedReturnedCapture> {
+    if (this.role !== 'student') throw decode.fail();
+    const expected = decode.student(structuredClone(input.expected));
+    if (!expected.released || expected.capture.submissionId !== this.submissionId)
+      throw new Error('Your teacher has not returned feedback for this captured version yet.');
+    const source = input.source;
+    if (
+      !(source instanceof Blob) ||
+      source.size !== expected.capture.source.bytes ||
+      source.size > MAX_REVIEW_SOURCE_BYTES
+    )
+      throw new Error(
+        'This returned document exceeds the browser PDF limit (50 MiB), or its source changed.',
+      );
+    this.clearReturnedCapture();
+    const generation = this.returnedGeneration;
+    const check = () => {
+      this.check();
+      if (generation !== this.returnedGeneration || options.signal?.aborted)
+        throw new Error('The returned feedback view was closed.');
+    };
+    let complete = false;
+    let annotations: Annotation[] = [];
+    try {
+      const data = await this.run(async (scope) => {
+        this.returnedScopes.add(scope);
+        const current = () => {
+          scope.check();
+          check();
+        };
+        const progress = (
+          stage: 'snapshot' | 'annotations' | 'source' | 'verifying',
+          completed: number,
+          total: number,
+        ) => {
+          current();
+          options.onProgress?.({ stage, completed, total });
+          current();
+        };
+        const binding = await scope.wait(input.readBinding());
+        current();
+        const identity = structuredClone(binding.identity);
+        if (
+          identity.origin !== this.origin ||
+          identity.organizationId !== this.session!.organizationId ||
+          identity.userId !== this.session!.userId
+        )
+          throw new Error(
+            'This saved assignment belongs to a different Canvas identity. Reopen the assignment.',
+          );
+        for (const name of [
+          'organizationId',
+          'userId',
+          'assignmentId',
+          'workId',
+          'documentId',
+          'versionId',
+        ] as const)
+          reviewDecode.id(identity[name]);
+        reviewDecode.hash(binding.sourceSha256);
+        const readFeedback = async (previous: decode.StudentFeedback) => {
+          const value = decode.student(
+            await this.transport.json(
+              scope,
+              await this.transport.request(scope, this.path(), 200),
+              1_048_576,
+            ),
+          );
+          if (
+            !value.released ||
+            !previous.released ||
+            !decode.same(value.capture, expected.capture) ||
+            value.released.revision < previous.released.revision ||
+            (value.released.revision === previous.released.revision &&
+              !decode.same(value.released, previous.released))
+          )
+            throw new Error(
+              'Returned feedback changed or is no longer available. Check feedback again.',
+            );
+          return value;
+        };
+        const readCapture = async () => {
+          const value = await this.transport.json(
+            scope,
+            await this.transport.request(scope, `${this.path()}/capture`, 200),
+            1_048_576,
+          );
+          // Expected assignment comes from the bound local copy, never the untrusted response.
+          const detail = reviewDecode.snapshot(
+            value,
+            {
+              assignment: { id: identity.assignmentId, title: '', instructions: '' },
+              mode: 'author-only',
+            },
+            this.session!.organizationId,
+            this.submissionId,
+            this.now(),
+          );
+          if (
+            detail.workId !== identity.workId ||
+            detail.documentId !== identity.documentId ||
+            detail.versionId !== identity.versionId ||
+            detail.source.sha256 !== binding.sourceSha256 ||
+            !decode.same(feedbackCapture(detail), expected.capture)
+          )
+            throw new Error(
+              'The returned capture does not match this assignment and feedback. Reopen it from Canvas.',
+            );
+          if (detail.outputBytes > MAX_REVIEW_BYTES)
+            throw new Error(
+              'This retained submission exceeds the browser annotation limit (32 MiB). Its saved capture remains available.',
+            );
+          return detail;
+        };
+        progress('snapshot', 0, 1);
+        const feedback = await readFeedback(expected);
+        const detail = await readCapture();
+        progress('snapshot', 1, 1);
+        annotations = await readMaterializedAnnotations({
+          detail,
+          scope,
+          transport: this.transport,
+          path: (index) => `${this.path()}/chunks/${index}?pin=${detail.snapshotPin}`,
+          check: current,
+          progress: (completed, total) => progress('annotations', completed, total),
+        });
+        progress('source', 0, source.size);
+        const bytes = new Uint8Array(
+          await scope.wait(source.arrayBuffer(), (late) => new Uint8Array(late).fill(0)),
+        );
+        try {
+          if (
+            new TextDecoder().decode(bytes.subarray(0, 5)) !== '%PDF-' ||
+            bytes.length !== detail.source.bytes ||
+            (await digestReviewBytes(bytes, scope)) !== detail.source.sha256
+          )
+            throw new Error(
+              'The preserved PDF source could not be verified. Reopen the assignment.',
+            );
+        } finally {
+          bytes.fill(0);
+        }
+        progress('source', source.size, source.size);
+        progress('verifying', 0, 1);
+        const finalDetail = await readCapture();
+        if (
+          finalDetail.submission.revision < detail.submission.revision ||
+          !decode.same(immutableCapture(detail), immutableCapture(finalDetail))
+        )
+          throw new Error(
+            'The captured submission changed while opening it. Check feedback again.',
+          );
+        const finalFeedback = await readFeedback(feedback);
+        const finalBinding = await scope.wait(input.readBinding());
+        if (
+          !decode.same(identity, finalBinding.identity) ||
+          finalBinding.sourceSha256 !== binding.sourceSha256
+        )
+          throw new Error(
+            'The saved assignment changed while opening feedback. Reopen it from Canvas.',
+          );
+        current();
+        progress('verifying', 1, 1);
+        return { feedback: finalFeedback, detail: finalDetail, annotations, source };
+      }, options.signal);
+      check();
+      const record: ReturnedCaptureRecord = { data, check };
+      const proof = Object.freeze({ kind: 'verified-returned-capture' }) as VerifiedReturnedCapture;
+      this.returnedProof = record;
+      returnedProofs.set(proof, record);
+      complete = true;
+      return proof;
+    } finally {
+      if (!complete) {
+        annotations.length = 0;
+        if (generation === this.returnedGeneration) this.clearReturnedCapture();
+      }
+    }
   }
   command(pending: PendingFeedback, lookup: boolean, signal?: AbortSignal) {
     if (this.role !== 'teacher') throw decode.fail();

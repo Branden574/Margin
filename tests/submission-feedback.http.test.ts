@@ -18,6 +18,7 @@ import {
   type FeedbackCommand,
   type TeacherFeedback,
 } from '../apps/api/src/assignments/feedback/types';
+import type { ReviewSnapshot } from '../apps/api/src/assignments/review/types';
 
 // Real HTTPS, session, CSRF and streaming-body boundaries. Service responses are synthetic;
 // submission-feedback.postgres.test.ts separately executes the actual encrypted/RLS service.
@@ -43,6 +44,8 @@ const teacher = `/api/assignments/review/submissions/${id}/feedback`,
   student = `/api/assignments/work/submissions/${id}/feedback`,
   release = teacher + '/release',
   command = teacher + '/commands/' + requestId;
+const capturePath = student + '/capture',
+  chunkPath = student + '/chunks/0?pin=' + pin;
 const content = { comment: 'Explain how the image supports your answer.', annotations: [] };
 const state: TeacherFeedback = {
   capture: {
@@ -78,12 +81,36 @@ const returned: FeedbackCommand = {
   releasedAt: new Date().toISOString(),
 };
 const released = { revision: 1, releasedAt: returned.releasedAt!, content };
+const snapshot: ReviewSnapshot = {
+  assignmentId: randomUUID(),
+  submission: {
+    id,
+    frozenCursor: 1,
+    frozenAt: state.capture.frozenAt,
+    revision: 2,
+    preparation: 'ready',
+    errorCode: null,
+  },
+  snapshotPin: pin,
+  organizationId: principal.organizationId,
+  workId: randomUUID(),
+  documentId: state.capture.documentId,
+  versionId: state.capture.versionId,
+  pages: state.capture.pages,
+  source: state.capture.source,
+  annotationCount: 1,
+  outputBytes: 100,
+  outputSha256: 'c'.repeat(64),
+  chunks: [{ index: 0, sha256: 'd'.repeat(64), bytes: 100 }],
+};
 const service = {
   teacher: vi.fn<AssignmentFeedbackService['teacher']>(),
   student: vi.fn<AssignmentFeedbackService['student']>(),
   save: vi.fn<AssignmentFeedbackService['save']>(),
   release: vi.fn<AssignmentFeedbackService['release']>(),
   command: vi.fn<AssignmentFeedbackService['command']>(),
+  studentCapture: vi.fn<AssignmentFeedbackService['studentCapture']>(),
+  studentChunk: vi.fn<AssignmentFeedbackService['studentChunk']>(),
 };
 let revoked = false,
   federationActive = true,
@@ -165,6 +192,10 @@ beforeEach(() => {
   service.save.mockReset().mockResolvedValue(saved);
   service.release.mockReset().mockResolvedValue(returned);
   service.command.mockReset().mockResolvedValue(returned);
+  service.studentCapture.mockReset().mockResolvedValue(snapshot);
+  service.studentChunk
+    .mockReset()
+    .mockImplementation(async () => Buffer.from('{"schema":1,"entries":[]}'));
   logs.length = 0;
 });
 type Reply = { status: number; headers: IncomingHttpHeaders; bytes: Buffer };
@@ -224,6 +255,137 @@ const unused = () => {
   for (const fn of Object.values(service)) expect(fn).not.toHaveBeenCalled();
 };
 describe('teacher feedback HTTPS boundary', () => {
+  it('projects the returned capture DTO, delivers bounded no-store chunks, and erases delivered buffers', async () => {
+    principal.role = 'student';
+    service.studentCapture.mockResolvedValueOnce({
+      ...snapshot,
+      wrappedKey: 'hidden',
+      submission: { ...snapshot.submission, userId: 'hidden' },
+      pages: snapshot.pages.map((p) => ({ ...p, ciphertext: 'hidden' })),
+      source: { ...snapshot.source, objectKey: 'hidden' },
+      chunks: snapshot.chunks.map((c) => ({ ...c, sealed: 'hidden' })),
+    } as ReviewSnapshot);
+    const metadata = await request(capturePath);
+    expect(metadata.status).toBe(200);
+    expect(json(metadata)).toEqual(snapshot);
+    expect(metadata.bytes.toString()).not.toContain('hidden');
+    const bytes = Buffer.from('{"schema":1,"entries":["captured-work"]}');
+    const expected = Buffer.from(bytes);
+    service.studentChunk.mockResolvedValueOnce(bytes);
+    const chunk = await request(chunkPath);
+    expect(chunk.status).toBe(200);
+    expect(chunk.bytes).toEqual(expected);
+    expect(service.studentChunk).toHaveBeenCalledExactlyOnceWith(
+      principal,
+      id,
+      0,
+      { snapshotPin: pin },
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(service.studentCapture).toHaveBeenCalledExactlyOnceWith(principal, id, {
+      signal: expect.any(AbortSignal),
+    });
+    for (const response of [metadata, chunk]) {
+      expect(response.headers['cache-control']).toBe('no-store');
+      expect(response.headers['content-type']).toBe('application/json; charset=utf-8');
+      expect(Number(response.headers['content-length'])).toBe(response.bytes.length);
+      expect(response.headers['x-content-type-options']).toBe('nosniff');
+    }
+    await vi.waitFor(() => expect(bytes.every((b) => b === 0)).toBe(true));
+  });
+  it('requires a current student launch and preserves service denials for private or revoked captures', async () => {
+    for (const path of [capturePath, chunkPath]) {
+      expect((await request(path)).status).toBe(403);
+      principal.role = 'student';
+      principal.authenticationMethod = 'oidc';
+      expect((await request(path)).status).toBe(403);
+      principal.authenticationMethod = 'lti';
+      federationActive = false;
+      expect((await request(path)).status).toBe(403);
+      federationActive = true;
+      expect((await request(path, { endpoint: fallback })).status).toBe(503);
+      principal.role = 'teacher';
+    }
+    unused();
+    principal.role = 'student';
+    service.studentCapture.mockRejectedValueOnce(
+      new AssignmentError(404, 'feedback_unavailable', 'Unavailable.'),
+    );
+    service.studentChunk.mockRejectedValueOnce(
+      new AssignmentError(404, 'feedback_unavailable', 'Unavailable.'),
+    );
+    expect((await request(capturePath)).status).toBe(404);
+    expect((await request(chunkPath)).status).toBe(404);
+  });
+  it('rejects malformed returned capture routes, pins, indices, methods and bodies before service entry', async () => {
+    principal.role = 'student';
+    for (const suffix of [
+      '/chunks/0',
+      '/chunks/0?pin=x',
+      '/chunks/0?pin=' + pin + '&pin=' + pin,
+      '/chunks/0?pin=' + pin + '&owner=x',
+      '/chunks/01?pin=' + pin,
+      '/chunks/-1?pin=' + pin,
+      '/chunks/2048?pin=' + pin,
+      '/chunks/1.5?pin=' + pin,
+      '/capture?pin=' + pin,
+    ])
+      expect((await request(student + suffix)).status).toBe(400);
+    for (const suffix of ['/chunks', '/capture/0', '/release', '/commands/' + requestId])
+      expect((await request(student + suffix)).status).toBe(404);
+    for (const path of [capturePath, chunkPath]) {
+      const wrong = await request(path, { method: 'POST', body: '{}' });
+      expect(wrong.status).toBe(405);
+      expect(wrong.headers.allow).toBe('GET');
+      expect((await request(path, { body: '{}' })).status).toBe(400);
+      expect((await request(path, { headers: { range: 'bytes=0-2' } })).status).toBe(400);
+    }
+    principal.role = 'teacher';
+    expect((await request(teacher + '/capture')).status).toBe(404);
+    expect((await request(teacher + '/chunks/0?pin=' + pin)).status).toBe(404);
+    unused();
+  });
+  it('bounds capture metadata and plaintext chunks, wiping refused chunk buffers', async () => {
+    principal.role = 'student';
+    service.studentCapture.mockResolvedValueOnce({
+      ...snapshot,
+      assignmentId: 'x'.repeat(1048577),
+    });
+    expect((await request(capturePath)).status).toBe(503);
+    const oversized = Buffer.alloc(262145, 42);
+    service.studentChunk.mockResolvedValueOnce(oversized);
+    expect((await request(chunkPath)).status).toBe(503);
+    expect(oversized.every((b) => b === 0)).toBe(true);
+    service.studentChunk.mockResolvedValueOnce(Buffer.alloc(0));
+    expect((await request(chunkPath)).status).toBe(503);
+  });
+  it('keeps aborted readers admitted until ignored provider work settles and erases late plaintext', async () => {
+    principal.role = 'student';
+    const finishes: Array<(b: Buffer) => void> = [];
+    const signals: AbortSignal[] = [];
+    service.studentChunk.mockImplementation((_p, _id, _index, _pin, options) => {
+      signals.push(options!.signal!);
+      return new Promise<Buffer>((resolve) => finishes.push(resolve));
+    });
+    const requests = [0, 1].map(() =>
+      raw(
+        chunkPath,
+        {},
+        () => {},
+        () => {},
+      ).end(),
+    );
+    await vi.waitFor(() => expect(finishes).toHaveLength(2));
+    for (const req of requests) req.destroy();
+    await vi.waitFor(() => expect(signals.every((s) => s.aborted)).toBe(true));
+    expect((await request(chunkPath)).status).toBe(503);
+    expect(service.studentChunk).toHaveBeenCalledTimes(2);
+    const late = finishes.map(() => Buffer.from('late captured plaintext'));
+    finishes.forEach((resolve, index) => resolve(late[index]));
+    await vi.waitFor(() => expect(late.every((b) => b.every((byte) => byte === 0))).toBe(true));
+    service.studentChunk.mockImplementation(async () => Buffer.from('{}'));
+    expect((await request(chunkPath)).status).toBe(200);
+  });
   it('projects public fields at every nested boundary and bounds serialized feedback', async () => {
     const annotation = {
       id: randomUUID(),

@@ -1,5 +1,10 @@
-import { useEffect, useState } from 'react';
-import { FeedbackClient } from '../lib/assignment-feedback/client';
+import { useEffect, useRef, useState } from 'react';
+import {
+  FeedbackClient,
+  readVerifiedReturnedCapture,
+  type ReturnedCaptureData,
+} from '../lib/assignment-feedback/client';
+import type { ReviewProgress } from '../lib/assignment-review/types';
 import type { StudentFeedback } from '../lib/assignment-feedback/decode';
 import { createReturnedFeedbackReader } from '../lib/assignment-feedback/returned-reader';
 import { readAssignmentSnapshot } from '../lib/assignment-work/repository';
@@ -14,7 +19,7 @@ interface Props {
   contentRevision: string;
   source: Blob;
 }
-/** Uses the immutable source only. The editable student draft is never passed as captured work. */
+/** Captured annotations are fetched only when opened; the editable student draft is never used. */
 export function CanvasReturnedFeedback({
   submissionId,
   documentId,
@@ -142,7 +147,14 @@ export function CanvasReturnedFeedback({
         )}
       </div>
       {opened && release && state.data && (
-        <ReturnedDocument data={state.data} source={source} close={() => setOpened(false)} />
+        <ReturnedDocument
+          key={`${state.data.capture.snapshotPin}:${release.revision}`}
+          data={state.data}
+          source={source}
+          documentId={documentId}
+          contentRevision={contentRevision}
+          close={() => setOpened(false)}
+        />
       )}
     </section>
   );
@@ -150,23 +162,94 @@ export function CanvasReturnedFeedback({
 function ReturnedDocument({
   data,
   source,
+  documentId,
+  contentRevision,
   close,
 }: {
   data: StudentFeedback;
   source: Blob;
+  documentId: string;
+  contentRevision: string;
   close: () => void;
 }) {
+  const expected = useRef(data).current;
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [capture, setCapture] = useState<ReturnedCaptureData | null>(null);
+  const [progress, setProgress] = useState<ReviewProgress | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [retry, setRetry] = useState(0);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
-    const dialog = document.querySelector<HTMLDialogElement>('#returned-feedback-dialog');
-    dialog?.showModal();
+    const element = dialog.current;
+    element?.showModal();
     return () => {
-      dialog?.close();
+      element?.close();
       previous?.focus();
     };
   }, []);
+  useEffect(() => {
+    let active = true;
+    const abort = new AbortController(),
+      client = new FeedbackClient('student', expected.capture.submissionId, { timeoutMs: 120000 });
+    setCapture(null);
+    setProgress(null);
+    setLoading(true);
+    setError('');
+    const remove = client.subscribeInvalidation(() => {
+      if (active) {
+        setCapture(null);
+        setProgress(null);
+        setLoading(false);
+        setError('Feedback access ended. Reopen this assignment from Canvas.');
+      }
+    });
+    void (async () => {
+      try {
+        const proof = await client.loadReturnedCapture(
+          {
+            expected,
+            source,
+            readBinding: async () =>
+              (await readAssignmentSnapshot(documentId, contentRevision)).binding,
+          },
+          {
+            signal: abort.signal,
+            onProgress: (value) => {
+              if (active) setProgress(value);
+            },
+          },
+        );
+        const verified = readVerifiedReturnedCapture(proof);
+        client.check();
+        if (active && !abort.signal.aborted) setCapture(verified);
+      } catch (reason) {
+        if (active && !abort.signal.aborted) {
+          setCapture(null);
+          setError(
+            reason instanceof Error
+              ? reason.message
+              : 'The captured submission could not be opened. Try again.',
+          );
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+          setProgress(null);
+        }
+      }
+    })();
+    return () => {
+      active = false;
+      abort.abort();
+      remove();
+      client.dispose();
+    };
+  }, [expected, source, documentId, contentRevision, retry]);
+  const shown = capture?.feedback ?? expected;
   return (
     <dialog
+      ref={dialog}
       id="returned-feedback-dialog"
       className="returned-feedback-dialog canvas-review"
       aria-labelledby="returned-feedback-title"
@@ -176,29 +259,51 @@ function ReturnedDocument({
         <div>
           <h2 id="returned-feedback-title">Returned feedback</h2>
           <p>
-            Captured {new Date(data.capture.frozenAt).toLocaleString()} · Feedback revision{' '}
-            {data.released!.revision}
+            Captured {new Date(shown.capture.frozenAt).toLocaleString()} · Feedback revision{' '}
+            {shown.released!.revision}
           </p>
         </div>
         <button className="review-button" onClick={close} autoFocus>
           Close feedback
         </button>
       </header>
-      <CanvasReviewDocument
-        source={source}
-        pages={data.capture.pages}
-        annotations={[]}
-        sourceOnly
-        feedback={{ annotations: data.released!.content.annotations }}
-        feedbackPanel={
-          <section className="teacher-feedback">
-            <h2>Teacher comment</h2>
-            <p className="returned-feedback-comment">
-              {data.released!.content.comment || 'No general comment.'}
+      {capture ? (
+        <CanvasReviewDocument
+          key={capture.detail.snapshotPin}
+          source={capture.source}
+          pages={capture.detail.pages}
+          annotations={capture.annotations}
+          feedback={{ annotations: capture.feedback.released!.content.annotations }}
+          feedbackPanel={
+            <section className="teacher-feedback">
+              <h2>Teacher comment</h2>
+              <p className="returned-feedback-comment">
+                {capture.feedback.released!.content.comment || 'No general comment.'}
+              </p>
+            </section>
+          }
+        />
+      ) : (
+        <div className="review-placeholder">
+          {loading ? (
+            <p role="status">
+              {progress?.stage === 'annotations'
+                ? `Verifying captured work (${progress.completed} of ${progress.total})…`
+                : progress?.stage === 'source'
+                  ? 'Verifying the preserved PDF…'
+                  : 'Opening the captured submission…'}
             </p>
-          </section>
-        }
-      />
+          ) : (
+            <>
+              <h3>Captured work unavailable</h3>
+              <p role="alert">{error}</p>
+              <button className="button secondary" onClick={() => setRetry((value) => value + 1)}>
+                Try opening feedback again
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </dialog>
   );
 }

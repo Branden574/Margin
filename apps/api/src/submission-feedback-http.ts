@@ -10,9 +10,10 @@ import {
   type FeedbackRelease,
 } from './assignments/feedback/types.js';
 import { strictJson } from './strict-json.js';
+import { sendReturnedCapture } from './assignments/feedback/capture-response.js';
 
 const route =
-  /^\/api\/assignments\/(review|work)\/submissions\/([^/]+)\/feedback(?:\/(release|commands)(?:\/([^/]+))?)?$/;
+  /^\/api\/assignments\/(review|work)\/submissions\/([^/]+)\/feedback(?:\/(release|commands|capture|chunks)(?:\/([^/]+))?)?$/;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 export const isSubmissionFeedbackPath = (path: string) =>
   /^\/api\/assignments\/(review|work)\/submissions\/[^/]+\/feedback(?:\/|$)/.test(path);
@@ -189,9 +190,14 @@ export async function handleSubmissionFeedback(
   const selected = route.exec(url.pathname);
   const teacher = selected?.[1] === 'review';
   authorize(principal, teacher);
+  const capture = selected?.[3] === 'capture',
+    chunk = selected?.[3] === 'chunks';
   if (
     !selected ||
-    (!teacher && selected[3]) ||
+    (!teacher && ['release', 'commands'].includes(selected[3])) ||
+    (teacher && (capture || chunk)) ||
+    (capture && selected[4]) ||
+    (chunk && !selected[4]) ||
     (selected[3] === 'release' && selected[4]) ||
     (selected[3] === 'commands' && !selected[4])
   )
@@ -200,12 +206,29 @@ export async function handleSubmissionFeedback(
       'feedback_route_not_found',
       'This feedback action is unavailable.',
     );
-  if (!uuid.test(selected[2]) || (selected[4] !== undefined && !uuid.test(selected[4])))
+  if (!uuid.test(selected[2]) || (selected[3] === 'commands' && !uuid.test(selected[4])))
     throw invalid(
       'invalid_identifier',
       'Use the exact saved submission and feedback request identifiers.',
     );
-  if (url.search) throw invalid('invalid_query', 'Feedback routes do not accept query parameters.');
+  let snapshotPin: string | undefined;
+  const index = chunk ? Number(selected[4]) : undefined;
+  if (chunk) {
+    if (!/^(0|[1-9][0-9]{0,3})$/.test(selected[4]) || index! > 2047)
+      throw invalid('invalid_review_chunk', 'Use a bounded chunk index from the returned capture.');
+    for (const [key, value] of url.searchParams) {
+      if (
+        key !== 'pin' ||
+        url.searchParams.getAll(key).length !== 1 ||
+        !/^[a-f0-9]{64}$/.test(value)
+      )
+        throw invalid('invalid_query', 'Use only the exact returned snapshot pin.');
+      snapshotPin = value;
+    }
+    if (!snapshotPin)
+      throw invalid('snapshot_pin_required', 'The exact returned snapshot pin is required.');
+  } else if (url.search)
+    throw invalid('invalid_query', 'This feedback route does not accept query parameters.');
   const command = selected[3] === 'commands',
     release = selected[3] === 'release';
   const methods = release ? ['POST'] : teacher && !command ? ['GET', 'PUT'] : ['GET'];
@@ -225,6 +248,16 @@ export async function handleSubmissionFeedback(
       503,
       'feedback_unconfigured',
       'Assignment feedback is not configured.',
+    );
+
+  if (capture || chunk)
+    return sendReturnedCapture(
+      req,
+      res,
+      service,
+      principal,
+      selected[2],
+      chunk ? { index: index!, snapshotPin: snapshotPin! } : undefined,
     );
 
   const controller = new AbortController();

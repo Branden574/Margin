@@ -4,9 +4,9 @@ import type { AuthorSession } from '../assignment-author/types';
 import { RequestScope, Transport } from '../assignment-work/transport';
 import { createVaultGuard, onVaultLock } from '../vault';
 import * as decode from './decode';
+import { readMaterializedAnnotations } from './materialization';
 import {
   MAX_REVIEW_BYTES,
-  MAX_REVIEW_CHUNK_BYTES,
   MAX_REVIEW_SOURCE_BYTES,
   REVIEW_TIMEOUT_MS,
   ReviewClientError,
@@ -416,94 +416,19 @@ class Client implements AssignmentReviewClient {
           'This retained submission exceeds the browser review limit (32 MiB annotations or 50 MiB PDF). Its saved capture remains available.',
         );
       progress('snapshot', 1, 1);
-      let joined: Uint8Array<ArrayBuffer> | null = new Uint8Array(detail.outputBytes);
       let sourceBytes: Uint8Array<ArrayBuffer> | null = null;
-      const ordered: Array<{ layerOrder: number; annotation: Annotation }> = [];
-      const pageIndexes = new Map(detail.pages.map((page) => [page.id, page.index]));
-      const cursorOwners = new Map<number, string>();
-      let lastId = '',
-        entryCount = 0,
-        revisions = 0,
-        latestCursor = 0,
-        offset = 0;
+      let annotations: Annotation[] = [];
       let completed = false;
       try {
-        for (const descriptor of detail.chunks) {
-          selected();
-          const response = await this.transport.request(
-            scope,
-            `/api/assignments/review/submissions/${id}/chunks/${descriptor.index}?pin=${detail.snapshotPin}`,
-            200,
-          );
-          if (
-            !/^application\/json(?:\s*;\s*charset=utf-8)?\s*$/i.test(
-              response.headers.get('content-type') ?? '',
-            )
-          ) {
-            void response.body?.cancel().catch(() => {});
-            decode.invalid();
-          }
-          const bytes = await this.transport.bytes(scope, response, MAX_REVIEW_CHUNK_BYTES);
-          try {
-            selected();
-            if (
-              bytes.length !== descriptor.bytes ||
-              (await digest(bytes, scope)) !== descriptor.sha256
-            )
-              decode.invalid();
-            let text: string, value: unknown;
-            try {
-              text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-              value = JSON.parse(text);
-            } catch {
-              decode.invalid();
-            }
-            const chunk = decode.chunk(value, detail, descriptor.index);
-            if (decode.canonical(chunk) !== text) decode.invalid();
-            joined.set(bytes, offset);
-            offset += bytes.length;
-            for (const entry of chunk.entries) {
-              if (entry.annotationId <= lastId || ++entryCount > detail.annotationCount)
-                decode.invalid();
-              lastId = entry.annotationId;
-              revisions += entry.revision;
-              latestCursor = Math.max(latestCursor, entry.latestCursor);
-              for (const cursor of [
-                entry.latestCursor,
-                ...(entry.layerOrder === null ? [] : [entry.layerOrder]),
-              ]) {
-                const owner = cursorOwners.get(cursor);
-                if (owner && owner !== entry.annotationId) decode.invalid();
-                cursorOwners.set(cursor, entry.annotationId);
-              }
-              if (entry.annotation && entry.layerOrder !== null)
-                ordered.push({
-                  layerOrder: entry.layerOrder,
-                  annotation: {
-                    ...entry.annotation,
-                    id: entry.annotationId,
-                    pageIndex: pageIndexes.get(entry.pageId)!,
-                    createdAt: 0,
-                    author: '',
-                  },
-                });
-            }
-          } finally {
-            bytes.fill(0);
-          }
-          progress('annotations', descriptor.index + 1, detail.chunks.length);
-          await scope.wait(new Promise<void>((resolve) => setTimeout(resolve, 0)));
-        }
-        if (
-          entryCount !== detail.annotationCount ||
-          revisions !== detail.submission.frozenCursor ||
-          latestCursor !== detail.submission.frozenCursor ||
-          offset !== detail.outputBytes ||
-          (await digest(joined, scope)) !== detail.outputSha256
-        )
-          decode.invalid();
-        joined.fill(0);
-        joined = null;
+        annotations = await readMaterializedAnnotations({
+          detail,
+          scope,
+          transport: this.transport,
+          path: (index) =>
+            `/api/assignments/review/submissions/${id}/chunks/${index}?pin=${detail.snapshotPin}`,
+          check: selected,
+          progress: (completed, total) => progress('annotations', completed, total),
+        });
         selected();
         progress('source', 0, detail.source.bytes);
         const sourceResponse = await this.transport.request(
@@ -530,11 +455,10 @@ class Client implements AssignmentReviewClient {
         const finalDetail = await this.snapshotWithin(scope, context, id);
         await this.contextWithin(scope);
         selected();
-        ordered.sort((a, b) => a.layerOrder - b.layerOrder);
         const data: ReviewData = {
           context,
           detail: finalDetail,
-          annotations: ordered.map((entry) => entry.annotation),
+          annotations,
           source: new Blob([sourceBytes], { type: 'application/pdf' }),
         };
         const record: ProofRecord = {
@@ -552,11 +476,8 @@ class Client implements AssignmentReviewClient {
         completed = true;
         return proof;
       } finally {
-        joined?.fill(0);
         sourceBytes?.fill(0);
-        ordered.length = 0;
-        cursorOwners.clear();
-        pageIndexes.clear();
+        if (!completed) annotations.length = 0;
         if (!completed && generation === this.selection) this.clearProof();
       }
     });

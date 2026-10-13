@@ -45,6 +45,7 @@ export function CanvasReviewDocument({
   const [geometryError, setGeometryError] = useState(false);
   const [measuredPage, setMeasuredPage] = useState(-1);
   const [showAnnotations, setShowAnnotations] = useState(true);
+  const [showFeedback, setShowFeedback] = useState(true);
   const [textState, setTextState] = useState<{ page: number; text: string; error: boolean } | null>(
     null,
   );
@@ -197,6 +198,16 @@ export function CanvasReviewDocument({
             Student annotations
           </label>
         )}
+        {feedback && (
+          <label className="review-layer-toggle">
+            <input
+              type="checkbox"
+              checked={showFeedback}
+              onChange={(event) => setShowFeedback(event.target.checked)}
+            />
+            Teacher feedback
+          </label>
+        )}
       </nav>
       {feedback?.onChange && (
         <div className="feedback-tools" aria-label="Teacher feedback tools">
@@ -304,7 +315,7 @@ export function CanvasReviewDocument({
                     ))}
                   </svg>
                 )}
-                {feedback && measuredPage === pageIndex && (
+                {feedback && showFeedback && measuredPage === pageIndex && (
                   <FeedbackAnnotationLayer
                     key={pageIndex}
                     {...feedback}

@@ -297,7 +297,7 @@ test('failed preparation retries the frozen version and recovers a lost retry af
   expect(a11y.violations).toEqual([]);
 });
 
-test('student opens returned feedback against the source without substituting later draft annotations', async ({
+test('student opens frozen work under returned feedback with independent layers and safe retry', async ({
   page,
 }) => {
   const fixture = await installFixture(page);
@@ -336,13 +336,34 @@ test('student opens returned feedback against the source without substituting la
   await expect(
     page.getByRole('button', { name: 'Open returned feedback', exact: true }),
   ).toBeVisible();
+  expect(fixture.state.returnedCaptureReads).toBe(0);
+  expect(fixture.state.returnedChunkReads).toBe(0);
+  fixture.state.corruptNextReturnedChunk = true;
   await page.getByRole('button', { name: 'Open returned feedback', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Returned feedback', exact: true });
   await expect(dialog).toBeVisible();
   await expect(
+    dialog.getByRole('heading', { name: 'Captured work unavailable', exact: true }),
+  ).toBeVisible();
+  await expect(dialog.locator('.review-annotation-layer')).toHaveCount(0);
+  await dialog.getByRole('button', { name: 'Try opening feedback again', exact: true }).click();
+  await expect(
     dialog.getByText('Good evidence. Explain the connection.', { exact: true }),
   ).toBeVisible();
   await expect(dialog.locator('.feedback-annotation-layer text')).toHaveText('Explain this detail');
+  await expect(dialog.locator('svg.review-annotation-layer text')).toHaveText(
+    'Student captured response',
+  );
+  await dialog.getByRole('checkbox', { name: 'Student annotations', exact: true }).uncheck();
+  await expect(dialog.locator('svg.review-annotation-layer')).toHaveCount(0);
+  await expect(dialog.locator('.feedback-annotation-layer text')).toHaveText('Explain this detail');
+  await dialog.getByRole('checkbox', { name: 'Student annotations', exact: true }).check();
+  await dialog.getByRole('checkbox', { name: 'Teacher feedback', exact: true }).uncheck();
+  await expect(dialog.locator('.feedback-annotation-layer')).toHaveCount(0);
+  await expect(dialog.locator('svg.review-annotation-layer text')).toHaveText(
+    'Student captured response',
+  );
+  await dialog.getByRole('checkbox', { name: 'Teacher feedback', exact: true }).check();
   await expect(dialog.getByText('Later mutable draft response', { exact: true })).toHaveCount(0);
   await expect(dialog.locator('.editor-annotation-layer')).toHaveCount(0);
   await expect(dialog.getByRole('combobox', { name: 'Feedback tool', exact: true })).toHaveCount(0);

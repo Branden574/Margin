@@ -19,10 +19,17 @@ import {
   descriptor,
   metadataSql,
   openCompletion,
+  openChunk,
   type ChunkMetadata,
+  type ChunkRow,
   type CompletionManifest,
   type CompletionRow,
 } from '../review/materialization.js';
+import type { ReviewPin, ReviewSnapshot } from '../review/types.js';
+import {
+  projectSubmissionStatus,
+  type SubmissionProcessingStatusRow,
+} from '../submissions/status.js';
 import { authenticate } from '../submissions/processing/envelope.js';
 import {
   capture,
@@ -69,10 +76,9 @@ interface CommandRow extends Ciphertext {
   expected_revision: number;
   wrapped_key: WrappedDataKey;
 }
-interface Job {
+interface Job extends SubmissionProcessingStatusRow {
   claim_id: string;
   materialization_attempt: number;
-  materialization_state: string;
 }
 interface Prepared {
   snapshot: Snapshot;
@@ -105,7 +111,7 @@ const notReady = () =>
     'feedback_not_ready',
     'The captured submission is not ready for feedback.',
   );
-const jobSql = `SELECT claim_id,materialization_attempt,materialization_state FROM margin_submissions.outbox WHERE attempt_id=$1`;
+const jobSql = `SELECT claim_id,materialization_attempt,materialization_state,status_revision,published_error_code,processing_generation,failed_at,materialized_at FROM margin_submissions.outbox WHERE attempt_id=$1`;
 const empty = (): FeedbackContent => ({ comment: '', annotations: [] });
 const same = (a: unknown, b: unknown) => fingerprint(a) === fingerprint(b);
 class RetryRead extends Error {}
@@ -168,14 +174,21 @@ export class PostgresAssignmentFeedbackService implements AssignmentFeedbackServ
     this.active++;
     let started = false;
     try {
-      return await bounded(60000, options.signal, async (signal) => {
-        started = true;
-        try {
-          return await fn({ ...p }, signal);
-        } finally {
-          this.active--;
-        }
-      });
+      return await bounded(
+        60000,
+        options.signal,
+        async (signal) => {
+          started = true;
+          try {
+            return await fn({ ...p }, signal);
+          } finally {
+            this.active--;
+          }
+        },
+        (late) => {
+          if (Buffer.isBuffer(late)) late.fill(0);
+        },
+      );
     } catch (error) {
       if (error instanceof AssignmentError) throw error;
       if (options.signal?.aborted) check(options.signal);
@@ -306,7 +319,14 @@ export class PostgresAssignmentFeedbackService implements AssignmentFeedbackServ
       },
     };
   }
-  private async verify(c: PoolClient, p: SessionPrincipal, v: Prepared, signal: AbortSignal) {
+  private async verify(
+    c: PoolClient,
+    p: SessionPrincipal,
+    v: Prepared,
+    signal: AbortSignal,
+    allChunks = true,
+    chunk?: ChunkRow,
+  ) {
     const id = v.snapshot.attempt.id;
     await this.scope(c, id);
     if (v.teacher) await lockCurrent(c, v.teacher);
@@ -324,12 +344,28 @@ export class PostgresAssignmentFeedbackService implements AssignmentFeedbackServ
     ).rows[0];
     const job = (await c.query<Job>(jobSql, [id])).rows[0];
     if (!same(receipt, v.receipt) || !same(job, v.job)) throw changed();
-    const chunks = (await c.query<ChunkMetadata>(metadataSql, [id, v.receipt.claim_id])).rows;
-    if (
-      chunks.some((r) => r.attempt !== v.receipt.attempt) ||
-      !same(chunks.map(descriptor), v.manifest.chunks)
-    )
-      throw integrity();
+    if (allChunks) {
+      const chunks = (await c.query<ChunkMetadata>(metadataSql, [id, v.receipt.claim_id])).rows;
+      if (
+        chunks.some((r) => r.attempt !== v.receipt.attempt) ||
+        !same(chunks.map(descriptor), v.manifest.chunks)
+      )
+        throw integrity();
+    }
+    if (chunk) {
+      const current = (
+        await c.query<ChunkRow>(
+          'SELECT * FROM margin_submissions.materialization_chunks WHERE submission_id=$1 AND claim_id=$2 AND chunk_index=$3',
+          [id, v.receipt.claim_id, chunk.chunk_index],
+        )
+      ).rows[0];
+      if (
+        !current ||
+        !same(current, chunk) ||
+        !same(descriptor(current), v.manifest.chunks[chunk.chunk_index])
+      )
+        throw integrity();
+    }
     check(signal);
   }
   private identity(v: Prepared) {
@@ -560,6 +596,157 @@ export class PostgresAssignmentFeedbackService implements AssignmentFeedbackServ
         'feedback_changed',
         'New feedback became available. Refresh to read it.',
       );
+    });
+  }
+  private async returned(principal: SessionPrincipal, id: string, signal: AbortSignal) {
+    const value = await this.prepare(principal, id, signal);
+    if (!value.release) throw unavailable();
+    // A row's existence is not proof that feedback was returned for this capture.
+    // Authenticate its encrypted identity, pin and content before exposing student work.
+    await this.content('release', value.release, value);
+    check(signal);
+    return value;
+  }
+  private async verifyReturned(
+    c: PoolClient,
+    principal: SessionPrincipal,
+    value: Prepared,
+    signal: AbortSignal,
+    allChunks = true,
+    chunk?: ChunkRow,
+  ) {
+    await this.verify(c, principal, value, signal, allChunks, chunk);
+    if (
+      !value.release ||
+      !same((await this.rows(c, value.capture.submissionId, false)).release, value.release)
+    )
+      throw new AssignmentError(
+        409,
+        'feedback_changed',
+        'Refresh the returned feedback before continuing.',
+      );
+    check(signal);
+  }
+  studentCapture(
+    p: SessionPrincipal,
+    id: string,
+    options: FeedbackOptions = {},
+  ): Promise<ReviewSnapshot> {
+    id = feedbackId(id);
+    return this.run(p, 'student', options, async (principal, signal) => {
+      const value = await this.returned(principal, id, signal);
+      const { snapshot, capture: saved, manifest } = value;
+      const status = projectSubmissionStatus(
+        {
+          id,
+          requestId: snapshot.attempt.request_id,
+          attempt: 1,
+          frozenCursor: saved.frozenCursor,
+          frozenAt: saved.frozenAt,
+          revision: 1,
+          phase: 'processing',
+          confirmedAt: null,
+          retryAllowed: false,
+          errorCode: null,
+        },
+        value.job,
+      );
+      return this.pool.transaction(
+        principal,
+        async (c) => {
+          await this.verifyReturned(c, principal, value, signal);
+          return {
+            assignmentId: snapshot.assignment.id,
+            submission: {
+              id,
+              frozenCursor: status.frozenCursor,
+              frozenAt: status.frozenAt,
+              revision: status.revision,
+              preparation: 'ready',
+              errorCode: null,
+            },
+            snapshotPin: saved.snapshotPin,
+            organizationId: snapshot.work.organization_id,
+            workId: snapshot.work.id,
+            documentId: saved.documentId,
+            versionId: saved.versionId,
+            pages: structuredClone(saved.pages),
+            source: { ...saved.source },
+            annotationCount: manifest.summary.annotationCount,
+            outputBytes: manifest.summary.outputBytes,
+            outputSha256: manifest.summary.outputSha256,
+            chunks: manifest.chunks.map(({ index, sha256, bytes }) => ({ index, sha256, bytes })),
+          };
+        },
+        signal,
+      );
+    });
+  }
+  studentChunk(
+    p: SessionPrincipal,
+    id: string,
+    index: number,
+    pin: ReviewPin,
+    options: FeedbackOptions = {},
+  ): Promise<Buffer> {
+    id = feedbackId(id);
+    return this.run(p, 'student', options, async (principal, signal) => {
+      if (!Number.isInteger(index) || index < 0 || index > 2047)
+        throw new AssignmentError(
+          400,
+          'invalid_review_chunk',
+          'Use a bounded captured chunk index.',
+        );
+      if (
+        !pin ||
+        typeof pin !== 'object' ||
+        Object.keys(pin).join(',') !== 'snapshotPin' ||
+        typeof pin.snapshotPin !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(pin.snapshotPin)
+      )
+        throw new AssignmentError(
+          400,
+          'snapshot_pin_required',
+          'Use the exact returned snapshot pin.',
+        );
+      const snapshotPin = pin.snapshotPin;
+      const value = await this.returned(principal, id, signal);
+      if (value.capture.snapshotPin !== snapshotPin) throw changed();
+      if (index >= value.manifest.chunks.length) throw unavailable();
+      const row = await this.pool.transaction(
+        principal,
+        async (c) => {
+          await this.verifyReturned(c, principal, value, signal, false);
+          return (
+            await c.query<ChunkRow>(
+              'SELECT * FROM margin_submissions.materialization_chunks WHERE submission_id=$1 AND claim_id=$2 AND chunk_index=$3',
+              [id, value.receipt.claim_id, index],
+            )
+          ).rows[0];
+        },
+        signal,
+      );
+      if (!row) throw integrity();
+      let body: Buffer | undefined;
+      try {
+        body = await openChunk(this.keys, value.snapshot, value.receipt, row, value.manifest);
+        check(signal);
+        // This locks current session, enrollment, launch, source and capture authority
+        // again after external key work, and reauthenticates the selected chunk seal.
+        // Full inventory verification belongs to the start/end capture reads; doing
+        // it for every chunk would rehash the entire captured dataset per request.
+        await this.pool.transaction(
+          principal,
+          (c) => this.verifyReturned(c, principal, value, signal, false, row),
+          signal,
+        );
+        check(signal);
+        const result = body;
+        body = undefined;
+        return result;
+      } finally {
+        body?.fill(0);
+      }
     });
   }
   command(

@@ -1,5 +1,6 @@
 import type { Annotation } from '@margin/core';
 import type { SessionPrincipal } from '../../identity/types.js';
+import type { ReviewPin, ReviewSnapshot } from '../review/types.js';
 
 export interface FeedbackOptions {
   signal?: AbortSignal;
@@ -89,6 +90,20 @@ export interface AssignmentFeedbackService {
     submissionId: string,
     options?: FeedbackOptions,
   ): Promise<StudentFeedback>;
+  /** The owning student's immutable capture, available only after an authenticated return. */
+  studentCapture(
+    principal: SessionPrincipal,
+    submissionId: string,
+    options?: FeedbackOptions,
+  ): Promise<ReviewSnapshot>;
+  /** Caller owns and must erase the authenticated plaintext buffer after use. */
+  studentChunk(
+    principal: SessionPrincipal,
+    submissionId: string,
+    index: number,
+    pin: ReviewPin,
+    options?: FeedbackOptions,
+  ): Promise<Buffer>;
 }
 export const MAX_FEEDBACK_BYTES = 196608;
 export const MAX_FEEDBACK_ANNOTATIONS = 500;

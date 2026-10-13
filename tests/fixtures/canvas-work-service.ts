@@ -1,6 +1,9 @@
 import { PDFDocument, StandardFonts } from 'pdf-lib';
 import { createHash } from 'node:crypto';
 import type { FeedbackRelease } from '../../apps/api/src/assignments/feedback/types';
+import type { ReviewSnapshot } from '../../apps/api/src/assignments/review/types';
+import { SubmissionReplay } from '../../apps/api/src/assignments/submissions/processing/replay';
+import { canonical } from '../../apps/api/src/sync/validation';
 import type { AppendOperation, CommittedOperation } from '../../apps/api/src/sync/types';
 import type {
   SubmissionInput,
@@ -37,12 +40,86 @@ export async function canvasWorkFixture({
   const submissions: SubmissionStatus[] = [];
   const frozenOperations = new Map<string, CommittedOperation[]>();
   const returnedFeedback = new Map<string, FeedbackRelease>();
+  const returnedCaptures = new Map<string, { detail: ReviewSnapshot; chunks: Buffer[] }>();
+  const getReturnedCapture = (submission: SubmissionStatus) => {
+    const previous = returnedCaptures.get(submission.id);
+    if (previous) return previous;
+    const frozen = frozenOperations.get(submission.id)!;
+    const pages = [{ id: id(8), index: 0, width: 612, height: 792 }];
+    const replay = new SubmissionReplay({
+      organizationId: id(3),
+      workId: id(5),
+      documentId: id(6),
+      versionId: id(7),
+      actorId: id(2),
+      frozenCursor: submission.frozenCursor,
+      pages,
+      expectedCanonicalBytes: frozen.reduce(
+        (
+          sum,
+          {
+            actorId: _actor,
+            cursor: _cursor,
+            annotationRevision: _revision,
+            committedAt: _time,
+            ...operation
+          },
+        ) => sum + Buffer.byteLength(canonical(operation)),
+        0,
+      ),
+    });
+    try {
+      for (let index = 0; index < frozen.length; index += 100)
+        replay.appendBatch(frozen.slice(index, index + 100));
+      const chunks: Buffer[] = [];
+      for (const chunk of replay.chunks()) chunks.push(Buffer.from(chunk.plaintext));
+      const summary = replay.summary();
+      const detail: ReviewSnapshot = {
+        assignmentId: id(4),
+        organizationId: id(3),
+        workId: id(5),
+        documentId: id(6),
+        versionId: id(7),
+        submission: {
+          id: submission.id,
+          frozenCursor: submission.frozenCursor,
+          frozenAt: submission.frozenAt,
+          revision: Math.max(2, submission.revision),
+          preparation: 'ready',
+          errorCode: null,
+        },
+        snapshotPin: createHash('sha256').update(`feedback-${submission.id}`).digest('hex'),
+        pages,
+        source: {
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+          bytes: bytes.length,
+          mimeType: 'application/pdf',
+        },
+        annotationCount: summary.annotationCount,
+        outputBytes: summary.outputBytes,
+        outputSha256: summary.outputSha256,
+        chunks: chunks.map((value, index) => ({
+          index,
+          sha256: createHash('sha256').update(value).digest('hex'),
+          bytes: value.length,
+        })),
+      };
+      const result = { detail, chunks };
+      returnedCaptures.set(submission.id, result);
+      return result;
+    } finally {
+      replay.dispose();
+    }
+  };
   const reprocessRequests = new Map<number, SubmissionReprocessRequest>();
   const reprocessPosts: number[] = [];
   const state = {
     authorized: true,
     loseNextAcknowledgement: false,
     sourceReads: 0,
+    returnedCaptureReads: 0,
+    returnedChunkReads: 0,
+    corruptNextReturnedChunk: false,
     submissionsConfigured: false,
     loseNextCaptureAcknowledgement: false,
     hideSubmissionRequests: false,
@@ -86,9 +163,10 @@ export async function canvasWorkFixture({
           expiresAt: createdAt + 3_600_000,
           csrfToken: 'a'.repeat(43),
         });
-      const feedbackMatch = /^\/api\/assignments\/work\/submissions\/([^/]+)\/feedback$/.exec(
-        url.pathname,
-      );
+      const feedbackMatch =
+        /^\/api\/assignments\/work\/submissions\/([^/]+)\/feedback(?:\/(capture|chunks\/\d+))?$/.exec(
+          url.pathname,
+        );
       if (feedbackMatch && method === 'GET') {
         const submission = submissions.find((row) => row.id === feedbackMatch[1]);
         if (!submission)
@@ -96,6 +174,37 @@ export async function canvasWorkFixture({
             { error: { code: 'feedback_unavailable', message: 'No captured feedback source.' } },
             404,
           );
+        if (feedbackMatch[2]) {
+          if (!returnedFeedback.has(submission.id))
+            return json(
+              {
+                error: { code: 'feedback_unavailable', message: 'Feedback has not been returned.' },
+              },
+              404,
+            );
+          const retained = getReturnedCapture(submission);
+          if (feedbackMatch[2] === 'capture') {
+            state.returnedCaptureReads++;
+            return json(retained.detail);
+          }
+          if (url.searchParams.get('pin') !== retained.detail.snapshotPin)
+            return json(
+              { error: { code: 'snapshot_changed', message: 'The captured snapshot changed.' } },
+              409,
+            );
+          const chunk = retained.chunks[Number(feedbackMatch[2].split('/')[1])];
+          if (!chunk)
+            return json(
+              { error: { code: 'feedback_unavailable', message: 'Chunk not found.' } },
+              404,
+            );
+          state.returnedChunkReads++;
+          if (state.corruptNextReturnedChunk) {
+            state.corruptNextReturnedChunk = false;
+            return json({ corrupted: true });
+          }
+          return { status: 200, contentType: 'application/json', body: chunk };
+        }
         return json({
           capture: {
             submissionId: submission.id,
