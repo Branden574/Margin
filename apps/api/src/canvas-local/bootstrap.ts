@@ -13,6 +13,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { Client, type ClientConfig } from 'pg';
 import { readProtectedFile } from './protected-files.js';
+import { assertNoPendingCertificateMaintenance } from './certificate-barrier.js';
 import { acquireCanvasMaintenance, assertCanvasDatabaseQuiet } from './maintenance.js';
 import { createCanvasUpgradeBackup, type CanvasUpgradeBackup } from './upgrade-backup.js';
 import {
@@ -395,7 +396,9 @@ export async function readCanvasLocalInstallation(
   rootDirectory: string,
 ): Promise<CanvasBootstrapReceipt> {
   assertLocalEnvironment();
-  return receipt(await canonicalRoot(rootDirectory, false));
+  const root = await canonicalRoot(rootDirectory, false);
+  await assertNoPendingCertificateMaintenance(root);
+  return receipt(root);
 }
 
 export interface CanvasLocalMaintenanceContext {
@@ -415,6 +418,7 @@ export async function withCanvasLocalMaintenance<T>(
   assertLocalEnvironment();
   const root = await canonicalRoot(rootDirectory, false);
   return locked(root, async () => {
+    await assertNoPendingCertificateMaintenance(root);
     const saved = await receipt(root);
     if (!(await running(saved.dataDirectory)))
       fail('Start the owned Canvas database before adding a local companion service.');
@@ -504,6 +508,7 @@ export async function startCanvasLocal(rootDirectory: string) {
   assertLocalEnvironment();
   const root = await canonicalRoot(rootDirectory, false);
   return locked(root, async () => {
+    await assertNoPendingCertificateMaintenance(root);
     const saved = await receipt(root);
     const alreadyRunning = await running(saved.dataDirectory);
     try {
@@ -526,6 +531,7 @@ export async function stopCanvasLocal(rootDirectory: string) {
   assertLocalEnvironment();
   const root = await canonicalRoot(rootDirectory, false);
   return locked(root, async () => {
+    await assertNoPendingCertificateMaintenance(root);
     const saved = await receipt(root);
     if (!(await running(saved.dataDirectory))) return false;
     const client = await operator(root);
@@ -551,6 +557,7 @@ export async function upgradeCanvasLocal(rootDirectory: string): Promise<{
   assertLocalEnvironment();
   const root = await canonicalRoot(rootDirectory, false);
   return locked(root, async () => {
+    await assertNoPendingCertificateMaintenance(root);
     const saved = await receipt(root);
     if (!(await running(saved.dataDirectory)))
       fail(
@@ -703,6 +710,7 @@ export async function bootCanvasLocal(
   const apiTls = await inspectApiTls(options.apiTls);
   try {
     const root = await canonicalRoot(options.rootDirectory, true);
+    await assertNoPendingCertificateMaintenance(root);
     const entries = await readdir(root);
     if (entries.includes('bootstrap.json')) {
       if (tests) fail('Historical test initialization requires a fresh disposable root.');
@@ -1004,3 +1012,22 @@ export async function bootCanvasLocal(
     apiTls.cert.fill(0);
   }
 }
+
+/** Narrow operator capabilities for the explicit certificate reconciler. Never runtime imports. */
+export const canvasCertificateOwnership = {
+  async root(path: string) {
+    assertLocalEnvironment();
+    return canonicalRoot(path, false);
+  },
+  receipt,
+  configuration: operatorConfiguration,
+  running,
+  start,
+  async stop(saved: CanvasBootstrapReceipt) {
+    await command('pg_ctl', ['-D', saved.dataDirectory, '-m', 'smart', '-w', '-t', '30', 'stop']);
+  },
+  async verify(client: Client, saved: CanvasBootstrapReceipt) {
+    await serverIdentity(client, saved.dataDirectory, saved.systemIdentifier);
+    return supportedLedger(client, saved.instanceId);
+  },
+};

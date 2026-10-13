@@ -1,4 +1,5 @@
 import { LocalKeyProvider } from './encryption.js';
+import { dirname } from 'node:path';
 import { LocalEncryptedArtifactRepository } from './local-artifacts.js';
 import { loadCanvasLocalConfig } from './canvas-local/config.js';
 import { assertCanvasDatabaseReady } from './canvas-local/preflight.js';
@@ -17,6 +18,7 @@ import {
 import { createApi } from './server.js';
 import { TeacherSourceUploadService } from './ingestion/upload.js';
 import { acquireCanvasRuntimeAdmission } from './canvas-local/maintenance.js';
+import { assertNoPendingCertificateMaintenance } from './canvas-local/certificate-barrier.js';
 
 async function stopHttp(server: ReturnType<typeof createApi>) {
   // Stop new connections first; give active responses a bounded chance to finish.
@@ -63,6 +65,7 @@ export async function startCanvasLocalApi(
       signal: options.signal,
     });
     cleanups.push(() => admission.close());
+    await assertNoPendingCertificateMaintenance(dirname(configPath));
     const startup = AbortSignal.any([
       admission.signal,
       ...(options.signal ? [options.signal] : []),

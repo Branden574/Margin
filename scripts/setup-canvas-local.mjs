@@ -12,17 +12,22 @@ import {
 import { CanvasLocalConfigError } from '../apps/api/src/canvas-local/protected-files.ts';
 import { CanvasAdmissionError } from '../apps/api/src/canvas-local/maintenance.ts';
 
+import {
+  renewCanvasPostgresCertificate,
+  CanvasCertificateMaintenanceError,
+} from '../apps/api/src/canvas-local/certificate-maintenance.ts';
+
 const repository = fileURLToPath(new URL('../', import.meta.url));
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
   process.stdout.write(
-    'Usage: node --import tsx scripts/setup-canvas-local.mjs [setup|start|stop|upgrade] [--root PATH] [--postgres-port 55439] [--api-port 4101] [--application-origin https://127.0.0.1:5174] [--api-tls-key PATH] [--api-tls-cert PATH]\nSetup starts only its dedicated persistent PostgreSQL cluster. Explicit upgrade applies reviewed migration 013 after a private database backup; stop the API, workers and other database sessions first. Existing keys, configuration and artifacts are preserved. It never changes OS trust or another database.\n',
+    'Usage: node --import tsx scripts/setup-canvas-local.mjs [setup|start|stop|upgrade|renew-postgres-cert] [--root PATH] [--postgres-port 55439] [--api-port 4101] [--application-origin https://127.0.0.1:5174] [--api-tls-key PATH] [--api-tls-cert PATH]\nSetup starts only its dedicated persistent PostgreSQL cluster. Explicit upgrade applies reviewed migration 013 after a private database backup; stop the API, workers and other database sessions first. The explicit renew-postgres-cert action preserves the PostgreSQL CA and server key, rebinds the owned scanner companion, and restores the database’s prior running state. Stop API and scanner runtimes before maintenance. Existing keys, configuration and artifacts are preserved. It never changes OS trust or another database.\n',
   );
 } else {
   try {
     const action = args[0] && !args[0].startsWith('--') ? args.shift() : 'setup';
-    if (!['setup', 'start', 'stop', 'upgrade'].includes(action))
-      throw new CanvasBootstrapError('Choose setup, start, stop, or upgrade.');
+    if (!['setup', 'start', 'stop', 'upgrade', 'renew-postgres-cert'].includes(action))
+      throw new CanvasBootstrapError('Choose setup, start, stop, upgrade, or renew-postgres-cert.');
     const known = new Set([
       '--root',
       '--postgres-port',
@@ -40,7 +45,7 @@ if (args.includes('--help')) {
       values.set(name, value);
     }
     if (action !== 'setup' && [...values.keys()].some((name) => name !== '--root'))
-      throw new CanvasBootstrapError('Start, stop and upgrade accept only the saved --root.');
+      throw new CanvasBootstrapError('Maintenance actions accept only the saved --root.');
     const rootDirectory = resolve(values.get('--root') ?? resolve(repository, '.local/canvas'));
     if (action === 'setup') {
       // Only the default parent may be created automatically. Custom parents are operator-owned.
@@ -73,6 +78,13 @@ if (args.includes('--help')) {
       process.stdout.write(
         `Owned Canvas PostgreSQL is ${result.started ? 'started' : 'already running'} on 127.0.0.1:${result.postgresPort}.\n`,
       );
+    } else if (action === 'renew-postgres-cert') {
+      const result = await renewCanvasPostgresCertificate(rootDirectory);
+      process.stdout.write(
+        result.completedPreviously
+          ? `Recovered the completed PostgreSQL leaf renewal record and retired its interrupted ownership lock. Saved leaf expires ${result.expiresAt}. No new live database verification or running-state change was performed.\n`
+          : `Owned PostgreSQL leaf renewal ${result.resumed ? 'was recovered and verified' : 'completed'}. Leaf expires ${result.expiresAt}. The database is ${result.wasRunning ? 'running' : 'stopped'}; CA, server key, credentials and data were preserved. Browser/API certificates and OS trust were unchanged.\n`,
+      );
     } else if (action === 'upgrade') {
       const result = await upgradeCanvasLocal(rootDirectory);
       process.stdout.write(
@@ -87,6 +99,7 @@ if (args.includes('--help')) {
   } catch (error) {
     // Never serialize command arguments, connection options, keys or PostgreSQL error objects.
     const message =
+      error instanceof CanvasCertificateMaintenanceError ||
       error instanceof CanvasBootstrapError ||
       error instanceof CanvasLocalConfigError ||
       error instanceof CanvasAdmissionError

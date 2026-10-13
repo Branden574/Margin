@@ -9,6 +9,7 @@ const f = vi.hoisted(() => ({
   events: [] as string[],
   load: vi.fn(),
   admission: vi.fn(),
+  barrier: vi.fn(),
   preflight: vi.fn(),
   factory: vi.fn(),
   repo: vi.fn(),
@@ -26,6 +27,9 @@ const f = vi.hoisted(() => ({
 vi.mock('../apps/api/src/scanner/local-config', () => ({ loadLocalScannerConfig: f.load }));
 vi.mock('../apps/api/src/canvas-local/maintenance', () => ({
   acquireCanvasRuntimeAdmission: f.admission,
+}));
+vi.mock('../apps/api/src/canvas-local/certificate-barrier', () => ({
+  assertNoPendingCertificateMaintenance: f.barrier,
 }));
 vi.mock('../apps/api/src/canvas-local/preflight', () => ({
   assertCanvasInspectorReady: f.preflight,
@@ -73,6 +77,7 @@ beforeEach(() => {
   external = new AbortController();
   wrappingKey = Buffer.alloc(32, 73);
   configuration = {
+    canvasRoot: '/private/fixture',
     database: {
       host: '127.0.0.1',
       port: 43210,
@@ -110,6 +115,9 @@ beforeEach(() => {
   f.admission.mockImplementation(async () => {
     f.events.push('admission');
     return { signal: admission.signal, close: leaseClose };
+  });
+  f.barrier.mockImplementation(async () => {
+    f.events.push('certificate-barrier');
   });
   f.preflight.mockImplementation(async () => {
     f.events.push('preflight');
@@ -197,6 +205,20 @@ it('prior abort opens no files or database connection', async () => {
   ).rejects.toMatchObject({ code: 'scanner_startup_refused' });
   expect(f.load).not.toHaveBeenCalled();
   expect(f.admission).not.toHaveBeenCalled();
+});
+it('rechecks certificate maintenance after admission and closes before creating scanner dependencies', async () => {
+  f.barrier.mockRejectedValue(new Error('pending renewal with private staged path'));
+  await expect(startLocalScanner('/private/fixture/scanner/inspector.json')).rejects.toMatchObject({
+    code: 'scanner_startup_refused',
+  });
+  expect(f.barrier).toHaveBeenCalledExactlyOnceWith(configuration.canvasRoot);
+  expect(f.preflight).not.toHaveBeenCalled();
+  expect(f.store).not.toHaveBeenCalled();
+  expect(f.repo).not.toHaveBeenCalled();
+  expect(f.factory).not.toHaveBeenCalled();
+  expect(leaseClose).toHaveBeenCalledOnce();
+  expect(dispose).toHaveBeenCalledOnce();
+  expect(f.events).toEqual(['load', 'admission', 'admission-close', 'dispose']);
 });
 it.each(['load', 'admission', 'preflight'] as const)(
   'scrubs %s startup failures and unwinds only acquired resources',

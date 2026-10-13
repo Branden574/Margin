@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { request } from 'node:https';
@@ -12,6 +12,8 @@ import {
   type CanvasBootstrapReceipt,
 } from '../apps/api/src/canvas-local/bootstrap';
 import { startCanvasLocalApi } from '../apps/api/src/runtime-canvas-local';
+import * as maintenance from '../apps/api/src/canvas-local/maintenance';
+import { CANVAS_CERTIFICATE_MAINTENANCE_MARKER } from '../apps/api/src/canvas-local/certificate-barrier';
 
 const available = postgresTlsToolsAvailable('persistent Canvas runtime');
 async function freePort(excluded: number[] = []) {
@@ -206,6 +208,65 @@ describe.skipIf(!available)(
       runtime = await startCanvasLocalApi(saved.configPath);
       await runtime.close();
       runtime = undefined;
+    });
+
+    it('refuses certificate maintenance published across startup admission and releases its database lease', async () => {
+      const marker = join(saved.rootDirectory, CANVAS_CERTIFICATE_MAINTENANCE_MARKER);
+      const acquire = maintenance.acquireCanvasRuntimeAdmission;
+      const admission = vi
+        .spyOn(maintenance, 'acquireCanvasRuntimeAdmission')
+        .mockImplementation(async (...args) => {
+          const lease = await acquire(...args);
+          // Simulate a renewal already in progress when shared admission becomes
+          // available after its old PostgreSQL process/lease is replaced.
+          await writeFile(marker, 'explicit interrupted-renewal fixture', { mode: 0o600 });
+          return lease;
+        });
+      try {
+        await expect(startCanvasLocalApi(saved.configPath)).rejects.toMatchObject({
+          code: 'certificate_maintenance_pending',
+        });
+        expect(admission).toHaveBeenCalledOnce();
+        await expect(get('/api/health')).rejects.toBeDefined();
+        await expect
+          .poll(
+            async () =>
+              (
+                await admin.query(
+                  "SELECT count(*)::integer AS count FROM pg_stat_activity WHERE datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid()",
+                )
+              ).rows[0].count,
+            { timeout: 5000 },
+          )
+          .toBe(0);
+        expect(await readFile(marker, 'utf8')).toBe('explicit interrupted-renewal fixture');
+      } finally {
+        admission.mockRestore();
+        await rm(marker, { force: true });
+      }
+      runtime = await startCanvasLocalApi(saved.configPath);
+      expect((await get('/api/health')).status).toBe(200);
+      await runtime.close();
+      runtime = undefined;
+    });
+
+    it('refuses a copied config in a private ancestor instead of missing the installation maintenance marker', async () => {
+      const marker = join(saved.rootDirectory, CANVAS_CERTIFICATE_MAINTENANCE_MARKER);
+      const copy = join(directory, 'copied-config.json');
+      await writeFile(copy, await readFile(saved.configPath), { mode: 0o600 });
+      await writeFile(marker, 'explicit pending-renewal fixture', { mode: 0o600 });
+      const admission = vi.spyOn(maintenance, 'acquireCanvasRuntimeAdmission');
+      try {
+        await expect(startCanvasLocalApi(copy)).rejects.toMatchObject({
+          code: 'configuration_root_mismatch',
+        });
+        expect(admission).not.toHaveBeenCalled();
+        await expect(get('/api/health')).rejects.toBeDefined();
+      } finally {
+        admission.mockRestore();
+        await rm(marker, { force: true });
+        await rm(copy, { force: true });
+      }
     });
 
     it('refuses invalid configuration and an already aborted startup without opening the listener', async () => {

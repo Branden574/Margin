@@ -48,7 +48,27 @@ npm run setup:canvas -- start
 
 Data and credentials remain on disk. There is no background launch agent or automatic boot startup. The API's default configuration is `.local/canvas/config.json`; an explicit absolute configuration path can be passed after `--`.
 
-Certificate maintenance is still an operator gap: setup issues a 30-day PostgreSQL server leaf and copies the existing API leaf with its original expiry. There is no supported renewal command yet. Expired database TLS prevents the verified operator connection used by start/stop checks; expired API TLS prevents application startup. Preserve the directory and keys rather than resetting the installation or disabling TLS checks. Certificate renewal must be implemented before this setup is treated as a long-lived environment. The explicit additive upgrade described below does not renew certificates.
+Setup issues a 30-day PostgreSQL server leaf and copies the existing API leaf with its original expiry. Database leaf renewal is a separate explicit operation described below. Synchronizing a renewed browser/API certificate remains an operator gap; database renewal does not replace that certificate or change OS trust. The additive database upgrade does not renew either certificate.
+
+## Explicit PostgreSQL certificate renewal
+
+Stop the Canvas API, inspector and other clients of this dedicated database, then run:
+
+```sh
+npm run setup:canvas -- renew-postgres-cert
+```
+
+For a custom installation, append `--root /absolute/path/to/owned/canvas`. A completed operation issues a new 30-day server leaf for `127.0.0.1`, signed by the same private database CA with the same server key. It preserves credentials, application signing/encryption keys, API certificate, database rows and artifacts. It updates the bootstrap hash and the owned scanner companion's binding records together; the inspector password and setup identity stay unchanged. The CA must remain valid beyond the new leaf's lifetime. An expired, mismatched or nearly expired CA requires separate operator recovery.
+
+For a running database, renewal first verifies its current TLS identity and obtains exclusive maintenance admission. For an already stopped database, it verifies the owned cluster and clean-shutdown state; this path also accepts a genuinely expired old leaf. A database still running with an expired leaf is refused because it cannot complete the normal authenticated connection. Stop the API/inspector, use PostgreSQL's smart shutdown with the exact owned data directory recorded in the private bootstrap receipt, and retry after shutdown. Do not disable certificate verification or target another PostgreSQL installation.
+
+Renewal verifies the new certificate actually served over TLS, the database identity, migration ledger and applicable runtime role checks before restoring the prior running/stopped state. It does not start the API or scanner for you. Restart those processes separately after maintenance completes.
+
+The private `certificate-renewals/` journal retains exact old/new file contents before replacement. It can contain scanner credentials and must remain private. A pending marker blocks API/scanner startup and other ordinary setup operations; startup also rechecks the marker after obtaining database admission. Retrying the same renewal command reconciles only the recorded operation and expected file hashes. Preserve pending files and keys if it refuses; do not reset the installation or delete the marker to bypass it.
+
+Recovery after process death accepts only the exact owned renewal lock whose recorded process is confirmed absent. A live, reused, inaccessible or ambiguous PID, a legacy unowned lock, changed files or a staged certificate that has since expired is refused. If the process died after durable completion and removal of the startup marker, retry only retires that completed operation's lock: its output explicitly says it does not repeat live verification or change the current running state. Rerunning after a fully completed operation and normal lock retirement requests another new leaf.
+
+An interruption before the first complete ownership record is published may require operator inspection instead of automatic recovery. Each operation permits at most 64 ownership records; exhaustion also requires inspection. Keep the original root and private journal intact in both cases. These limits do not authorize deleting locks, resetting credentials or bypassing the pending marker.
 
 ## Explicit database upgrade
 
@@ -67,7 +87,7 @@ Current runtime processes hold a shared maintenance lease. Losing that database 
 
 ## Startup and shutdown checks
 
-The loader bounds input sizes, rejects duplicate JSON properties and unsupported fields, validates private file ownership and certificate purpose, requires independent keys and distinct database logins, and rejects production or disabled TLS verification. Environment connection options do not replace the configured values.
+The loader bounds input sizes, rejects duplicate JSON properties and unsupported fields, validates private file ownership and certificate purpose, requires independent keys and distinct database logins, and rejects production or disabled TLS verification. Protected references stay within the private configuration directory; artifact and API data directories must be distinct direct children of that root. This binds maintenance checks to the same installation even when configuration filenames are customized. Environment connection options do not replace the configured values.
 
 Before listening, the API performs bounded read-only database checks for all ten purposes: verified TLS, exclusive actual roles, expected database identity, durable settings, exact migration ledger, and selected table, forced-RLS, policy, trigger and authority-function contracts. These are startup drift checks, not a continuous availability monitor or a complete schema/ACL security audit. Every request retains its own authorization checks.
 

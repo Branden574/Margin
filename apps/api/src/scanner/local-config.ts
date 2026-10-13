@@ -10,6 +10,7 @@ import {
   utf8,
 } from '../canvas-local/protected-files.js';
 import type { CanvasBootstrapReceipt } from '../canvas-local/bootstrap.js';
+import { assertNoPendingCertificateMaintenance } from '../canvas-local/certificate-barrier.js';
 
 export const INSPECTOR_LOGIN = 'margin_canvas_inspector';
 export class LocalScannerConfigurationError extends Error {
@@ -224,6 +225,7 @@ export async function loadLocalScannerConfig(
     const sidecar = dirname(configPath),
       canvasRoot = dirname(sidecar);
     scannerAssert(configPath === join(canvasRoot, 'scanner/inspector.json'));
+    await assertNoPendingCertificateMaintenance(canvasRoot);
     await checkDedicatedDirectory(sidecar);
     const binding = await readScannerBinding(canvasRoot);
     const raw = await scannerRead(configPath);

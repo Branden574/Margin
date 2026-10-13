@@ -1,8 +1,9 @@
 import { constants } from 'node:fs';
 import { createPrivateKey, createPublicKey, X509Certificate } from 'node:crypto';
-import { sep } from 'node:path';
+import { dirname, sep } from 'node:path';
 import type { PoolConfig } from 'pg';
 import { strictJson } from '../strict-json.js';
+import { assertNoPendingCertificateMaintenance } from './certificate-barrier.js';
 import {
   absolutePath,
   CanvasLocalConfigError,
@@ -176,6 +177,21 @@ function references(value: unknown, configPath: string): References {
     );
   if (new Set(protectedPaths).size !== protectedPaths.length)
     invalid('aliased_file', 'Each protected configuration input must have its own file reference.');
+  // This directory is also the certificate-maintenance boundary. A copied config
+  // must not borrow another installation's credentials while checking a different
+  // marker. Generic operator layouts remain valid only within this one private root.
+  const configRoot = dirname(configPath);
+  if (
+    dirname(parsed.artifactDirectory) !== configRoot ||
+    dirname(parsed.dataDirectory) !== configRoot ||
+    [...protectedPaths, parsed.artifactDirectory, parsed.dataDirectory].some(
+      (path) => !contains(configRoot, path),
+    )
+  )
+    invalid(
+      'configuration_root_mismatch',
+      'Protected references must stay inside the private configuration root, with artifact and API data directories directly beneath it.',
+    );
   return parsed;
 }
 function secret(bytes: Buffer): Buffer {
@@ -320,6 +336,8 @@ export async function loadCanvasLocalConfig(
     return bytes;
   };
   try {
+    absolutePath(configPath);
+    await assertNoPendingCertificateMaintenance(dirname(configPath));
     const raw = await read(absolutePath(configPath), 65536);
     let json: unknown;
     try {

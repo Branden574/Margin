@@ -4,6 +4,7 @@ import { PostgresIngestionRepository } from '../ingestion/postgres.js';
 import { SourceInspectionWorker } from '../ingestion/worker.js';
 import { acquireCanvasRuntimeAdmission } from '../canvas-local/maintenance.js';
 import { assertCanvasInspectorReady } from '../canvas-local/preflight.js';
+import { assertNoPendingCertificateMaintenance } from '../canvas-local/certificate-barrier.js';
 import { loadLocalScannerConfig } from './local-config.js';
 import { createIsolatedSourceScanner } from './index.js';
 import { startInspectionLoop, type InspectionLoopEvent } from './loop.js';
@@ -74,6 +75,7 @@ export async function startLocalScanner(
       signal: options.signal,
     });
     cleanups.push(() => admission.close());
+    await assertNoPendingCertificateMaintenance(config.canvasRoot);
     const admitted = AbortSignal.any([
       admission.signal,
       ...(options.signal ? [options.signal] : []),

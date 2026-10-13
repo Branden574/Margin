@@ -372,6 +372,42 @@ describe('protected Canvas local configuration', () => {
     await save();
     await expect(load()).rejects.toMatchObject({ code: 'invalid_directory' });
   });
+  it.each(['sibling', 'ancestor'] as const)(
+    'rejects a valid config copied to a private %s directory before reading its borrowed secrets',
+    async (location) => {
+      const copyRoot = location === 'ancestor' ? base : directory + '-copy';
+      if (location === 'sibling') await mkdir(copyRoot, { mode: 0o700 });
+      const copy = join(copyRoot, 'copied-config.json');
+      await protectedWrite(copy, await readFile(configPath));
+      await protectedWrite(join(directory, '.certificate-renewal.pending.json'), 'pending');
+      const paths = new Set<string>();
+      hooks.afterRead = async (path) => {
+        paths.add(path);
+      };
+      try {
+        await expect(loadCanvasLocalConfig(copy)).rejects.toMatchObject({
+          code: 'configuration_root_mismatch',
+        });
+        expect([...paths]).toEqual([copy]);
+      } finally {
+        hooks.afterRead = undefined;
+        await rm(copy, { force: true });
+        if (location === 'sibling') await rm(copyRoot, { recursive: true, force: true });
+      }
+    },
+  );
+  it.each(['artifact', 'data', 'key', 'database'] as const)(
+    'rejects a %s reference escaping its explicit configuration root',
+    async (kind) => {
+      const external = join(base, 'outside-' + kind);
+      if (kind === 'artifact') input.artifactDirectory = external;
+      if (kind === 'data') input.dataDirectory = external;
+      if (kind === 'key') input.secrets.wrapping = external;
+      if (kind === 'database') input.databases.identity = external;
+      await save();
+      await expect(load()).rejects.toMatchObject({ code: 'configuration_root_mismatch' });
+    },
+  );
   it('rejects existing data directories with unsafe permissions without changing them', async () => {
     await mkdir(input.artifactDirectory, { mode: 0o755 });
     await expect(load()).rejects.toMatchObject({ code: 'unsafe_file' });
@@ -410,7 +446,8 @@ describe('protected Canvas local configuration', () => {
     await symlink(directory, alias);
     try {
       await expect(loadCanvasLocalConfig(join(alias, 'config.json'))).rejects.toMatchObject({
-        code: 'unsafe_file',
+        // The maintenance guard now refuses this ancestor before any config read.
+        code: 'certificate_maintenance_unavailable',
       });
     } finally {
       await unlink(alias);
